@@ -1,0 +1,40 @@
+# Dependencies
+/node_modules
+.pnp
+.pnp.js
+
+# Encore generated code & local state
+/encore.gen
+/.encore
+encore.gen.go
+encore.gen.cue
+
+# Secrets & environment (NUNCA commitar)
+.env
+.env.*
+!.env.example
+*.local
+.secrets.local.cue
+
+# Build output
+/dist
+/build
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test coverage
+/coverage
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.swp

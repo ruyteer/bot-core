@@ -1,0 +1,151 @@
+import { api, APIError } from "encore.dev/api";
+import { getAuthData } from "~encore/auth";
+import { LeadDrizzleRepository } from "./infrastructure/lead.drizzle.repository.js";
+import { decrypt } from "../shared/crypto.js";
+import { db } from "../shared/database.js";
+import { bots } from "../shared/schema/index.js";
+import { eq } from "drizzle-orm";
+import type { LeadWithStats } from "./domain/lead.entity.js";
+
+const repo = new LeadDrizzleRepository();
+
+async function assertLeadOwnership(leadId: string, userId: string) {
+  const lead = await repo.findById(leadId);
+  if (!lead) throw APIError.notFound("lead not found");
+  const userBotIds = await repo.getUserBotIds(userId);
+  if (!userBotIds.includes(lead.botId)) throw APIError.notFound("lead not found");
+  return lead;
+}
+
+// ─── Shapes ──────────────────────────────────────────────────────────────────
+
+interface LeadResponse {
+  id:               string;
+  botId:            string;
+  botName:          string | null;
+  telegramChatId:   string;
+  telegramUsername: string | null;
+  firstName:        string | null;
+  lastName:         string | null;
+  utmSource:        string | null;
+  utmCampaign:      string | null;
+  utmMedium:        string | null;
+  status:           string | null;
+  funnelName:       string | null;
+  nodeSummary:      string | null;
+  conversionTimeMs: number | null;
+  createdAt:        string;
+}
+
+function toResponse(l: LeadWithStats): LeadResponse {
+  return {
+    id:               l.id,
+    botId:            l.botId,
+    botName:          l.botName,
+    telegramChatId:   l.telegramChatId.toString(),
+    telegramUsername: l.telegramUsername,
+    firstName:        l.firstName,
+    lastName:         l.lastName,
+    utmSource:        l.utmSource,
+    utmCampaign:      l.utmCampaign,
+    utmMedium:        l.utmMedium,
+    status:           l.progress?.status ?? null,
+    funnelName:       l.progress?.funnelName ?? null,
+    nodeSummary:      l.progress?.nodeSummary ?? null,
+    conversionTimeMs: l.conversionTimeMs,
+    createdAt:        l.createdAt.toISOString(),
+  };
+}
+
+// ─── Endpoints ───────────────────────────────────────────────────────────────
+
+// GET /leads?botId=...&start=...&end=...
+export const list = api(
+  { method: "GET", path: "/leads", expose: true, auth: true },
+  async ({ botId, start, end }: { botId?: string; start?: string; end?: string }): Promise<{ leads: LeadResponse[] }> => {
+    const { userID: userId } = getAuthData()!;
+    const userBotIds = await repo.getUserBotIds(userId);
+    if (botId && !userBotIds.includes(botId)) throw APIError.notFound("bot not found");
+    const botIds = botId ? [botId] : userBotIds;
+    const startDate = start ? new Date(start) : undefined;
+    const endDate   = end   ? new Date(end)   : undefined;
+    const result    = await repo.findByBotIds(botIds, startDate, endDate);
+    return { leads: result.map(toResponse) };
+  },
+);
+
+// GET /leads/:id
+export const get = api(
+  { method: "GET", path: "/leads/:id", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<LeadResponse> => {
+    const { userID: userId } = getAuthData()!;
+    const lead = await assertLeadOwnership(id, userId);
+    return toResponse(lead);
+  },
+);
+
+// GET /leads/:id/messages
+export const getMessages = api(
+  { method: "GET", path: "/leads/:id/messages", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ messages: Array<{ id: string; direction: string; content: Record<string, unknown>; createdAt: string }> }> => {
+    const { userID: userId } = getAuthData()!;
+    await assertLeadOwnership(id, userId);
+    const msgs = await repo.getMessages(id, 200);
+    return {
+      messages: msgs.map((m) => ({
+        id:        m.id,
+        direction: m.direction,
+        content:   m.content,
+        createdAt: m.createdAt.toISOString(),
+      })),
+    };
+  },
+);
+
+// POST /leads/:id/pause — toggle pause/resume
+export const togglePause = api(
+  { method: "POST", path: "/leads/:id/pause", expose: true, auth: true },
+  async ({ id, pause }: { id: string; pause: boolean }): Promise<{ ok: boolean; paused: boolean }> => {
+    const { userID: userId } = getAuthData()!;
+    await assertLeadOwnership(id, userId);
+    await repo.setPaused(id, pause);
+    return { ok: true, paused: pause };
+  },
+);
+
+// POST /leads/:id/message — send message on behalf of the bot
+export const sendMessage = api(
+  { method: "POST", path: "/leads/:id/message", expose: true, auth: true },
+  async ({ id, kind, text, mediaUrl }: { id: string; kind: string; text?: string; mediaUrl?: string }): Promise<{ ok: boolean }> => {
+    const { userID: userId } = getAuthData()!;
+    const lead = await assertLeadOwnership(id, userId);
+
+    const [bot] = await db.select().from(bots).where(eq(bots.id, lead.botId));
+    if (!bot) throw APIError.notFound("bot not found");
+
+    const token = decrypt(bot.telegramToken);
+    const chatId = lead.telegramChatId.toString();
+
+    let res: Response;
+    if (kind === "text" && text) {
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text }),
+      });
+    } else if (kind === "photo" && mediaUrl) {
+      res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, photo: mediaUrl }),
+      });
+    } else {
+      throw APIError.invalidArgument("unsupported message kind or missing content");
+    }
+
+    if (!res.ok) throw APIError.internal("telegram API error");
+
+    await repo.saveMessage(id, lead.botId, "outbound", { kind, text, mediaUrl });
+    return { ok: true };
+  },
+);
