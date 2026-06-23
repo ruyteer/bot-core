@@ -238,15 +238,18 @@ export class ExecuteFlowStepUseCase {
         return;
 
       case "input":
-      case "wait_response":
-        // Stay on this node; next step triggered by inbound message
+      case "wait_response": {
+        // Stay on this node; next step triggered by inbound message.
+        // O frontend salva a pergunta em `question`; fallback p/ `prompt` antigo.
         await advanceProgress(progressId, node.id, "active");
-        if (c.prompt) {
-          const prompt = interpolate(c.prompt as string, vars);
+        const promptRaw = (c.question ?? c.prompt) as string | undefined;
+        if (promptRaw) {
+          const prompt = interpolate(promptRaw, vars);
           await tg.sendMessage({ chatId, text: prompt, protectContent: protect });
           await saveOutbound(leadId, botId, { kind: "text", text: prompt, nodeId: node.id });
         }
         return;
+      }
 
       case "delay": {
         const value  = (c.value as number) ?? 0;
@@ -323,24 +326,34 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const blocks = (c.blocks as Array<{ type: string; content?: string; url?: string; caption?: string }>) ?? [];
+    // O frontend salva o texto em `message` (tanto no nó simples quanto em cada
+    // bloco); mantemos fallback p/ `content`/`text` de versões antigas.
+    const blocks = (c.blocks as Array<Record<string, unknown>>) ?? [];
 
     if (blocks.length > 0) {
       for (const block of blocks) {
-        if (block.type === "text" && block.content) {
-          await tg.sendMessage({ chatId, text: interpolate(block.content, vars), protectContent: protect });
-        } else if (block.type === "image" && block.url) {
-          await tg.sendPhoto({ chatId, photo: block.url, caption: block.caption ? interpolate(block.caption, vars) : undefined, protectContent: protect });
-        } else if (block.type === "video" && block.url) {
-          await tg.sendVideo(chatId, block.url, block.caption ? interpolate(block.caption, vars) : undefined, protect);
-        } else if (block.type === "document" && block.url) {
-          await tg.sendDocument(chatId, block.url, block.caption ? interpolate(block.caption, vars) : undefined, protect);
-        } else if (block.type === "audio" && block.url) {
-          await tg.sendAudio(chatId, block.url, undefined, protect);
+        const url       = block.url as string | undefined;
+        const text      = (block.message ?? block.content ?? block.text) as string | undefined;
+        const caption   = typeof block.caption === "string" ? interpolate(block.caption, vars) : undefined;
+        const mediaType = (block.media_type ?? block.type) as string | undefined;
+
+        if (block.type === "text" && text) {
+          await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
+        } else if ((block.type === "media" || block.type === "image" || block.type === "video" || block.type === "document") && url) {
+          if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
+          else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
+          else                               await tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
+        } else if (block.type === "audio" && url) {
+          await tg.sendAudio(chatId, url, caption, protect);
+        } else if (text) {
+          await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
         }
       }
-    } else if (typeof c.text === "string") {
-      await tg.sendMessage({ chatId, text: interpolate(c.text, vars), protectContent: protect });
+    } else {
+      const text = (c.message ?? c.text) as string | undefined;
+      if (typeof text === "string" && text) {
+        await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
+      }
     }
   }
 
@@ -351,9 +364,16 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const text    = typeof c.text === "string" ? interpolate(c.text, vars) : "Escolha uma opção:";
-    const buttons = (c.buttons as Array<{ label: string; value: string }>) ?? [];
-    const keyboard = buttons.map((b) => [{ text: b.label, callback_data: b.value }]);
+    // Frontend salva o texto em `message` e os botões como { text, callback, action };
+    // fallback p/ `text`/`label`/`value` antigos.
+    const raw     = (c.message ?? c.text) as string | undefined;
+    const text    = typeof raw === "string" && raw ? interpolate(raw, vars) : "Escolha uma opção:";
+    const buttons = (c.buttons as Array<Record<string, unknown>>) ?? [];
+    const keyboard = buttons.map((b) => {
+      const label = (b.text ?? b.label ?? "") as string;
+      if (typeof b.url === "string" && b.url) return [{ text: label, url: b.url }];
+      return [{ text: label, callback_data: (b.callback ?? b.value ?? "") as string }];
+    });
     await tg.sendMessage({
       chatId,
       text,
