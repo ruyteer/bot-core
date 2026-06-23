@@ -53,6 +53,7 @@ jobs:
           TAG="sha-${COMMIT_SHA:0:12}"
 
           /home/runner/.encore/bin/encore build docker \
+            --base node:22-slim \
             --config railway-infra.config.json \
             ${IMAGE}:${TAG}
 
