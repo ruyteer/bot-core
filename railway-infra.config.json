@@ -1,0 +1,30 @@
+{
+  "$schema": "https://encore.dev/schemas/infra.schema.json",
+  "secrets": {
+    "ENCRYPTION_KEY": { "$env": "ENCRYPTION_KEY" },
+    "SUPABASE_URL": { "$env": "SUPABASE_URL" },
+    "ENCORE_EXTERNAL_URL": { "$env": "ENCORE_EXTERNAL_URL" },
+    "DATABASE_URL": { "$env": "DATABASE_URL" }
+  },
+  "worker_threads": 0,
+  "pubsub": [
+    {
+      "type": "nsq",
+      "hosts": "nsqd.railway.internal:4150",
+      "topics": {
+        "telegram-update-received": {
+          "name": "telegram-update-received",
+          "subscriptions": {
+            "runner-process-update": {
+              "name": "runner-process-update"
+            }
+          }
+        },
+        "flow-step-executed": {
+          "name": "flow-step-executed",
+          "subscriptions": {}
+        }
+      }
+    }
+  ]
+}

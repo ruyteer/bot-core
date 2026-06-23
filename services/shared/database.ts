@@ -1,10 +1,10 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "./schema/index.js";
+import { databaseUrl } from "../config/secrets.js";
 
 const pool = new Pool({
-    connectionString:
-        "postgresql://postgres:wpnvAiMxGPZTpTJHlsNAFekFvgzPDUGa@zephyr.proxy.rlwy.net:55938/railway",
+    connectionString: databaseUrl(),
     max: 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
