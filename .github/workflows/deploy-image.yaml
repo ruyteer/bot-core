@@ -47,7 +47,7 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          IMAGE="${REGISTRY}/${OWNER}/${REPO}-core"
+          IMAGE="${REGISTRY}/${OWNER}/${REPO}"
           TAG="sha-${COMMIT_SHA:0:12}"
 
           /home/runner/.encore/bin/encore build docker \
