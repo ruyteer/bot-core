@@ -38,7 +38,9 @@ jobs:
           args: --output install.sh -L https://encore.dev/install.sh
 
       - name: Install Encore CLI
-        run: bash install.sh
+        # Versão fixada p/ casar com a lib encore.dev (1.57.8). Sem pin, instala a
+        # CLI mais recente, que gera imagem com Node novo onde o alias ~encore quebra.
+        run: bash install.sh 1.57.8
 
       - name: Build Core Service
         env:
