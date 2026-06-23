@@ -1,4 +1,4 @@
-import { eq, and } from "drizzle-orm";
+import { eq, and, ne, desc } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
@@ -15,6 +15,12 @@ interface ExecutionContext {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Texto dos nós é plano (textarea), mas o Telegram usa parse_mode HTML por padrão.
+// Sem escapar, um `<`, `>` ou `&` no texto faz o Telegram rejeitar e abortar o passo.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
 async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
   const rows = await db.select().from(leadVariables)
@@ -108,8 +114,16 @@ export class ExecuteFlowStepUseCase {
 
     // ── /start command: enter funnel ────────────────────────────────────────
     if (messageText === "/start" || !prog) {
+      // Só funis de fluxo são executáveis aqui (o simplificado não tem nós).
+      // orderBy + limit p/ ser determinístico quando há mais de um ativo.
       const [activeFunnel] = await db.select().from(funnels)
-        .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true)));
+        .where(and(
+          eq(funnels.botId, botId),
+          eq(funnels.isActive, true),
+          ne(funnels.kind, "simplified"),
+        ))
+        .orderBy(desc(funnels.updatedAt))
+        .limit(1);
       if (!activeFunnel) return;
 
       // Find trigger node
@@ -218,14 +232,19 @@ export class ExecuteFlowStepUseCase {
 
     switch (node.type) {
       case "message":
-      case "media":
         await this.executeMessageNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         break;
 
+      case "media":
+        await this.executeMediaNode(c, chatId, tg, protect, vars);
+        await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        break;
+
       case "audio": {
-        const url = c.url as string | undefined;
-        if (url) await tg.sendAudio(chatId, url, undefined, protect);
+        const url     = c.url as string | undefined;
+        const caption = typeof c.caption === "string" ? interpolate(c.caption, vars) : undefined;
+        if (url) await tg.sendAudio(chatId, url, caption, protect);
         await saveOutbound(leadId, botId, { kind: "audio", url, nodeId: node.id });
         break;
       }
@@ -244,7 +263,7 @@ export class ExecuteFlowStepUseCase {
         await advanceProgress(progressId, node.id, "active");
         const promptRaw = (c.question ?? c.prompt) as string | undefined;
         if (promptRaw) {
-          const prompt = interpolate(promptRaw, vars);
+          const prompt = escapeHtml(interpolate(promptRaw, vars));
           await tg.sendMessage({ chatId, text: prompt, protectContent: protect });
           await saveOutbound(leadId, botId, { kind: "text", text: prompt, nodeId: node.id });
         }
@@ -252,9 +271,16 @@ export class ExecuteFlowStepUseCase {
       }
 
       case "delay": {
-        const value  = (c.value as number) ?? 0;
-        const unit   = (c.unit as string) ?? "seconds";
-        const ms     = unit === "minutes" ? value * 60000 : unit === "hours" ? value * 3600000 : value * 1000;
+        // Frontend salva `seconds`; fallback p/ o par value/unit antigo.
+        let seconds: number;
+        if (typeof c.seconds === "number") {
+          seconds = c.seconds;
+        } else {
+          const value = (c.value as number) ?? 0;
+          const unit  = (c.unit as string) ?? "seconds";
+          seconds = unit === "minutes" ? value * 60 : unit === "hours" ? value * 3600 : value;
+        }
+        const ms     = seconds * 1000;
         const nextId = await nextNode(funnelId, node.id);
         if (nextId && ms > 0) {
           await db.insert(scheduledDelays).values({
@@ -334,11 +360,11 @@ export class ExecuteFlowStepUseCase {
       for (const block of blocks) {
         const url       = block.url as string | undefined;
         const text      = (block.message ?? block.content ?? block.text) as string | undefined;
-        const caption   = typeof block.caption === "string" ? interpolate(block.caption, vars) : undefined;
+        const caption   = typeof block.caption === "string" ? escapeHtml(interpolate(block.caption, vars)) : undefined;
         const mediaType = (block.media_type ?? block.type) as string | undefined;
 
         if (block.type === "text" && text) {
-          await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
         } else if ((block.type === "media" || block.type === "image" || block.type === "video" || block.type === "document") && url) {
           if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
           else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
@@ -346,14 +372,38 @@ export class ExecuteFlowStepUseCase {
         } else if (block.type === "audio" && url) {
           await tg.sendAudio(chatId, url, caption, protect);
         } else if (text) {
-          await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
         }
       }
     } else {
       const text = (c.message ?? c.text) as string | undefined;
       if (typeof text === "string" && text) {
-        await tg.sendMessage({ chatId, text: interpolate(text, vars), protectContent: protect });
+        await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
       }
+    }
+  }
+
+  private async executeMediaNode(
+    c:       Record<string, unknown>,
+    chatId:  string,
+    tg:      TelegramClient,
+    protect: boolean,
+    vars:    Map<string, string>,
+  ): Promise<void> {
+    // Nó de mídia: { url, media_type, caption, extra_items[] }. Só o item
+    // principal tem caption; os extras (álbum) são enviados em sequência.
+    const main   = { url: c.url, media_type: c.media_type, caption: c.caption } as Record<string, unknown>;
+    const extras = (c.extra_items as Array<Record<string, unknown>>) ?? [];
+    const items  = [main, ...extras];
+
+    for (const it of items) {
+      const url = it.url as string | undefined;
+      if (!url) continue;
+      const caption   = typeof it.caption === "string" ? escapeHtml(interpolate(it.caption, vars)) : undefined;
+      const mediaType = it.media_type as string | undefined;
+      if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
+      else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
+      else                               await tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
     }
   }
 
@@ -367,7 +417,7 @@ export class ExecuteFlowStepUseCase {
     // Frontend salva o texto em `message` e os botões como { text, callback, action };
     // fallback p/ `text`/`label`/`value` antigos.
     const raw     = (c.message ?? c.text) as string | undefined;
-    const text    = typeof raw === "string" && raw ? interpolate(raw, vars) : "Escolha uma opção:";
+    const text    = typeof raw === "string" && raw ? escapeHtml(interpolate(raw, vars)) : "Escolha uma opção:";
     const buttons = (c.buttons as Array<Record<string, unknown>>) ?? [];
     const keyboard = buttons.map((b) => {
       const label = (b.text ?? b.label ?? "") as string;
