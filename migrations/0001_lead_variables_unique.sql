@@ -1,0 +1,1 @@
+ALTER TABLE "lead_variables" ADD CONSTRAINT "lead_variables_lead_id_variable_name_unique" UNIQUE("lead_id","variable_name");

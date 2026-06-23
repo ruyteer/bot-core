@@ -1,7 +1,7 @@
 import {
   pgTable, pgEnum, uuid, text, boolean, timestamp,
   bigint, doublePrecision, jsonb, integer, primaryKey,
-  uniqueIndex,
+  uniqueIndex, unique,
 } from "drizzle-orm/pg-core";
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
@@ -100,7 +100,10 @@ export const leadVariables = pgTable("lead_variables", {
   value:        text("value").notNull().default(""),
   createdAt:    timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:    timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Necessária para o upsert de setVar (ON CONFLICT lead_id, variable_name).
+  unique("lead_variables_lead_id_variable_name_unique").on(t.leadId, t.variableName),
+]);
 
 export const leadMessages = pgTable("lead_messages", {
   id:               uuid("id").defaultRandom().primaryKey(),
