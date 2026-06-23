@@ -61,5 +61,8 @@ jobs:
           docker push ${IMAGE}:${TAG}
           docker push ${IMAGE}:latest
 
+          # Passa a tag imutável pro passo de deploy (evita race do :latest).
+          echo "IMAGE_REF=${IMAGE}:${TAG}" >> "$GITHUB_ENV"
+
       - name: Trigger Railway deployment
-        run: node script.js ${{ secrets.RAILWAY_API_TOKEN }}
+        run: node script.js ${{ secrets.RAILWAY_API_TOKEN }} "$IMAGE_REF"
