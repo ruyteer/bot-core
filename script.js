@@ -13,7 +13,8 @@ const resp = await fetch("https://backboard.railway.com/graphql/v2", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    authorization: `Bearer ${TOKEN}`,
+    // Project Token do Railway usa este header. (Account/Team token usaria "Authorization: Bearer".)
+    "Project-Access-Token": TOKEN,
   },
   body: JSON.stringify({
     query: `
