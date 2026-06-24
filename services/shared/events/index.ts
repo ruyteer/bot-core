@@ -33,6 +33,12 @@ export interface FlowStepExecutedEvent {
   nextNodeId: string | null;
 }
 
+// Publicado quando um pagamento é confirmado (webhook). O runner assina p/
+// entregar o produto e retomar o funil pelo handle `__paid` da oferta.
+export interface PaymentPaidEvent {
+  paymentId: string;
+}
+
 export const telegramUpdateReceived = new Topic<TelegramUpdateEvent>(
   "telegram-update-received",
   { deliveryGuarantee: "at-least-once" },
@@ -40,5 +46,10 @@ export const telegramUpdateReceived = new Topic<TelegramUpdateEvent>(
 
 export const flowStepExecuted = new Topic<FlowStepExecutedEvent>(
   "flow-step-executed",
+  { deliveryGuarantee: "at-least-once" },
+);
+
+export const paymentPaid = new Topic<PaymentPaidEvent>(
+  "payment-paid",
   { deliveryGuarantee: "at-least-once" },
 );

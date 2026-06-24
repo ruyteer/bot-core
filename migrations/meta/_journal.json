@@ -15,6 +15,20 @@
       "when": 1782239260750,
       "tag": "0001_lead_variables_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782239260751,
+      "tag": "0002_payments_resume_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1782323451507,
+      "tag": "0003_simplified_funnel",
+      "breakpoints": true
     }
   ]
 }

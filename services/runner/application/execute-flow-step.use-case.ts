@@ -8,6 +8,28 @@ import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { interpolate } from "./interpolate.js";
 import type { TelegramUpdate } from "../../shared/events/index.js";
+// Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
+// puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
+// importáveis aqui sem cruzar a fronteira de serviço.
+import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
+import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import { createPix } from "../../payments/application/gateway-clients.js";
+import { encoreExternalUrl } from "../../config/secrets.js";
+import type { Payment } from "../../payments/domain/payment.entity.js";
+import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
+
+const gwRepo  = new GatewayDrizzleRepository();
+const payRepo = new PaymentDrizzleRepository();
+const simplifiedUseCase = new ExecuteSimplifiedFunnelUseCase();
+
+// Handle de uma oferta dentro de um nó `offer`. O frontend usa exatamente
+// `offer.callback || offer.product_name || offer_<i>` como id dos conectores
+// (`<handle>__paid|__pending|__no_action`) — replicamos para casar na retomada.
+function offerHandleId(offer: Record<string, unknown>, i: number): string {
+  const callback = typeof offer.callback === "string" ? offer.callback : "";
+  const name     = typeof offer.product_name === "string" ? offer.product_name : "";
+  return callback || name || `offer_${i}`;
+}
 
 interface ExecutionContext {
   botId:  string;
@@ -20,6 +42,61 @@ interface ExecutionContext {
 // Sem escapar, um `<`, `>` ou `&` no texto faz o Telegram rejeitar e abortar o passo.
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── Validação de input ─────────────────────────────────────────────────────────
+// O frontend (NodeEditPanel) salva `content.validation` com os valores:
+// "none" | "email" | "number" | "cpf". Tratamos também sinônimos (numeric,
+// telefone/phone, etc.) por segurança. Qualquer valor desconhecido → sem validação.
+
+// Remove acentos e normaliza p/ comparação case-insensitive.
+function normalizeValidationKind(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return raw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+}
+
+function isValidEmail(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+}
+
+function isValidNumber(s: string): boolean {
+  // inteiro ou decimal com . ou , (opcionalmente com sinal)
+  return /^[+-]?\d+([.,]\d+)?$/.test(s.trim());
+}
+
+function isValidPhone(s: string): boolean {
+  // 10–13 dígitos, ignorando separadores comuns (+, -, espaços, parênteses)
+  const digits = s.replace(/[^\d]/g, "");
+  return digits.length >= 10 && digits.length <= 13;
+}
+
+function isValidCpf(s: string): boolean {
+  const cpf = s.replace(/[^\d]/g, "");
+  if (cpf.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(cpf)) return false; // todos os dígitos iguais
+
+  const calcDigit = (len: number): number => {
+    let sum = 0;
+    for (let i = 0; i < len; i++) sum += parseInt(cpf[i], 10) * (len + 1 - i);
+    const rest = (sum * 10) % 11;
+    return rest === 10 ? 0 : rest;
+  };
+  return calcDigit(9) === parseInt(cpf[9], 10) && calcDigit(10) === parseInt(cpf[10], 10);
+}
+
+// Retorna true se `value` passa na validação `kind`. Tipos desconhecidos/none → true.
+function passesValidation(kind: unknown, value: string): boolean {
+  const k = normalizeValidationKind(kind);
+  switch (k) {
+    case "email":   return isValidEmail(value);
+    case "number":
+    case "numero":
+    case "numeric": return isValidNumber(value);
+    case "cpf":     return isValidCpf(value);
+    case "telefone":
+    case "phone":   return isValidPhone(value);
+    default:        return true; // none/"" /desconhecido → sem validação
+  }
 }
 
 async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
@@ -112,6 +189,21 @@ export class ExecuteFlowStepUseCase {
 
     const vars = await getVars(lead.id, botId);
 
+    // ── Funil SIMPLIFICADO tem precedência (interpretador linear, stateless) ──
+    const [simplifiedFunnel] = await db.select().from(funnels)
+      .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true), eq(funnels.kind, "simplified")))
+      .orderBy(desc(funnels.updatedAt))
+      .limit(1);
+    if (simplifiedFunnel) {
+      const handled = await simplifiedUseCase.handle({
+        bot, lead, chatId: chatIdStr, funnel: simplifiedFunnel,
+        text: messageText, callbackData,
+        callbackMessageId: update.callback_query?.message?.message_id ?? null,
+        tg,
+      });
+      if (handled) return;
+    }
+
     // ── /start command: enter funnel ────────────────────────────────────────
     if (messageText === "/start" || !prog) {
       // Só funis de fluxo são executáveis aqui (o simplificado não tem nós).
@@ -168,6 +260,18 @@ export class ExecuteFlowStepUseCase {
         }
         return;
       }
+
+      // Clique num botão de compra do nó `offer` → gera PIX p/ aquela oferta.
+      // callback_data = `offer:<i>` (curto, evita o limite de 64 bytes do TG).
+      if (currentNode?.type === "offer" && callbackData.startsWith("offer:")) {
+        const idx = parseInt(callbackData.slice("offer:".length), 10);
+        const offers = (currentNode.content as { offers?: Array<Record<string, unknown>> }).offers ?? [];
+        const offer = Number.isInteger(idx) ? offers[idx] : undefined;
+        if (offer) {
+          await this.handleOfferPurchase(offer, idx, currentNode, prog, lead, bot, chatIdStr, tg);
+        }
+        return;
+      }
     }
 
     // ── Handle text response for input node ─────────────────────────────────
@@ -177,12 +281,44 @@ export class ExecuteFlowStepUseCase {
         : null;
 
       if (currentNode?.type === "input" || currentNode?.type === "wait_response") {
-        const c = currentNode.content as { variable_name?: string };
+        const c = currentNode.content as {
+          variable_name?: string;
+          validation?:    string;
+          error_message?: string;
+        };
+
+        // 1) Validação de input: se houver `validation` configurado e a resposta
+        //    for inválida, reenvia a mensagem de erro e PERMANECE no nó (não salva
+        //    variável nem avança). Sem validation (ou tipo desconhecido) → segue.
+        if (!passesValidation(c.validation, messageText)) {
+          const errRaw = c.error_message ?? "Resposta inválida. Tente novamente.";
+          const errText = escapeHtml(interpolate(errRaw, vars));
+          await tg.sendMessage({ chatId: chatIdStr, text: errText, protectContent: bot.protectContent });
+          await saveOutbound(lead.id, botId, { kind: "text", text: errText, nodeId: currentNode.id });
+          return; // fica no mesmo nó esperando nova resposta
+        }
+
         if (c.variable_name) {
           await setVar(lead.id, botId, c.variable_name, messageText);
           vars.set(c.variable_name, messageText);
         }
-        const nextId = await nextNode(prog.funnelId, currentNode.id);
+
+        // 2) Resolução do próximo nó:
+        //    - wait_response: cancela timeouts pendentes deste progresso e avança
+        //      pelo handle "responded" (fallback p/ a conexão default).
+        //    - input: comportamento atual (conexão default).
+        let nextId: string | null;
+        if (currentNode.type === "wait_response") {
+          await db.delete(scheduledDelays).where(and(
+            eq(scheduledDelays.progressId, prog.id),
+            eq(scheduledDelays.status, "pending"),
+          ));
+          nextId = await nextNode(prog.funnelId, currentNode.id, "responded")
+                ?? await nextNode(prog.funnelId, currentNode.id);
+        } else {
+          nextId = await nextNode(prog.funnelId, currentNode.id);
+        }
+
         if (nextId) {
           await advanceProgress(prog.id, nextId, "active");
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
@@ -267,6 +403,29 @@ export class ExecuteFlowStepUseCase {
           await tg.sendMessage({ chatId, text: prompt, protectContent: protect });
           await saveOutbound(leadId, botId, { kind: "text", text: prompt, nodeId: node.id });
         }
+
+        // Timeout do wait_response: o frontend salva `timeout_seconds` (em segundos)
+        // e liga o nó pelos handles "responded" e "no_response". Se houver timeout
+        // e um alvo no_response, agenda em scheduled_delays p/ o scheduler existente
+        // (runner.ts) rodar o ramo no_response quando vencer. Sem timeout ou sem
+        // alvo → não agenda (espera indefinidamente, como antes).
+        if (node.type === "wait_response") {
+          const timeoutSeconds = typeof c.timeout_seconds === "number" ? c.timeout_seconds : 0;
+          if (timeoutSeconds > 0) {
+            const noResponseId = await nextNode(funnelId, node.id, "no_response");
+            if (noResponseId) {
+              await db.insert(scheduledDelays).values({
+                botId,
+                leadId,
+                funnelId,
+                progressId,
+                nextNodeId: noResponseId,
+                executeAt:  new Date(Date.now() + timeoutSeconds * 1000),
+                status:     "pending",
+              });
+            }
+          }
+        }
         return;
       }
 
@@ -321,10 +480,34 @@ export class ExecuteFlowStepUseCase {
       case "random": {
         const connections = await db.select().from(nodeConnections)
           .where(and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, node.id)));
-        if (connections.length > 0) {
-          const pick = connections[Math.floor(Math.random() * connections.length)];
-          await this.runNode(funnelId, pick.targetNodeId, progressId, leadId, botId, chatId, tg, protect, vars, node.id, depth + 1);
+        if (connections.length === 0) return;
+
+        // Frontend salva `content.outputs` = [{ name, weight, handle }], onde handle
+        // é "out_0", "out_1", ... e os weights somam ~100. Escolha PONDERADA pelos
+        // weights; fallback p/ escolha uniforme entre as conexões quando não houver
+        // outputs/weights válidos.
+        const outputs = (c.outputs as Array<{ weight?: number; handle?: string }>) ?? [];
+        const valid   = outputs.filter((o) => typeof o.handle === "string" && (o.weight ?? 0) > 0);
+        const total   = valid.reduce((sum, o) => sum + (o.weight ?? 0), 0);
+
+        let targetId: string | null = null;
+        if (valid.length > 0 && total > 0) {
+          let r = Math.random() * total;
+          let chosenHandle = valid[valid.length - 1].handle!; // fallback p/ último
+          for (const o of valid) {
+            r -= o.weight ?? 0;
+            if (r < 0) { chosenHandle = o.handle!; break; }
+          }
+          targetId = connections.find((cn) => cn.sourceHandle === chosenHandle)?.targetNodeId
+                  ?? await nextNode(funnelId, node.id, chosenHandle);
         }
+
+        // Fallback uniforme se a ponderação não resolveu um alvo conectado.
+        if (!targetId) {
+          targetId = connections[Math.floor(Math.random() * connections.length)].targetNodeId;
+        }
+
+        await this.runNode(funnelId, targetId, progressId, leadId, botId, chatId, tg, protect, vars, node.id, depth + 1);
         return;
       }
 
@@ -439,20 +622,159 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const offers = (c.offers as Array<{ product_name?: string; price?: number; payment_url?: string }>) ?? [];
+    // Cada oferta vira um botão de compra; o clique (callback `offer:<i>`) gera
+    // o PIX. O texto/imagem vem da 1ª oferta + intro_message opcional.
+    const offers = (c.offers as Array<Record<string, unknown>>) ?? [];
     if (offers.length === 0) return;
-    const offer = offers[0];
-    const priceText = offer.price ? ` — R$ ${(offer.price / 100).toFixed(2)}` : "";
-    const text = `*${offer.product_name ?? "Oferta"}*${priceText}`;
-    const buttons = offer.payment_url
-      ? [[{ text: "Comprar agora", url: offer.payment_url }]]
-      : [];
-    await tg.sendMessage({
-      chatId,
-      text: interpolate(text, vars),
-      parseMode: "Markdown",
-      protectContent: protect,
-      replyMarkup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined,
+
+    const keyboard = offers.map((o, i) => {
+      const price = typeof o.price === "number" ? o.price : 0;
+      const label = (typeof o.button_text === "string" && o.button_text)
+        ? o.button_text
+        : `Comprar — R$ ${(price / 100).toFixed(2)}`;
+      return [{ text: label, callback_data: `offer:${i}` }];
     });
+
+    const intro = typeof c.intro_message === "string" && c.intro_message
+      ? escapeHtml(interpolate(c.intro_message, vars))
+      : null;
+    const firstName = typeof offers[0].product_name === "string" ? offers[0].product_name : "";
+    const caption = intro ?? (firstName ? escapeHtml(interpolate(firstName, vars)) : "Escolha uma oferta:");
+    const image = typeof offers[0].image_url === "string" ? offers[0].image_url : "";
+
+    if (image) {
+      await tg.sendPhoto({ chatId, photo: image, caption, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
+    } else {
+      await tg.sendMessage({ chatId, text: caption, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
+    }
+  }
+
+  // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
+  private async handleOfferPurchase(
+    offer:  Record<string, unknown>,
+    idx:    number,
+    node:   typeof funnelNodes.$inferSelect,
+    prog:   typeof leadProgress.$inferSelect,
+    lead:   typeof leads.$inferSelect,
+    bot:    typeof bots.$inferSelect,
+    chatId: string,
+    tg:     TelegramClient,
+  ): Promise<void> {
+    const gatewayId = typeof offer.gateway_id === "string" ? offer.gateway_id : "";
+    const amount    = typeof offer.price === "number" ? offer.price : 0;
+    const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
+
+    if (!gatewayId || amount <= 0) {
+      await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent });
+      return;
+    }
+
+    const gw = await gwRepo.findById(gatewayId);
+    if (!gw) {
+      await tg.sendMessage({ chatId, text: "Gateway de pagamento não configurado.", protectContent: bot.protectContent });
+      return;
+    }
+
+    const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
+    const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
+
+    let pix;
+    try {
+      pix = await createPix(gw.provider, clientId, clientSecret, amount, productName, webhookUrl);
+    } catch (err) {
+      console.error("[runner] createPix falhou:", err);
+      await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
+      return;
+    }
+
+    // Persiste a cobrança com o contexto p/ retomar o funil quando pago.
+    await payRepo.create({
+      userId:      bot.userId,
+      botId:       bot.id,
+      leadId:      lead.id,
+      gatewayId:   gw.id,
+      offerName:   productName,
+      amount,
+      status:      "pending",
+      externalId:  pix.externalId,
+      pixCode:     pix.pixCode,
+      description: productName,
+      funnelId:    prog.funnelId,
+      progressId:  prog.id,
+      nodeId:      node.id,
+      paidHandle:  `${offerHandleId(offer, idx)}__paid`,
+    });
+
+    const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
+    await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
+    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+    await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
+  }
+
+  // ── Pago (chamado pela subscription do webhook): entrega + retoma o funil ────
+  async handlePaidOffer(payment: Payment): Promise<void> {
+    if (!payment.progressId || !payment.nodeId || !payment.paidHandle || !payment.funnelId || !payment.leadId) {
+      return; // cobrança sem contexto de funil (ex.: teste de gateway) — ignora
+    }
+
+    const [prog] = await db.select().from(leadProgress).where(eq(leadProgress.id, payment.progressId));
+    const [lead] = await db.select().from(leads).where(eq(leads.id, payment.leadId));
+    const [bot]  = await db.select().from(bots).where(eq(bots.id, payment.botId));
+    const [node] = await db.select().from(funnelNodes).where(eq(funnelNodes.id, payment.nodeId));
+    if (!prog || !lead || !bot || !node) return;
+
+    const tg     = new TelegramClient(decrypt(bot.telegramToken));
+    const chatId = lead.telegramChatId.toString();
+    const vars   = await getVars(lead.id, bot.id);
+
+    // Localiza a oferta paga p/ entregar o produto (handle sem o sufixo __paid).
+    const handleId = payment.paidHandle.replace(/__paid$/, "");
+    const offers   = (node.content as { offers?: Array<Record<string, unknown>> }).offers ?? [];
+    const offer    = offers.find((o, i) => offerHandleId(o, i) === handleId);
+    if (offer) {
+      await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars)
+        .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
+    }
+
+    // Retoma o funil pelo ramo __paid.
+    const nextId = await nextNode(payment.funnelId, payment.nodeId, payment.paidHandle);
+    if (nextId) {
+      await advanceProgress(prog.id, nextId, "active");
+      await this.runNode(payment.funnelId, nextId, prog.id, lead.id, bot.id, chatId, tg, bot.protectContent, vars, null);
+    } else {
+      await advanceProgress(prog.id, null, "completed");
+    }
+  }
+
+  // Entrega do produto pago: link de conteúdo ou convite de grupo VIP.
+  private async deliverOffer(
+    offer:   Record<string, unknown>,
+    chatId:  string,
+    tg:      TelegramClient,
+    protect: boolean,
+    vars:    Map<string, string>,
+  ): Promise<void> {
+    const type = typeof offer.product_type === "string" ? offer.product_type : "content";
+
+    if (type === "vip_group") {
+      const groupId = (typeof offer.telegram_group_id === "string" ? offer.telegram_group_id : "").trim();
+      if (!groupId) return;
+      const accessDays = typeof offer.access_days === "number" ? offer.access_days : 0;
+      const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
+      try {
+        const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
+        await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado! Seu acesso: ${link}`, protectContent: protect });
+      } catch (err) {
+        console.error("[runner] createChatInviteLink falhou:", err);
+        await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: protect });
+      }
+      return;
+    }
+
+    const url = typeof offer.delivery_url === "string" ? offer.delivery_url : "";
+    const text = url
+      ? `✅ Pagamento confirmado! Acesse seu produto: ${escapeHtml(interpolate(url, vars))}`
+      : "✅ Pagamento confirmado!";
+    await tg.sendMessage({ chatId, text, protectContent: protect });
   }
 }

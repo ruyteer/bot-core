@@ -1,5 +1,6 @@
 import { api } from "encore.dev/api";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
+import { paymentPaid } from "../shared/events/index.js";
 import {
   normalizeSyncpayWebhook,
   normalizeBuckpayWebhook,
@@ -34,6 +35,8 @@ async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: un
   if (payment) {
     if (event.status === "paid") {
       await payRepo.markPaid(payment.id, event.amount ?? undefined);
+      // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
+      await paymentPaid.publish({ paymentId: payment.id });
     } else if (event.status === "cancelled" || event.status === "expired") {
       await payRepo.updateStatus(payment.id, event.status);
     }

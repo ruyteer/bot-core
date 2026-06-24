@@ -3,12 +3,16 @@ import { api } from "encore.dev/api";
 import { eq, and, lte } from "drizzle-orm";
 import { db } from "../shared/database.js";
 import { scheduledDelays, bots, leads, leadVariables } from "../shared/schema/index.js";
-import { telegramUpdateReceived } from "../shared/events/index.js";
+import { telegramUpdateReceived, paymentPaid } from "../shared/events/index.js";
 import { ExecuteFlowStepUseCase } from "./application/execute-flow-step.use-case.js";
+import { ExecuteSimplifiedFunnelUseCase } from "./application/execute-simplified-funnel.use-case.js";
+import { PaymentDrizzleRepository } from "../payments/infrastructure/payment.drizzle.repository.js";
 import { decrypt } from "../shared/crypto.js";
 import { TelegramClient } from "./application/telegram.client.js";
 
-const executeFlowStep = new ExecuteFlowStepUseCase();
+const executeFlowStep   = new ExecuteFlowStepUseCase();
+const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
+const payRepo           = new PaymentDrizzleRepository();
 
 // ── Telegram update subscriber ────────────────────────────────────────────────
 
@@ -18,6 +22,23 @@ const _sub = new Subscription(telegramUpdateReceived, "runner-process-update", {
       await executeFlowStep.execute({ botId: event.botId, update: event.update });
     } catch (err) {
       console.error(`[runner] error processing update for bot ${event.botId}:`, err);
+    }
+  },
+});
+
+// ── Payment paid subscriber ───────────────────────────────────────────────────
+// Quando o webhook confirma um pagamento, entrega o produto e retoma o funil.
+
+const _paidSub = new Subscription(paymentPaid, "runner-payment-paid", {
+  handler: async (event) => {
+    try {
+      const payment = await payRepo.findById(event.paymentId);
+      if (!payment) return;
+      // Simplificado: entrega itens + agenda upsells. Flow: retoma pelo handle __paid.
+      if (payment.simplifiedCtx) await simplifiedFunnel.deliverPaid(payment);
+      else                       await executeFlowStep.handlePaidOffer(payment);
+    } catch (err) {
+      console.error(`[runner] error handling paid payment ${event.paymentId}:`, err);
     }
   },
 });
@@ -83,7 +104,9 @@ async function tickDelays(): Promise<void> {
   delaysTickRunning = true;
   try {
     const n = await runDuePendingDelays();
+    const m = await simplifiedFunnel.processDueTasks();
     if (n > 0) console.log(`[runner] scheduler: ${n} delay(s) processado(s)`);
+    if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
   } catch (err) {
     console.error("[runner] scheduler tick falhou:", err);
   } finally {

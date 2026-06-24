@@ -199,6 +199,25 @@ export const scheduledDelays = pgTable("scheduled_delays", {
   createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Tarefas agendadas do funil SIMPLIFICADO (upsell pós-compra, downsell pós-PIX
+// sem pagamento). Processadas pelo tick de 60s do runner — não cabem em
+// scheduled_delays (que exige um nó de fluxo).
+export const simplifiedScheduledTasks = pgTable("simplified_scheduled_tasks", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  leadId:    uuid("lead_id").notNull().references(() => leads.id, { onDelete: "cascade" }),
+  funnelId:  uuid("funnel_id").notNull().references(() => funnels.id, { onDelete: "cascade" }),
+  kind:      text("kind").notNull(),               // "upsell" | "downsell"
+  refId:     text("ref_id").notNull(),             // id do upsell/downsell no simplified_config
+  paymentId: uuid("payment_id").references(() => payments.id, { onDelete: "set null" }),
+  executeAt: timestamp("execute_at", { withTimezone: true }).notNull(),
+  status:    text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  // Idempotência no agendamento (retry não duplica).
+  unique("simplified_scheduled_payment_kind_ref_unique").on(t.paymentId, t.kind, t.refId),
+]);
+
 // ─── PAYMENTS ─────────────────────────────────────────────────────────────────
 
 export const paymentGateways = pgTable("payment_gateways", {
@@ -233,6 +252,14 @@ export const payments = pgTable("payments", {
   endToEnd:         text("end_to_end"),
   paidAt:           timestamp("paid_at", { withTimezone: true }),
   description:      text("description"),
+  // Funnel resume context — let the "paid" webhook resume the funnel where it stopped
+  funnelId:         uuid("funnel_id").references(() => funnels.id, { onDelete: "set null" }),
+  progressId:       uuid("progress_id").references(() => leadProgress.id, { onDelete: "set null" }),
+  nodeId:           uuid("node_id").references(() => funnelNodes.id, { onDelete: "set null" }),
+  paidHandle:       text("paid_handle"),   // source_handle to follow when paid, e.g. "<callback>__paid"
+  // Snapshot do contexto de entrega do funil SIMPLIFICADO (não tem nós/funnel_offers):
+  // { kind: "plan"|"upsell"|"downsell", funnelId, planId?, items: [{name, delivery_type, ...}] }
+  simplifiedCtx:    jsonb("simplified_ctx"),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:        timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -492,6 +519,7 @@ export type NodeConnection                = typeof nodeConnections.$inferSelect;
 export type FunnelOffer                   = typeof funnelOffers.$inferSelect;
 export type LeadProgress                  = typeof leadProgress.$inferSelect;
 export type ScheduledDelay                = typeof scheduledDelays.$inferSelect;
+export type SimplifiedScheduledTask       = typeof simplifiedScheduledTasks.$inferSelect;
 export type PaymentGateway                = typeof paymentGateways.$inferSelect;
 export type Payment                       = typeof payments.$inferSelect;
 export type ScheduledMessage              = typeof scheduledMessages.$inferSelect;
