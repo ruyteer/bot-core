@@ -67,12 +67,14 @@ export async function buckpayCashIn(
   });
   const json = await res.json() as {
     data?:  { id?: string; pix?: { code?: string; qrcode_base64?: string } };
-    error?: { message?: string };
+    error?: { message?: string; detail?: unknown };
     message?: string;
   };
   const tx = json.data;
-  if (!tx?.id || !tx.pix?.code) {
-    throw new Error(json.error?.message ?? json.message ?? "BuckPay cashin failed");
+  if (!res.ok || !tx?.id || !tx.pix?.code) {
+    const msg    = json.error?.message ?? json.message ?? "BuckPay cashin failed";
+    const detail = json.error?.detail ? ` detail=${JSON.stringify(json.error.detail)}` : "";
+    throw new Error(`BuckPay ${res.status}: ${msg}${detail}`);
   }
   return {
     pixCode:     tx.pix.code,
