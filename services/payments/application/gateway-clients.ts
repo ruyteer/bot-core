@@ -78,10 +78,9 @@ export async function buckpayCashIn(
   }
   return {
     pixCode:     tx.pix.code,
-    // A API já devolve o QR em base64; usa-o direto e cai no gerador externo só se faltar.
-    qrImage:     tx.pix.qrcode_base64
-      ? `data:image/png;base64,${tx.pix.qrcode_base64}`
-      : `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
+    // A API devolve o QR em base64, mas o Telegram só aceita URL/file_id no campo
+    // `photo` (não data-URI), então gera a imagem via qrserver a partir do código.
+    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
     externalId:  String(tx.id),
     amount:      amountCents,
     provider:    "buckpay",
