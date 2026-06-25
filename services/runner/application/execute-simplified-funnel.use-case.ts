@@ -374,6 +374,9 @@ export class ExecuteSimplifiedFunnelUseCase {
     refKey: string;
   }): Promise<{ paymentId: string | null; reused: boolean }> {
     const { bot, lead, chatId, tg, payCfg, amount, productName, ctx, refKey } = opts;
+    // amount chega em REAIS (preços do funil simplificado); gateway e tabela
+    // payments trabalham em centavos. Display (fmtBRL) continua em reais.
+    const amountCents = Math.round(amount * 100);
     const gatewayId = String(payCfg.gateway_id || "");
     if (!gatewayId) {
       await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado neste funil.", protectContent: bot.protectContent });
@@ -381,7 +384,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
 
     // Dedup: reaproveita PIX pendente recente do mesmo (bot, lead, valor, ref).
-    const existing = await payRepo.findReusablePending(bot.id, lead.id, amount, refKey);
+    const existing = await payRepo.findReusablePending(bot.id, lead.id, amountCents, refKey);
     if (existing?.pixCode) {
       await this.sendPixMessages(tg, chatId, existing.pixCode, amount, productName, payCfg, bot.protectContent);
       return { paymentId: existing.id, reused: true };
@@ -397,7 +400,7 @@ export class ExecuteSimplifiedFunnelUseCase {
 
     let pix;
     try {
-      pix = await createPix(gw.provider, clientId, clientSecret, amount, productName, webhookUrl);
+      pix = await createPix(gw.provider, clientId, clientSecret, amountCents, productName, webhookUrl);
     } catch (err) {
       console.error("[simplified] createPix falhou:", err);
       await tg.sendMessage({ chatId, text: "⚠️ Erro ao gerar PIX. Tente novamente.", protectContent: bot.protectContent });
@@ -411,7 +414,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       gatewayId:        gw.id,
       offerName:        productName,
       offerExternalRef: refKey,
-      amount,
+      amount:           amountCents,
       status:           "pending",
       externalId:       pix.externalId,
       pixCode:          pix.pixCode,

@@ -628,10 +628,11 @@ export class ExecuteFlowStepUseCase {
     if (offers.length === 0) return;
 
     const keyboard = offers.map((o, i) => {
+      // price vem do nó do funil em REAIS (MoneyInput no front emite reais).
       const price = typeof o.price === "number" ? o.price : 0;
       const label = (typeof o.button_text === "string" && o.button_text)
         ? o.button_text
-        : `Comprar — R$ ${(price / 100).toFixed(2)}`;
+        : `Comprar — R$ ${price.toFixed(2)}`;
       return [{ text: label, callback_data: `offer:${i}` }];
     });
 
@@ -661,7 +662,8 @@ export class ExecuteFlowStepUseCase {
     tg:     TelegramClient,
   ): Promise<void> {
     const gatewayId = typeof offer.gateway_id === "string" ? offer.gateway_id : "";
-    const amount    = typeof offer.price === "number" ? offer.price : 0;
+    // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
+    const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
     const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
 
     if (!gatewayId || amount <= 0) {
