@@ -23,6 +23,14 @@
         "flow-step-executed": {
           "name": "flow-step-executed",
           "subscriptions": {}
+        },
+        "payment-paid": {
+          "name": "payment-paid",
+          "subscriptions": {
+            "runner-payment-paid": {
+              "name": "runner-payment-paid"
+            }
+          }
         }
       }
     }
