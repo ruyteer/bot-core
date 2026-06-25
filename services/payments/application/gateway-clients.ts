@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { PixPaymentResult, Provider } from "../domain/gateway.entity.js";
 
 // ── SyncPay ───────────────────────────────────────────────────────────────────
@@ -40,27 +41,46 @@ export async function syncpayCashIn(
 }
 
 // ── BuckPay ───────────────────────────────────────────────────────────────────
+// API real fica em api.realtechdev.com.br (white-label). Doc: docs.buckpay.com.br.
+// O header User-Agent é OBRIGATÓRIO e específico da conta (fornecido pelo gerente
+// de contas da BuckPay) — sem o valor correto a requisição é rejeitada.
+const BUCKPAY_BASE_URL   = "https://api.realtechdev.com.br";
+const BUCKPAY_USER_AGENT = "Buckpay API"; // valor fornecido pelo gerente de contas BuckPay
 
 export async function buckpayCashIn(
   apiToken: string,
   amountCents: number, description: string, webhookUrl: string,
 ): Promise<PixPaymentResult> {
-  const res = await fetch("https://api.buckpay.com.br/api/v1/transactions", {
+  const res = await fetch(`${BUCKPAY_BASE_URL}/v1/transactions`, {
     method:  "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiToken}` },
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent":   BUCKPAY_USER_AGENT,
+      Authorization:  `Bearer ${apiToken}`,
+    },
     body: JSON.stringify({
-      amount:       amountCents / 100,
-      payment_type: "pix",
-      description,
-      callback_url: webhookUrl,
+      external_id:    randomUUID(),
+      payment_method: "pix",
+      amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
+      postbackUrl:    webhookUrl,
     }),
   });
-  const data = await res.json() as { pix_qr_code?: string; id?: string; message?: string; error?: string };
-  if (!data.pix_qr_code || !data.id) throw new Error(data.message ?? data.error ?? "BuckPay cashin failed");
+  const json = await res.json() as {
+    data?:  { id?: string; pix?: { code?: string; qrcode_base64?: string } };
+    error?: { message?: string };
+    message?: string;
+  };
+  const tx = json.data;
+  if (!tx?.id || !tx.pix?.code) {
+    throw new Error(json.error?.message ?? json.message ?? "BuckPay cashin failed");
+  }
   return {
-    pixCode:     data.pix_qr_code,
-    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.pix_qr_code)}`,
-    externalId:  String(data.id),
+    pixCode:     tx.pix.code,
+    // A API já devolve o QR em base64; usa-o direto e cai no gerador externo só se faltar.
+    qrImage:     tx.pix.qrcode_base64
+      ? `data:image/png;base64,${tx.pix.qrcode_base64}`
+      : `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
+    externalId:  String(tx.id),
     amount:      amountCents,
     provider:    "buckpay",
     institution: "BuckPay",
@@ -166,16 +186,21 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
 }
 
 export function normalizeBuckpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
-  const id      = String(body.id ?? body.transaction_id ?? "");
-  const statusRaw = (body.status ?? "") as string;
-  const isPaid  = statusRaw === "paid" || statusRaw === "approved" || statusRaw === "completed";
-  const status  = isPaid ? "paid" : statusRaw === "cancelled" ? "cancelled" : statusRaw === "expired" ? "expired" : "pending";
+  // O webhook (evento transaction-processed) traz a transação aninhada em `data`,
+  // mesmo shape da resposta de criação; mantém fallback p/ payload plano por segurança.
+  const data = (body.data && typeof body.data === "object" ? body.data : body) as Record<string, unknown>;
+  const id        = String(data.id ?? data.transaction_id ?? data.external_id ?? "");
+  const statusRaw = String(data.status ?? body.event ?? "");
+  const isPaid    = statusRaw === "paid" || statusRaw === "approved" || statusRaw === "completed";
+  const status    = isPaid ? "paid" : statusRaw === "cancelled" ? "cancelled" : statusRaw === "expired" ? "expired" : "pending";
+  // total_amount já vem em centavos (inteiro).
+  const amountRaw = data.total_amount ?? data.amount;
   return {
     externalId: id,
     provider:   "buckpay",
     status,
-    amount:     typeof body.amount === "number" ? Math.round(body.amount * 100) : null,
-    event:      statusRaw,
+    amount:     typeof amountRaw === "number" ? Math.round(amountRaw) : null,
+    event:      String(body.event ?? statusRaw),
   };
 }
 
