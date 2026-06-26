@@ -71,6 +71,21 @@ export class TelegramClient {
     await this.call("sendVoice", { chat_id: chatId, voice, protect_content: protectContent });
   }
 
+  // Busca metadados de um chat (título, tipo). Retorna null se a API falhar
+  // (ex.: bot sem acesso). Usado p/ nomear grupos/canais salvos.
+  async getChat(chatId: string): Promise<{ id: number; type: string; title?: string } | null> {
+    try {
+      return await this.call("getChat", { chat_id: chatId }) as { id: number; type: string; title?: string };
+    } catch {
+      return null;
+    }
+  }
+
+  // Indicador de "digitando…"/"gravando áudio…" etc. Best-effort (não lança).
+  async sendChatAction(chatId: string, action: string): Promise<void> {
+    await this.call("sendChatAction", { chat_id: chatId, action }).catch(() => {});
+  }
+
   async answerCallbackQuery(opts: AnswerCallbackOptions): Promise<void> {
     await this.call("answerCallbackQuery", {
       callback_query_id: opts.callbackQueryId,

@@ -15,10 +15,20 @@ export interface TelegramCallbackQuery {
   data?: string;
 }
 
+// Disparado quando o status do PRÓPRIO bot muda num chat (ex.: virou admin de
+// um grupo/canal, ou foi removido). Requer "my_chat_member" em allowed_updates.
+export interface TelegramChatMemberUpdated {
+  chat: { id: number; type: string; title?: string };
+  from?: { id: number; first_name?: string; username?: string };
+  new_chat_member?: { status: string; user?: { id: number; is_bot?: boolean } };
+  old_chat_member?: { status: string };
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessageUpdate;
   callback_query?: TelegramCallbackQuery;
+  my_chat_member?: TelegramChatMemberUpdated;
 }
 
 export interface TelegramUpdateEvent {

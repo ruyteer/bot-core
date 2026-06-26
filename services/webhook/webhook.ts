@@ -65,7 +65,7 @@ export const registerWebhook = api(
         body: JSON.stringify({
           url:          webhookUrl,
           secret_token: bot.webhookSecret,
-          allowed_updates: ["message", "callback_query"],
+          allowed_updates: ["message", "callback_query", "my_chat_member"],
         }),
       },
     );

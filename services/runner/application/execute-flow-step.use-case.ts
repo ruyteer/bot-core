@@ -2,12 +2,12 @@ import { eq, and, ne, desc } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
-  funnels, funnelNodes, nodeConnections, scheduledDelays, bots,
+  funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { interpolate } from "./interpolate.js";
-import type { TelegramUpdate } from "../../shared/events/index.js";
+import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
 // Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
 // puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
 // importáveis aqui sem cruzar a fronteira de serviço.
@@ -140,6 +140,12 @@ export class ExecuteFlowStepUseCase {
   async execute(ctx: ExecutionContext): Promise<void> {
     const { botId, update } = ctx;
 
+    // ── Bot adicionado/removido de grupo/canal (my_chat_member) ─────────────
+    if (update.my_chat_member) {
+      await this.handleChatMemberEvent(botId, update.my_chat_member);
+      return;
+    }
+
     // Identify sender + message text
     const from = update.message?.from ?? update.callback_query?.from;
     if (!from) return;
@@ -154,6 +160,16 @@ export class ExecuteFlowStepUseCase {
     if (!bot) return;
     const tg = new TelegramClient(decrypt(bot.telegramToken));
     const chatIdStr = chatId.toString();
+
+    // ── Mensagens em grupo/canal: `/id` salva o grupo e devolve o ID; as
+    //    demais são ignoradas (nunca registrar um grupo como lead) ──────────
+    const inboundChatType = update.message?.chat.type;
+    if (inboundChatType && inboundChatType !== "private") {
+      if (typeof messageText === "string" && messageText.trim().startsWith("/id")) {
+        await this.handleIdCommand(botId, update.message!.chat.id, inboundChatType, tg);
+      }
+      return;
+    }
 
     // Upsert lead
     const [lead] = await db.insert(leads).values({
@@ -324,6 +340,61 @@ export class ExecuteFlowStepUseCase {
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
         }
       }
+    }
+  }
+
+  // ── Grupo/canal: bot virou (ou deixou de ser) membro/admin ──────────────────
+  private async handleChatMemberEvent(botId: string, ev: TelegramChatMemberUpdated): Promise<void> {
+    const status = ev.new_chat_member?.status;
+    const isBot  = ev.new_chat_member?.user?.is_bot;
+    const type   = ev.chat?.type;
+    if (!isBot || (type !== "group" && type !== "supergroup" && type !== "channel")) return;
+
+    const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
+    if (!bot || !bot.isActive) return;
+    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const chatId = ev.chat.id;
+
+    // Removido/saiu → remove do sistema.
+    if (status === "left" || status === "kicked") {
+      await db.delete(botGroups).where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, BigInt(chatId))));
+      return;
+    }
+
+    // Adicionado como membro/admin → salva + envia o ID no chat.
+    if (status === "member" || status === "administrator") {
+      const isChannel = type === "channel";
+      const label = isChannel ? "Canal" : "Grupo";
+      const info = await tg.getChat(String(chatId));
+      const name = info?.title || label;
+      await this.upsertGroup(botId, BigInt(chatId), name, type);
+
+      const permissionNote = isChannel
+        ? `permissão de "<b>Postar mensagens</b>"`
+        : `permissão de "<b>Banir usuários</b>"`;
+      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem ${permissionNote}\n2️⃣ No painel, vá em <b>Produtos</b> e crie um produto do tipo "<b>${label} VIP</b>"\n3️⃣ Cole o ID no campo "ID do Grupo Telegram"\n\n🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>`;
+      await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
+    }
+  }
+
+  // ── Comando `/id` em grupo/canal: salva e devolve o ID ──────────────────────
+  private async handleIdCommand(botId: string, chatId: number, type: string, tg: TelegramClient): Promise<void> {
+    const label = type === "channel" ? "Canal" : "Grupo";
+    const info  = await tg.getChat(String(chatId));
+    const name  = info?.title || label;
+    await this.upsertGroup(botId, BigInt(chatId), name, type);
+    const msg = `🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>\n\n✅ ${label} salvo automaticamente no painel.`;
+    await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
+  }
+
+  // Upsert de grupo por (botId, telegramChatId) — sem depender de constraint única.
+  private async upsertGroup(botId: string, chatId: bigint, name: string, type: string): Promise<void> {
+    const [existing] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, chatId)));
+    if (existing) {
+      await db.update(botGroups).set({ name, type, updatedAt: new Date() }).where(eq(botGroups.id, existing.id));
+    } else {
+      await db.insert(botGroups).values({ botId, telegramChatId: chatId, name, type });
     }
   }
 
