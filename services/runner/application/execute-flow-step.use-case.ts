@@ -587,6 +587,9 @@ export class ExecuteFlowStepUseCase {
         await this.executeOfferNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, kind: "offer", nodeId: node.id });
         await advanceProgress(progressId, node.id, "active");
+        // Se o lead nunca clicar em comprar, dispara o ramo __no_action após o
+        // unpaid_timeout. Cancelado quando ele clica (handleOfferPurchase).
+        await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
         return;
     }
 
@@ -612,6 +615,10 @@ export class ExecuteFlowStepUseCase {
 
     if (blocks.length > 0) {
       for (const block of blocks) {
+        // "digitando…"/"gravando áudio…" antes de enviar o bloco (cosmético, auto-expira ~5s).
+        if (block.simulate_typing)         await tg.sendChatAction(chatId, "typing");
+        else if (block.simulate_recording) await tg.sendChatAction(chatId, "record_voice");
+
         const url       = block.url as string | undefined;
         const text      = (block.message ?? block.content ?? block.text) as string | undefined;
         const caption   = typeof block.caption === "string" ? escapeHtml(interpolate(block.caption, vars)) : undefined;
@@ -721,6 +728,34 @@ export class ExecuteFlowStepUseCase {
     }
   }
 
+  // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
+  // Usa `unpaid_timeout` (minutos, default 5, mín. 60s) do conteúdo do nó. Agenda
+  // um delay por oferta cujo handle (`<handleId>__no_action|__pending`) tenha
+  // conexão. Para __pending, só a oferta `onlyIdx` (a que o lead clicou).
+  private async scheduleOfferTimeouts(
+    funnelId:   string,
+    node:       typeof funnelNodes.$inferSelect,
+    progressId: string,
+    leadId:     string,
+    botId:      string,
+    suffix:     "__no_action" | "__pending",
+    onlyIdx?:   number,
+  ): Promise<void> {
+    const content = node.content as { offers?: Array<Record<string, unknown>>; unpaid_timeout?: number };
+    const offers  = content.offers ?? [];
+    const timeoutMin = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+    const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
+
+    for (let i = 0; i < offers.length; i++) {
+      if (onlyIdx !== undefined && i !== onlyIdx) continue;
+      const target = await nextNode(funnelId, node.id, `${offerHandleId(offers[i], i)}${suffix}`);
+      if (!target) continue;
+      await db.insert(scheduledDelays).values({
+        botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
+      });
+    }
+  }
+
   // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
   private async handleOfferPurchase(
     offer:  Record<string, unknown>,
@@ -732,6 +767,13 @@ export class ExecuteFlowStepUseCase {
     chatId: string,
     tg:     TelegramClient,
   ): Promise<void> {
+    // O lead interagiu com a oferta → cancela os timeouts __no_action pendentes
+    // deste progresso (só há os do nó de oferta atual).
+    await db.delete(scheduledDelays).where(and(
+      eq(scheduledDelays.progressId, prog.id),
+      eq(scheduledDelays.status, "pending"),
+    ));
+
     const gatewayId = typeof offer.gateway_id === "string" ? offer.gateway_id : "";
     // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
     const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
@@ -778,6 +820,10 @@ export class ExecuteFlowStepUseCase {
       paidHandle:  `${offerHandleId(offer, idx)}__paid`,
     });
 
+    // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
+    // Cancelado quando o pagamento confirma (handlePaidOffer).
+    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "__pending", idx);
+
     const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
     await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
@@ -799,6 +845,12 @@ export class ExecuteFlowStepUseCase {
     const tg     = new TelegramClient(decrypt(bot.telegramToken));
     const chatId = lead.telegramChatId.toString();
     const vars   = await getVars(lead.id, bot.id);
+
+    // Pagou → cancela o timeout __pending pendente deste progresso.
+    await db.delete(scheduledDelays).where(and(
+      eq(scheduledDelays.progressId, payment.progressId),
+      eq(scheduledDelays.status, "pending"),
+    ));
 
     // Localiza a oferta paga p/ entregar o produto (handle sem o sufixo __paid).
     const handleId = payment.paidHandle.replace(/__paid$/, "");
