@@ -31,6 +31,33 @@ function offerHandleId(offer: Record<string, unknown>, i: number): string {
   return callback || name || `offer_${i}`;
 }
 
+// Coleta as ofertas "compráveis" de um nó com o handleId EXATO que o frontend usa
+// nos conectores (`<handleId>__paid|__pending|__no_action`). Cobre o nó `offer`
+// dedicado (content.offers) e blocos de oferta dentro de um nó `message`
+// (blocks[].offers, cujo fallback de handle é `offer_<blockIdx>_<offerIdx>`).
+// A ordem do retorno é o índice usado no callback `offer:<i>`.
+function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Record<string, unknown>; handleId: string }> {
+  const out: Array<{ offer: Record<string, unknown>; handleId: string }> = [];
+  const direct = content.offers as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(direct)) {
+    direct.forEach((offer, i) => out.push({ offer, handleId: offerHandleId(offer, i) }));
+  }
+  const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(blocks)) {
+    blocks.forEach((block, blockIdx) => {
+      if (block.type !== "offer") return;
+      const offers = block.offers as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(offers)) return;
+      offers.forEach((offer, offerIdx) => {
+        const callback = typeof offer.callback === "string" ? offer.callback : "";
+        const name     = typeof offer.product_name === "string" ? offer.product_name : "";
+        out.push({ offer, handleId: callback || name || `offer_${blockIdx}_${offerIdx}` });
+      });
+    });
+  }
+  return out;
+}
+
 interface ExecutionContext {
   botId:  string;
   update: TelegramUpdate;
@@ -268,23 +295,24 @@ export class ExecuteFlowStepUseCase {
         ? (await db.select().from(funnelNodes).where(eq(funnelNodes.id, prog.currentNodeId)))[0]
         : null;
 
+      // Clique num botão de compra (callback `offer:<i>`, curto p/ caber no limite
+      // de 64 bytes do TG). Funciona no nó `offer` dedicado E em ofertas embutidas
+      // num nó `message` — o índice é resolvido pela mesma ordem de collectNodeOffers.
+      if (currentNode && callbackData.startsWith("offer:")) {
+        const offersList = collectNodeOffers(currentNode.content as Record<string, unknown>);
+        const idx = parseInt(callbackData.slice("offer:".length), 10);
+        const picked = Number.isInteger(idx) ? offersList[idx] : undefined;
+        if (picked) {
+          await this.handleOfferPurchase(picked.offer, picked.handleId, currentNode, prog, lead, bot, chatIdStr, tg);
+        }
+        return;
+      }
+
       if (currentNode?.type === "buttons") {
         const nextId = await nextNode(prog.funnelId, currentNode.id, callbackData);
         if (nextId) {
           await advanceProgress(prog.id, nextId, "active");
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
-        }
-        return;
-      }
-
-      // Clique num botão de compra do nó `offer` → gera PIX p/ aquela oferta.
-      // callback_data = `offer:<i>` (curto, evita o limite de 64 bytes do TG).
-      if (currentNode?.type === "offer" && callbackData.startsWith("offer:")) {
-        const idx = parseInt(callbackData.slice("offer:".length), 10);
-        const offers = (currentNode.content as { offers?: Array<Record<string, unknown>> }).offers ?? [];
-        const offer = Number.isInteger(idx) ? offers[idx] : undefined;
-        if (offer) {
-          await this.handleOfferPurchase(offer, idx, currentNode, prog, lead, bot, chatIdStr, tg);
         }
         return;
       }
@@ -438,10 +466,21 @@ export class ExecuteFlowStepUseCase {
     await advanceProgress(progressId, node.id, "active");
 
     switch (node.type) {
-      case "message":
+      case "message": {
         await this.executeMessageNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        // Nó de mensagem pode conter blocos de oferta (botões de compra). Se houver,
+        // comporta-se como nó offer: apresenta as ofertas, espera o clique e agenda
+        // o ramo __no_action — não avança automaticamente.
+        const msgOffers = collectNodeOffers(c);
+        if (msgOffers.length > 0) {
+          await this.presentOffers(c, msgOffers, chatId, tg, protect, vars);
+          await advanceProgress(progressId, node.id, "active");
+          await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
+          return;
+        }
         break;
+      }
 
       case "media":
         await this.executeMediaNode(c, chatId, tg, protect, vars);
@@ -700,26 +739,37 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    // Cada oferta vira um botão de compra; o clique (callback `offer:<i>`) gera
-    // o PIX. O texto/imagem vem da 1ª oferta + intro_message opcional.
-    const offers = (c.offers as Array<Record<string, unknown>>) ?? [];
-    if (offers.length === 0) return;
+    const offersList = collectNodeOffers(c);
+    if (offersList.length === 0) return;
+    await this.presentOffers(c, offersList, chatId, tg, protect, vars);
+  }
 
-    const keyboard = offers.map((o, i) => {
+  // Renderiza um botão de compra por oferta (callback `offer:<i>`, na ordem de
+  // collectNodeOffers). Texto/imagem vêm de intro_message + 1ª oferta.
+  private async presentOffers(
+    content:    Record<string, unknown>,
+    offersList: Array<{ offer: Record<string, unknown>; handleId: string }>,
+    chatId:     string,
+    tg:         TelegramClient,
+    protect:    boolean,
+    vars:       Map<string, string>,
+  ): Promise<void> {
+    const keyboard = offersList.map(({ offer }, i) => {
       // price vem do nó do funil em REAIS (MoneyInput no front emite reais).
-      const price = typeof o.price === "number" ? o.price : 0;
-      const label = (typeof o.button_text === "string" && o.button_text)
-        ? o.button_text
+      const price = typeof offer.price === "number" ? offer.price : 0;
+      const label = (typeof offer.button_text === "string" && offer.button_text)
+        ? offer.button_text
         : `Comprar — R$ ${price.toFixed(2)}`;
       return [{ text: label, callback_data: `offer:${i}` }];
     });
 
-    const intro = typeof c.intro_message === "string" && c.intro_message
-      ? escapeHtml(interpolate(c.intro_message, vars))
+    const intro = typeof content.intro_message === "string" && content.intro_message
+      ? escapeHtml(interpolate(content.intro_message, vars))
       : null;
-    const firstName = typeof offers[0].product_name === "string" ? offers[0].product_name : "";
+    const first = offersList[0].offer;
+    const firstName = typeof first.product_name === "string" ? first.product_name : "";
     const caption = intro ?? (firstName ? escapeHtml(interpolate(firstName, vars)) : "Escolha uma oferta:");
-    const image = typeof offers[0].image_url === "string" ? offers[0].image_url : "";
+    const image = typeof first.image_url === "string" ? first.image_url : "";
 
     if (image) {
       await tg.sendPhoto({ chatId, photo: image, caption, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
@@ -731,24 +781,24 @@ export class ExecuteFlowStepUseCase {
   // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
   // Usa `unpaid_timeout` (minutos, default 5, mín. 60s) do conteúdo do nó. Agenda
   // um delay por oferta cujo handle (`<handleId>__no_action|__pending`) tenha
-  // conexão. Para __pending, só a oferta `onlyIdx` (a que o lead clicou).
+  // conexão. Para __pending, só a oferta `onlyHandleId` (a que o lead clicou).
   private async scheduleOfferTimeouts(
-    funnelId:   string,
-    node:       typeof funnelNodes.$inferSelect,
-    progressId: string,
-    leadId:     string,
-    botId:      string,
-    suffix:     "__no_action" | "__pending",
-    onlyIdx?:   number,
+    funnelId:     string,
+    node:         typeof funnelNodes.$inferSelect,
+    progressId:   string,
+    leadId:       string,
+    botId:        string,
+    suffix:       "__no_action" | "__pending",
+    onlyHandleId?: string,
   ): Promise<void> {
-    const content = node.content as { offers?: Array<Record<string, unknown>>; unpaid_timeout?: number };
-    const offers  = content.offers ?? [];
+    const content = node.content as Record<string, unknown> & { unpaid_timeout?: number };
+    const offersList = collectNodeOffers(content);
     const timeoutMin = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
     const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
 
-    for (let i = 0; i < offers.length; i++) {
-      if (onlyIdx !== undefined && i !== onlyIdx) continue;
-      const target = await nextNode(funnelId, node.id, `${offerHandleId(offers[i], i)}${suffix}`);
+    for (const { handleId } of offersList) {
+      if (onlyHandleId !== undefined && handleId !== onlyHandleId) continue;
+      const target = await nextNode(funnelId, node.id, `${handleId}${suffix}`);
       if (!target) continue;
       await db.insert(scheduledDelays).values({
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
@@ -759,7 +809,7 @@ export class ExecuteFlowStepUseCase {
   // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
   private async handleOfferPurchase(
     offer:  Record<string, unknown>,
-    idx:    number,
+    handleId: string,
     node:   typeof funnelNodes.$inferSelect,
     prog:   typeof leadProgress.$inferSelect,
     lead:   typeof leads.$inferSelect,
@@ -817,12 +867,12 @@ export class ExecuteFlowStepUseCase {
       funnelId:    prog.funnelId,
       progressId:  prog.id,
       nodeId:      node.id,
-      paidHandle:  `${offerHandleId(offer, idx)}__paid`,
+      paidHandle:  `${handleId}__paid`,
     });
 
     // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
     // Cancelado quando o pagamento confirma (handlePaidOffer).
-    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "__pending", idx);
+    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "__pending", handleId);
 
     const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
@@ -853,9 +903,10 @@ export class ExecuteFlowStepUseCase {
     ));
 
     // Localiza a oferta paga p/ entregar o produto (handle sem o sufixo __paid).
+    // collectNodeOffers cobre tanto o nó offer quanto ofertas embutidas em message.
     const handleId = payment.paidHandle.replace(/__paid$/, "");
-    const offers   = (node.content as { offers?: Array<Record<string, unknown>> }).offers ?? [];
-    const offer    = offers.find((o, i) => offerHandleId(o, i) === handleId);
+    const offer    = collectNodeOffers(node.content as Record<string, unknown>)
+      .find((x) => x.handleId === handleId)?.offer;
     if (offer) {
       await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars)
         .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
