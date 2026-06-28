@@ -123,7 +123,7 @@ export const funnels = pgTable("funnels", {
   userId:           uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
   botId:            uuid("bot_id").references(() => bots.id, { onDelete: "set null" }),
   name:             text("name").notNull(),
-  kind:             text("kind").notNull().default("flow"),    // 'flow' | 'simple'
+  kind:             text("kind").notNull().default("flow"),    // 'flow' | 'simplified'
   isActive:         boolean("is_active").notNull().default(false),
   simplifiedConfig: jsonb("simplified_config").notNull().default({}),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),

@@ -13,7 +13,7 @@ const payRepo = new PaymentDrizzleRepository();
 
 // ── Shared handler ────────────────────────────────────────────────────────────
 
-async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<void> {
+export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<void> {
   if (!event.externalId) return;
 
   // Idempotency — skip if already processed with same status
@@ -45,19 +45,22 @@ async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: un
   await payRepo.markProcessed(event.externalId, event.provider, event.status);
 }
 
+// ── Helper p/ os 4 endpoints raw (lê body JSON, responde 200, processa) ─────────
+
+async function readJsonBody(req: AsyncIterable<Buffer>): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { return {}; }
+}
+
 // ── SyncPay ───────────────────────────────────────────────────────────────────
 
 export const syncpayWebhook = api.raw(
   { expose: true, method: "POST", path: "/payments/webhook/syncpay" },
   async (req, resp) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { /* ignore */ }
-
+    const body = await readJsonBody(req);
     resp.writeHead(200);
     resp.end("ok");
-
     const event = normalizeSyncpayWebhook(body);
     await processWebhookEvent(event, body, req.socket?.remoteAddress).catch(console.error);
   },
@@ -68,14 +71,9 @@ export const syncpayWebhook = api.raw(
 export const buckpayWebhook = api.raw(
   { expose: true, method: "POST", path: "/payments/webhook/buckpay" },
   async (req, resp) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { /* ignore */ }
-
+    const body = await readJsonBody(req);
     resp.writeHead(200);
     resp.end("ok");
-
     const event = normalizeBuckpayWebhook(body);
     await processWebhookEvent(event, body, req.socket?.remoteAddress).catch(console.error);
   },
@@ -86,14 +84,9 @@ export const buckpayWebhook = api.raw(
 export const nexuspagWebhook = api.raw(
   { expose: true, method: "POST", path: "/payments/webhook/nexuspag" },
   async (req, resp) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { /* ignore */ }
-
+    const body = await readJsonBody(req);
     resp.writeHead(200);
     resp.end("ok");
-
     const event = normalizeNexuspagWebhook(body);
     await processWebhookEvent(event, body, req.socket?.remoteAddress).catch(console.error);
   },
@@ -104,14 +97,9 @@ export const nexuspagWebhook = api.raw(
 export const wiinpayWebhook = api.raw(
   { expose: true, method: "POST", path: "/payments/webhook/wiinpay" },
   async (req, resp) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body: Record<string, unknown> = {};
-    try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { /* ignore */ }
-
+    const body = await readJsonBody(req);
     resp.writeHead(200);
     resp.end("ok");
-
     const event = normalizeWiinpayWebhook(body);
     await processWebhookEvent(event, body, req.socket?.remoteAddress).catch(console.error);
   },

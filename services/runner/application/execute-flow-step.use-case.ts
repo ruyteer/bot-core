@@ -690,21 +690,49 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    // Nó de mídia: { url, media_type, caption, extra_items[] }. Só o item
-    // principal tem caption; os extras (álbum) são enviados em sequência.
+    // Nó de mídia: { url, media_type, caption, extra_items[] }. Com 2+ itens de
+    // imagem/vídeo, envia como ÁLBUM (sendMediaGroup) — o Telegram agrupa numa só
+    // mensagem. Documentos/áudios não entram em álbum e vão individualmente.
+    // O caption (HTML) vai só no 1º item do álbum (limite do Telegram).
     const main   = { url: c.url, media_type: c.media_type, caption: c.caption } as Record<string, unknown>;
     const extras = (c.extra_items as Array<Record<string, unknown>>) ?? [];
-    const items  = [main, ...extras];
+    const items  = [main, ...extras].filter((it) => typeof it.url === "string" && it.url);
 
-    for (const it of items) {
-      const url = it.url as string | undefined;
-      if (!url) continue;
-      const caption   = typeof it.caption === "string" ? escapeHtml(interpolate(it.caption, vars)) : undefined;
-      const mediaType = it.media_type as string | undefined;
-      if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
-      else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
-      else                               await tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
+    const capOf  = (it: Record<string, unknown>): string | undefined =>
+      typeof it.caption === "string" ? escapeHtml(interpolate(it.caption, vars)) : undefined;
+    const typeOf = (it: Record<string, unknown>): string => (it.media_type as string) || "image";
+    const isAlbumType = (t: string): boolean => t === "image" || t === "photo" || t === "video";
+
+    const single = (it: Record<string, unknown>): Promise<void> => {
+      const url = it.url as string;
+      const caption = capOf(it);
+      const t = typeOf(it);
+      if (t === "video")    return tg.sendVideo(chatId, url, caption, protect);
+      if (t === "document") return tg.sendDocument(chatId, url, caption, protect);
+      if (t === "audio")    return tg.sendAudio(chatId, url, caption, protect);
+      return tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
+    };
+
+    const albumItems = items.filter((it) => isAlbumType(typeOf(it)));
+    if (albumItems.length >= 2) {
+      try {
+        await tg.sendMediaGroup(
+          chatId,
+          albumItems.map((it, i) => ({
+            type:    typeOf(it) === "video" ? "video" as const : "photo" as const,
+            media:   it.url as string,
+            caption: i === 0 ? capOf(it) : undefined,
+          })),
+          protect,
+        );
+      } catch {
+        for (const it of albumItems) await single(it);
+      }
+      for (const it of items) if (!isAlbumType(typeOf(it))) await single(it);
+      return;
     }
+
+    for (const it of items) await single(it);
   }
 
   private async executeButtonsNode(
