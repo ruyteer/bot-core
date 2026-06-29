@@ -141,3 +141,12 @@ describe("simplified — roteamento via execute-flow-step", () => {
     expect(getSentMessages().some((m) => m.includes("Olá simplificado"))).toBe(true);
   });
 });
+
+describe("simplified — interpolação de {{first_name}} (bug #1)", () => {
+  it("welcome interpola o nome do lead", async () => {
+    const { bot, funnelId, chatId } = await baseFunnel({ welcome: { text: "Olá {{first_name}}!" } });
+    const r = await rows(bot.id, funnelId, chatId); // lead.firstName = "Lead"
+    await simplified.handle({ bot: r.bot, lead: r.lead, chatId: chatId.toString(), funnel: r.funnel, text: "/start", callbackData: null, callbackMessageId: null, tg });
+    expect(getSentMessages().some((m) => m.includes("Olá Lead!"))).toBe(true);
+  });
+});

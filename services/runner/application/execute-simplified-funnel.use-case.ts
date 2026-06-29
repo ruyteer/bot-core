@@ -4,6 +4,7 @@ import {
   bots, leads, funnels, payments, simplifiedScheduledTasks,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
+import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
@@ -136,6 +137,8 @@ export class ExecuteSimplifiedFunnelUseCase {
   // Retorna true se tratou; false se o caller deve seguir o fluxo normal (flow).
   async handle(ctx: SimplifiedCtx): Promise<boolean> {
     const { bot, lead, chatId, funnel, text, callbackData, callbackMessageId, tg } = ctx;
+    const leadVars = leadFieldsMap(lead); // {{first_name}}, {{username}}, ... do lead
+    const itp = (t: string) => interpolate(t, leadVars);
     const cfg     = (funnel.simplifiedConfig as Record<string, unknown>) || {};
     const plans   = (cfg.plans as Array<Record<string, unknown>>) ?? [];
     const bumps   = (cfg.order_bumps as Array<Record<string, unknown>>) ?? [];
@@ -228,12 +231,12 @@ export class ExecuteSimplifiedFunnelUseCase {
 
     // ── Callback: CTA aceitar / recusar ──
     if (callbackData === `sc_accept_${funnel.id}`) {
-      await this.sendPlansBlock(tg, chatId, plans, cfg, protect);
+      await this.sendPlansBlock(tg, chatId, plans, cfg, protect, leadVars);
       return true;
     }
     if (callbackData === `sc_decline_${funnel.id}`) {
       const cta = (cfg.cta as Record<string, unknown>) || {};
-      const msg = (String(cta.decline_message || "Tudo bem! Use /start quando quiser ver as ofertas.")).trim();
+      const msg = itp((String(cta.decline_message || "Tudo bem! Use /start quando quiser ver as ofertas.")).trim());
       if (msg) await send(msg);
       return true;
     }
@@ -249,7 +252,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     const welcome = (cfg.welcome as Record<string, unknown>) || {};
     const cta     = (cfg.cta as Record<string, unknown>) || {};
     const ctaEnabled = !!cta.enabled && !!String(cta.text || "").trim();
-    const welcomeText = String(welcome.text || (ctaEnabled ? "" : "Bem-vindo! Escolha um plano abaixo:")).trim();
+    const welcomeText = itp(String(welcome.text || (ctaEnabled ? "" : "Bem-vindo! Escolha um plano abaixo:")).trim());
 
     const welcomeKeyboard: Array<Array<Record<string, unknown>>> = [];
     if (!ctaEnabled) {
@@ -273,7 +276,7 @@ export class ExecuteSimplifiedFunnelUseCase {
         { text: String(cta.decline_label || "Agora não"), callback_data: `sc_decline_${funnel.id}` },
       ]];
       await sendMediaBlock({
-        tg, chatId, media: readSimpleMediaList(cta), caption: String(cta.text || "").trim(),
+        tg, chatId, media: readSimpleMediaList(cta), caption: itp(String(cta.text || "").trim()),
         replyMarkup: { inline_keyboard: ctaKeyboard }, protect,
       });
     }
@@ -281,7 +284,7 @@ export class ExecuteSimplifiedFunnelUseCase {
   }
 
   // ── Bloco de planos ──
-  private async sendPlansBlock(tg: TelegramClient, chatId: string, plans: Array<Record<string, unknown>>, cfg: Record<string, unknown>, protect: boolean): Promise<void> {
+  private async sendPlansBlock(tg: TelegramClient, chatId: string, plans: Array<Record<string, unknown>>, cfg: Record<string, unknown>, protect: boolean, leadVars: Map<string, string>): Promise<void> {
     const cta = (cfg.cta as Record<string, unknown>) || {};
     const intro = String(cfg.plans_intro_text ?? cta.plans_intro_text ?? "").trim();
     const keyboard: Array<Array<Record<string, unknown>>> = [];
@@ -291,7 +294,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
     if (!keyboard.length) { await tg.sendMessage({ chatId, text: "⚠️ Nenhum plano configurado.", protectContent: protect }); return; }
     const legacyDescr = plans.map((p) => (typeof p?.description === "string" ? p.description.trim() : "")).filter(Boolean);
-    const text = intro || legacyDescr.join("\n\n") || "Planos disponíveis:";
+    const text = interpolate(intro || legacyDescr.join("\n\n") || "Planos disponíveis:", leadVars);
     await tg.sendMessage({ chatId, text, replyMarkup: { inline_keyboard: keyboard }, protectContent: protect });
   }
 
@@ -484,8 +487,9 @@ export class ExecuteSimplifiedFunnelUseCase {
 
     await tg.sendMessage({ chatId, text: "✅ <b>Pagamento confirmado!</b>\n\nPreparando sua entrega...", protectContent: protect });
 
+    const leadVars = leadFieldsMap(lead);
     for (const item of ctx.items ?? []) {
-      await this.deliverItem(tg, chatId, item, lead.id, protect).catch((e) => console.error("[simplified] deliverItem:", e));
+      await this.deliverItem(tg, chatId, item, lead.id, protect, leadVars).catch((e) => console.error("[simplified] deliverItem:", e));
     }
 
     if (ctx.kind === "plan" && ctx.planId) {
@@ -494,19 +498,20 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
   }
 
-  private async deliverItem(tg: TelegramClient, chatId: string, item: SimplifiedDeliveryItem, leadId: string, protect: boolean): Promise<void> {
+  private async deliverItem(tg: TelegramClient, chatId: string, item: SimplifiedDeliveryItem, leadId: string, protect: boolean, leadVars: Map<string, string> = new Map()): Promise<void> {
+    const name = interpolate(item.name, leadVars);
     if (item.delivery_type === "content" && item.delivery_url) {
-      await tg.sendMessage({ chatId, text: `📦 <b>${item.name}</b>\n\n🔗 Acesse seu conteúdo:\n${item.delivery_url}`, protectContent: protect });
+      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n🔗 Acesse seu conteúdo:\n${interpolate(item.delivery_url, leadVars)}`, protectContent: protect });
     } else if (item.delivery_type === "text" && item.delivery_text) {
-      await tg.sendMessage({ chatId, text: `📦 <b>${item.name}</b>\n\n${item.delivery_text}`, protectContent: protect });
+      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n${interpolate(item.delivery_text, leadVars)}`, protectContent: protect });
     } else if (item.delivery_type === "vip_group" && item.vip_group_id) {
       const expireDate = (item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined;
       try {
         const link = await tg.createChatInviteLink(item.vip_group_id, { memberLimit: 1, expireDate });
-        await tg.sendMessage({ chatId, text: `🎉 <b>${item.name}</b>\n\n🔗 Entre no grupo VIP:\n${link}\n\n⚠️ Este link é único e só pode ser usado uma vez.`, protectContent: protect });
+        await tg.sendMessage({ chatId, text: `🎉 <b>${name}</b>\n\n🔗 Entre no grupo VIP:\n${link}\n\n⚠️ Este link é único e só pode ser usado uma vez.`, protectContent: protect });
       } catch (err) {
         console.error("[simplified] createChatInviteLink:", err);
-        await tg.sendMessage({ chatId, text: `📦 <b>${item.name}</b>\n\n⚠️ Não foi possível gerar o link de convite automaticamente. Entre em contato com o suporte.`, protectContent: protect });
+        await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n⚠️ Não foi possível gerar o link de convite automaticamente. Entre em contato com o suporte.`, protectContent: protect });
       }
     }
   }

@@ -6,7 +6,7 @@ import {
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
-import { interpolate } from "./interpolate.js";
+import { interpolate, mergeLeadFields } from "./interpolate.js";
 import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
 // Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
 // puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
@@ -129,7 +129,12 @@ function passesValidation(kind: unknown, value: string): boolean {
 async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
   const rows = await db.select().from(leadVariables)
     .where(and(eq(leadVariables.leadId, leadId), eq(leadVariables.botId, botId)));
-  return new Map(rows.map((r) => [r.variableName, r.value]));
+  const map = new Map(rows.map((r) => [r.variableName, r.value]));
+  // Injeta campos nativos do lead ({{first_name}}, {{username}}, ...) sem
+  // sobrescrever variáveis já salvas pelo usuário.
+  const [lead] = await db.select().from(leads).where(eq(leads.id, leadId));
+  if (lead) mergeLeadFields(map, lead);
+  return map;
 }
 
 async function setVar(leadId: string, botId: string, name: string, value: string): Promise<void> {

@@ -298,3 +298,50 @@ describe("media node", () => {
     expect(getTelegramCalls("sendPhoto").length).toBe(1);
   });
 });
+
+// ── INTERPOLAÇÃO DE CAMPOS DE SISTEMA (bug #1) ──────────────────────────────
+describe("interpolação de campos do lead", () => {
+  it("{{first_name}} vira o nome do lead", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "Oi {{first_name}}!" } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(900, { firstName: "Carlos" }) });
+    expect(getSentMessages()).toContain("Oi Carlos!");
+  });
+
+  it("{{username}} vira o @username do lead", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "user: {{username}}" } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(901, { firstName: "X", username: "buck123" }) });
+    expect(getSentMessages()).toContain("user: buck123");
+  });
+
+  it("variável salva pelo usuário tem precedência sobre campo de sistema", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "ask", type: "input", content: { question: "?", variable_name: "first_name" } },
+        { key: "m", type: "message", content: { message: "valor: {{first_name}}" } },
+      ],
+      connections: [{ from: "t", to: "ask" }, { from: "ask", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(902, { firstName: "Sistema" }) });
+    await useCase.execute({ botId: bot.id, update: textUpdate(902, "DigitadoPeloUser") });
+    expect(getSentMessages()).toContain("valor: DigitadoPeloUser");
+  });
+});

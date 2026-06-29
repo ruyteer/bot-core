@@ -9,6 +9,9 @@ import { ExecuteSimplifiedFunnelUseCase } from "./application/execute-simplified
 import { PaymentDrizzleRepository } from "../payments/infrastructure/payment.drizzle.repository.js";
 import { decrypt } from "../shared/crypto.js";
 import { TelegramClient } from "./application/telegram.client.js";
+import { mergeLeadFields } from "./application/interpolate.js";
+import { processDueBroadcasts } from "../broadcasts/application/process-broadcasts.use-case.js";
+import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing/application/process-remarketing.use-case.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
@@ -68,6 +71,7 @@ async function runDuePendingDelays(): Promise<number> {
       const varRows = await db.select().from(leadVariables)
         .where(and(eq(leadVariables.leadId, delay.leadId), eq(leadVariables.botId, delay.botId)));
       const vars = new Map(varRows.map((v) => [v.variableName, v.value]));
+      mergeLeadFields(vars, lead);
 
       await executeFlowStep.resumeFromNode(
         delay.funnelId, delay.nextNodeId, delay.progressId,
@@ -105,8 +109,14 @@ async function tickDelays(): Promise<void> {
   try {
     const n = await runDuePendingDelays();
     const m = await simplifiedFunnel.processDueTasks();
+    const b = await processDueBroadcasts();
+    const enrolled = await enrollRemarketingTriggers();
+    const rmk = await processDueRemarketing();
     if (n > 0) console.log(`[runner] scheduler: ${n} delay(s) processado(s)`);
     if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
+    if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
+    if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);
+    if (rmk > 0) console.log(`[runner] scheduler: ${rmk} mensagem(ns) de remarketing enviada(s)`);
   } catch (err) {
     console.error("[runner] scheduler tick falhou:", err);
   } finally {
