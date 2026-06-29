@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueBroadcasts } from "./application/process-broadcasts.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { scheduledMessages, broadcastRuns, payments, leads } from "../shared/schema/index.js";
+import { scheduledMessages, broadcastRuns, payments, leads, funnelOffers } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 
@@ -123,5 +123,19 @@ describe("processDueBroadcasts — não envia para grupos (bug João)", () => {
     await seedMsg(bot.id, bot.userId, { message: "promo", filterType: "all", targetType: "leads" });
     await processDueBroadcasts();
     expect(getTelegramCalls("sendMessage").length).toBe(1); // só o usuário recebe
+  });
+});
+
+describe("processDueBroadcasts — oferta + botão (bug João)", () => {
+  it("renderiza o botão da oferta (bcast_buy) junto do conteúdo", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7100n);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await seedMsg(bot.id, bot.userId, { message: "promo", advancedFilters: { offers: [{ product_id: offer.id, button_text: "Comprar" }] } as Record<string, unknown> });
+    await processDueBroadcasts();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
+    expect(kb.flat().some((b) => b.callback_data === `bcast_buy_${offer.id}`)).toBe(true);
   });
 });

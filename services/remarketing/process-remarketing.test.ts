@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueRemarketing, enrollRemarketingTriggers } from "./application/process-remarketing.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { remarketingCampaigns, remarketingMessages, remarketingLeadState, payments, leads } from "../shared/schema/index.js";
+import { remarketingCampaigns, remarketingMessages, remarketingLeadState, payments, leads, funnelOffers } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
-import { getSentMessages } from "../../test/helpers/fetch-mock.js";
+import { getSentMessages, getTelegramCalls } from "../../test/helpers/fetch-mock.js";
 
 async function campaign(botId: string, over: Partial<typeof remarketingCampaigns.$inferInsert> = {}) {
   const db = await testDb();
@@ -99,5 +99,21 @@ describe("processDueRemarketing", () => {
     const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
     expect(after.status).toBe("completed");
     expect(after.cyclesCompleted).toBe(1);
+  });
+});
+
+describe("remarketing — oferta anexada renderiza botão de compra", () => {
+  it("mensagem com offerId envia botão bcast_buy", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6100n);
+    const c = await campaign(bot.id);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await message(c.id, { offerId: offer.id });
+    await state(c.id, bot.id, lead);
+    await processDueRemarketing();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
+    expect(kb.flat().some((b) => b.callback_data === `bcast_buy_${offer.id}`)).toBe(true);
   });
 });

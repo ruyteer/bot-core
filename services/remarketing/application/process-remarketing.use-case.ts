@@ -2,7 +2,7 @@ import { eq, and, inArray, lte, lt, ne } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   remarketingCampaigns, remarketingMessages, remarketingLeadState,
-  bots, leads, payments,
+  bots, leads, payments, funnelOffers,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -134,7 +134,12 @@ export async function processDueRemarketing(): Promise<number> {
       const text = replaceVars(msg.message || "", lead);
       const media = (Array.isArray(msg.media) ? msg.media : (msg.media && typeof msg.media === "object" && Array.isArray((msg.media as { items?: unknown }).items) ? (msg.media as { items: MediaItem[] }).items : [])) as MediaItem[];
       const buttons = (Array.isArray(msg.inlineButtons) ? msg.inlineButtons : []) as Array<{ text?: string; url?: string }>;
-      const kb = buttons.filter((b) => b?.text && b?.url).map((b) => [{ text: String(b.text), url: String(b.url) }]);
+      const kb: Array<Array<Record<string, unknown>>> = buttons.filter((b) => b?.text && b?.url).map((b) => [{ text: String(b.text), url: String(b.url) }]);
+      // Oferta anexada → botão de compra (bcast_buy), tratado pelo runner.
+      if (msg.offerId) {
+        const [off] = await db.select().from(funnelOffers).where(and(eq(funnelOffers.id, msg.offerId), eq(funnelOffers.botId, camp.botId)));
+        if (off) kb.push([{ text: `🛒 ${off.name} — ${(Number(off.price) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}`, callback_data: `bcast_buy_${off.id}` }]);
+      }
       const replyMarkup = kb.length ? { inline_keyboard: kb } : undefined;
 
       let sentOk = true;

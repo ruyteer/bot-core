@@ -1,7 +1,7 @@
 import { eq, and, inArray, lte, lt, gt } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
-  scheduledMessages, broadcastRuns, bots, leads, payments, botGroups,
+  scheduledMessages, broadcastRuns, bots, leads, payments, botGroups, funnelOffers,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -83,6 +83,26 @@ function buildKeyboard(buttons: Array<Record<string, unknown>>): { inline_keyboa
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
+// Resolve botões de OFERTA (funnel_offers) do broadcast → botão "comprar" com
+// callback bcast_buy_<id>, tratado pelo runner. price em centavos (exibe /100).
+async function resolveOfferButtons(botId: string, offers: Array<{ product_id?: string; external_ref?: string; button_text?: string }>): Promise<Array<Array<Record<string, unknown>>>> {
+  if (!offers || offers.length === 0) return [];
+  const refs = offers.map((o) => o.external_ref).filter(Boolean) as string[];
+  const ids = offers.map((o) => o.product_id).filter(Boolean) as string[];
+  const products: Array<typeof funnelOffers.$inferSelect> = [];
+  if (refs.length) products.push(...await db.select().from(funnelOffers).where(and(eq(funnelOffers.botId, botId), inArray(funnelOffers.externalRef, refs))));
+  if (ids.length)  products.push(...await db.select().from(funnelOffers).where(and(eq(funnelOffers.botId, botId), inArray(funnelOffers.id, ids))));
+  const fmt = (cents: number) => (Number(cents) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  const rows: Array<Array<Record<string, unknown>>> = [];
+  for (const o of offers) {
+    const p = products.find((pp) => (o.external_ref && pp.externalRef === o.external_ref) || (o.product_id && pp.id === o.product_id));
+    if (!p) continue;
+    const label = (o.button_text && o.button_text.trim()) ? o.button_text : `🛒 ${p.name} — ${fmt(p.price)}`;
+    rows.push([{ text: label, callback_data: `bcast_buy_${p.id}` }]);
+  }
+  return rows;
+}
+
 async function sendMedia(tg: TelegramClient, chatId: string, items: MediaItem[], caption: string | undefined, replyMarkup: unknown, protect: boolean): Promise<void> {
   const album = items.filter((m) => m.media_type === "image" || m.media_type === "photo" || m.media_type === "video");
   if (items.length >= 2 && album.length >= 2) {
@@ -141,6 +161,7 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   const adv = (msg.advancedFilters && typeof msg.advancedFilters === "object" ? msg.advancedFilters : {}) as Record<string, unknown>;
   const media = (Array.isArray(adv.media) ? adv.media : []) as MediaItem[];
   const inlineButtons = (Array.isArray(adv.inline_buttons) ? adv.inline_buttons : []) as Array<Record<string, unknown>>;
+  const offers = (Array.isArray(adv.offers) ? adv.offers : []) as Array<{ product_id?: string; external_ref?: string; button_text?: string }>;
   const filterProductId = (adv.filter_product_id as string | null) ?? null;
   const targetType = msg.targetType || "leads";
   const targetGroupIds = (Array.isArray(msg.targetGroupIds) ? msg.targetGroupIds : []) as string[];
@@ -151,7 +172,10 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
 
   for (const bot of botRows) {
     const tg = new TelegramClient(decrypt(bot.telegramToken));
-    const keyboard = buildKeyboard(inlineButtons);
+    const inlineKb = buildKeyboard(inlineButtons);
+    const offerRows = await resolveOfferButtons(bot.id, offers);
+    const allRows = [...((inlineKb?.inline_keyboard as Array<Array<Record<string, unknown>>>) ?? []), ...offerRows];
+    const keyboard = allRows.length ? { inline_keyboard: allRows } : undefined;
 
     // Leads
     if (targetType === "leads" || targetType === "both") {
@@ -159,11 +183,11 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
       for (const lead of audience) {
         const chatId = lead.telegramChatId.toString();
         const text = replaceVars(msg.message || "", lead);
-        if (media.length === 0 && !text) continue; // nada a enviar — não conta como enviado
+        if (media.length === 0 && !text && !keyboard) continue; // nada a enviar
         totalTargets++;
         try {
           if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
-          else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
+          else await tg.sendMessage({ chatId, text: text || "👇", replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
         } catch (e) { failedCount++; console.error("[broadcast] lead falhou:", lead.id, e); }
       }

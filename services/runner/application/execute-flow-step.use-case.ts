@@ -3,6 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
   funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
+  funnelOffers, paymentGateways,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -228,6 +229,12 @@ export class ExecuteFlowStepUseCase {
     // Answer callback immediately to stop Telegram spinner
     if (callbackQueryId) {
       await tg.answerCallbackQuery({ callbackQueryId }).catch(() => {});
+    }
+
+    // ── Compra via botão de OFERTA de broadcast/remarketing (bcast_buy_<id>) ──
+    if (callbackData && callbackData.startsWith("bcast_buy_")) {
+      await this.handleBroadcastBuy(callbackData.slice("bcast_buy_".length), lead, bot, chatIdStr, tg);
+      return;
     }
 
     // Check if lead is manually paused — drop all automation
@@ -913,8 +920,88 @@ export class ExecuteFlowStepUseCase {
     await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
   }
 
+  // ── Compra avulsa de oferta (botão de broadcast/remarketing) → gera PIX ──────
+  private async handleBroadcastBuy(
+    offerId: string,
+    lead: typeof leads.$inferSelect,
+    bot:  typeof bots.$inferSelect,
+    chatId: string,
+    tg:   TelegramClient,
+  ): Promise<void> {
+    const [offer] = await db.select().from(funnelOffers)
+      .where(and(eq(funnelOffers.id, offerId), eq(funnelOffers.botId, bot.id)));
+    if (!offer) { await tg.sendMessage({ chatId, text: "⚠️ Produto não encontrado.", protectContent: bot.protectContent }); return; }
+
+    const [gw] = await db.select().from(paymentGateways)
+      .where(and(eq(paymentGateways.userId, bot.userId), eq(paymentGateways.isActive, true))).limit(1);
+    if (!gw) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
+
+    const amount = offer.price; // funnel_offers.price já é em centavos
+    if (amount <= 0) { await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent }); return; }
+
+    const clientId = decrypt(gw.clientId);
+    const clientSecret = decrypt(gw.clientSecret);
+    const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
+
+    let pix;
+    try {
+      pix = await createPix(gw.provider as never, clientId, clientSecret, amount, offer.name, webhookUrl);
+    } catch (err) {
+      console.error("[runner] bcast_buy createPix falhou:", err);
+      await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
+      return;
+    }
+
+    await payRepo.create({
+      userId: bot.userId, botId: bot.id, leadId: lead.id, gatewayId: gw.id,
+      offerId: offer.id, offerName: offer.name, amount, status: "pending",
+      externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
+    });
+
+    const caption = `💠 <b>${escapeHtml(offer.name)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
+    await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
+    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+  }
+
+  // ── Entrega do produto de uma oferta avulsa (funnel_offers) após pagamento ───
+  private async deliverFunnelOffer(payment: Payment): Promise<void> {
+    if (!payment.offerId || !payment.leadId) return;
+    const [offer] = await db.select().from(funnelOffers).where(eq(funnelOffers.id, payment.offerId));
+    const [bot]   = await db.select().from(bots).where(eq(bots.id, payment.botId));
+    const [lead]  = await db.select().from(leads).where(eq(leads.id, payment.leadId));
+    if (!offer || !bot || !lead) return;
+    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const chatId = lead.telegramChatId.toString();
+
+    if (offer.productType === "vip_group" && offer.telegramGroupId) {
+      const [grp] = await db.select().from(botGroups).where(eq(botGroups.id, offer.telegramGroupId));
+      if (grp) {
+        const expireDate = offer.accessDays > 0 ? Math.floor(Date.now() / 1000) + offer.accessDays * 86400 : undefined;
+        try {
+          const link = await tg.createChatInviteLink(grp.telegramChatId.toString(), { memberLimit: 1, expireDate });
+          await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado! Seu acesso: ${link}`, protectContent: bot.protectContent });
+          return;
+        } catch (e) { console.error("[runner] deliverFunnelOffer invite:", e); }
+      }
+      await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: bot.protectContent });
+      return;
+    }
+    if (offer.productType === "text" && offer.deliveryText) {
+      await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado!\n\n${offer.deliveryText}`, protectContent: bot.protectContent });
+      return;
+    }
+    const url = offer.deliveryUrl ?? "";
+    await tg.sendMessage({ chatId, text: url ? `✅ Pagamento confirmado! Acesse seu produto: ${url}` : "✅ Pagamento confirmado!", protectContent: bot.protectContent });
+  }
+
   // ── Pago (chamado pela subscription do webhook): entrega + retoma o funil ────
   async handlePaidOffer(payment: Payment): Promise<void> {
+    // Compra avulsa (oferta de broadcast/remarketing): sem contexto de funil, mas
+    // com offerId → entrega o produto direto e encerra.
+    if ((!payment.progressId || !payment.nodeId || !payment.paidHandle || !payment.funnelId) && payment.offerId) {
+      await this.deliverFunnelOffer(payment).catch((e) => console.error("[runner] deliverFunnelOffer falhou:", e));
+      return;
+    }
     if (!payment.progressId || !payment.nodeId || !payment.paidHandle || !payment.funnelId || !payment.leadId) {
       return; // cobrança sem contexto de funil (ex.: teste de gateway) — ignora
     }

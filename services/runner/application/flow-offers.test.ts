@@ -3,7 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { testDb } from "../../../test/helpers/db.js";
-import { payments, scheduledDelays, leads } from "../../shared/schema/index.js";
+import { payments, scheduledDelays, leads, funnelOffers } from "../../shared/schema/index.js";
 import {
   createBot, createGateway, createFlowFunnel, startUpdate, callbackUpdate,
 } from "../../../test/helpers/seed.js";
@@ -152,5 +152,21 @@ describe("ofertas embutidas em nó message (block.type=offer)", () => {
     const db = await testDb();
     const [pay] = await db.select().from(payments);
     expect(pay.amount).toBe(1000);
+  });
+});
+
+describe("bcast_buy — compra de oferta avulsa (broadcast/remarketing)", () => {
+  it("clique no botão bcast_buy gera PIX no valor da oferta e persiste payment", async () => {
+    const bot = await createBot();
+    await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990, productType: "content", deliveryUrl: "https://entrega" }).returning();
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(7200, `bcast_buy_${offer.id}`) });
+    const [pay] = await db.select().from(payments);
+    expect(pay).toBeDefined();
+    expect(pay.amount).toBe(1990);
+    expect(pay.offerId).toBe(offer.id);
+    expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0);
+    expect(getSentMessages().some((m) => m.includes("<code>"))).toBe(true);
   });
 });
