@@ -122,6 +122,8 @@ export async function processDueRemarketing(): Promise<number> {
       const msg = messages[idx];
       const [lead] = await db.select().from(leads).where(eq(leads.id, st.leadId));
       if (!lead) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "lead_not_found", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
+      // Grupo/canal (id negativo) nunca é alvo de remarketing.
+      if (lead.telegramChatId <= 0n) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "not_a_user", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
       if (!botCache.has(camp.botId)) { const [b] = await db.select().from(bots).where(eq(bots.id, camp.botId)); botCache.set(camp.botId, b); }
       const bot = botCache.get(camp.botId);

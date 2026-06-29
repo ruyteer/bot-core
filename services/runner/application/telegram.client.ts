@@ -24,14 +24,24 @@ export class TelegramClient {
   constructor(private readonly token: string) {}
 
   private async call(method: string, body: Record<string, unknown>): Promise<unknown> {
-    const res = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(body),
-    });
-    const json = await res.json() as { ok: boolean; result?: unknown };
-    if (!json.ok) throw new Error(`Telegram ${method} failed`);
-    return json.result;
+    // Timeout obrigatório: sem isso, um fetch que trava (TCP black hole, Telegram
+    // lento) deixaria o await pendurado pra sempre — e, no scheduler, isso congela
+    // toda a fila (delays/broadcasts/remarketing). 20s é folgado p/ a API do TG.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(body),
+        signal:  controller.signal,
+      });
+      const json = await res.json() as { ok: boolean; result?: unknown };
+      if (!json.ok) throw new Error(`Telegram ${method} failed`);
+      return json.result;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async sendMessage(opts: SendMessageOptions): Promise<void> {

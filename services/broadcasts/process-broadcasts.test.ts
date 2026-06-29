@@ -4,7 +4,7 @@ import { processDueBroadcasts } from "./application/process-broadcasts.use-case.
 import { testDb } from "../../test/helpers/db.js";
 import { scheduledMessages, broadcastRuns, payments, leads } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
-import { getSentMessages, getTelegramCalls } from "../../test/helpers/fetch-mock.js";
+import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 
 async function seedMsg(botId: string, userId: string, over: Partial<typeof scheduledMessages.$inferInsert> = {}) {
   const db = await testDb();
@@ -86,5 +86,42 @@ describe("processDueBroadcasts", () => {
     const db = await testDb();
     const [after] = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, msg.id));
     expect(after.status).toBe("completed");
+  });
+});
+
+describe("processDueBroadcasts — status real (fix)", () => {
+  it("falha no Telegram marca 'failed', não 'sent'", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 5007n);
+    const msg = await seedMsg(bot.id, bot.userId, { message: "oi" });
+    forceTelegramError("sendMessage");
+    await processDueBroadcasts();
+    const db = await testDb();
+    const [after] = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, msg.id));
+    expect(after.status).toBe("failed");
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].failedCount).toBe(1);
+    expect(runs[0].sentCount).toBe(0);
+  });
+
+  it("mensagem vazia sem mídia não conta alvo (totalTargets 0)", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 5008n);
+    await seedMsg(bot.id, bot.userId, { message: "" });
+    await processDueBroadcasts();
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].totalTargets).toBe(0);
+  });
+});
+
+describe("processDueBroadcasts — não envia para grupos (bug João)", () => {
+  it("broadcast 'leads' ignora chats de grupo/canal (id negativo)", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7001n);     // usuário real
+    await createLead(bot.id, -1001500n); // grupo resíduo (id negativo)
+    await seedMsg(bot.id, bot.userId, { message: "promo", filterType: "all", targetType: "leads" });
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMessage").length).toBe(1); // só o usuário recebe
   });
 });

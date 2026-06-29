@@ -61,7 +61,8 @@ async function runDuePendingDelays(): Promise<number> {
 
       const [bot] = await db.select().from(bots).where(eq(bots.id, delay.botId));
       const [lead] = await db.select().from(leads).where(eq(leads.id, delay.leadId));
-      if (!bot || !lead) {
+      if (!bot || !lead || lead.telegramChatId <= 0n) {
+        // !lead, bot inativo, ou chat de grupo/canal (id negativo) → não processa.
         await db.update(scheduledDelays).set({ status: "skipped" }).where(eq(scheduledDelays.id, delay.id));
         continue;
       }
@@ -101,11 +102,17 @@ export const processPendingDelays = api(
 // ── Scheduler interno ─────────────────────────────────────────────────────────
 // Os Cron Jobs do Encore só rodam no Encore Cloud; em self-hosted (Railway) não
 // disparam. Então processamos a fila com um setInterval no próprio processo.
-// A guarda evita sobreposição se um tick demorar mais que o intervalo.
-let delaysTickRunning = false;
+// Guarda por TEMPO (não booleana permanente): se um tick travar (ex.: rede),
+// o próximo assume que morreu após TICK_MAX_MS e segue — evita congelar a fila
+// pra sempre (sintoma: só voltava a enviar após um redeploy). Os processadores
+// usam claim atômico ("sending"/"processing"), então uma sobreposição eventual
+// não duplica envio.
+const TICK_MAX_MS = 3 * 60_000;
+let tickRunningSince = 0;
 async function tickDelays(): Promise<void> {
-  if (delaysTickRunning) return;
-  delaysTickRunning = true;
+  const now = Date.now();
+  if (tickRunningSince && now - tickRunningSince < TICK_MAX_MS) return;
+  tickRunningSince = now;
   try {
     const n = await runDuePendingDelays();
     const m = await simplifiedFunnel.processDueTasks();
@@ -120,7 +127,7 @@ async function tickDelays(): Promise<void> {
   } catch (err) {
     console.error("[runner] scheduler tick falhou:", err);
   } finally {
-    delaysTickRunning = false;
+    tickRunningSince = 0;
   }
 }
 

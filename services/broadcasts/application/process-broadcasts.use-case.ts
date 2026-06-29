@@ -1,4 +1,4 @@
-import { eq, and, inArray, lte, lt } from "drizzle-orm";
+import { eq, and, inArray, lte, lt, gt } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   scheduledMessages, broadcastRuns, bots, leads, payments, botGroups,
@@ -57,7 +57,8 @@ function nextOccurrence(rule: RecurrenceRule, from: Date): Date | null {
 // ── Audiência ───────────────────────────────────────────────────────────────────
 type LeadRow = typeof leads.$inferSelect;
 async function getAudienceLeads(botId: string, filterType: string, filterProductId?: string | null): Promise<LeadRow[]> {
-  const all = await db.select().from(leads).where(eq(leads.botId, botId));
+  // Exclui chats de grupo/canal (id negativo) — só usuários reais recebem broadcast.
+  const all = await db.select().from(leads).where(and(eq(leads.botId, botId), gt(leads.telegramChatId, 0n)));
   if (filterType === "all" || !filterType) return all;
   const paid = await db.select({ leadId: payments.leadId }).from(payments).where(and(eq(payments.botId, botId), eq(payments.status, "paid")));
   const buyerIds = new Set(paid.map((p) => p.leadId).filter(Boolean) as string[]);
@@ -96,10 +97,10 @@ async function sendMedia(tg: TelegramClient, chatId: string, items: MediaItem[],
 }
 
 // ── Finaliza um schedule (recorrência → próxima; senão sent) ────────────────────
-async function finalizeSchedule(msg: typeof scheduledMessages.$inferSelect): Promise<void> {
+async function finalizeSchedule(msg: typeof scheduledMessages.$inferSelect, finalStatus: "sent" | "partial" | "failed"): Promise<void> {
   const now = new Date();
   const rule = (msg.recurrenceRule as RecurrenceRule | null) || null;
-  if (!rule) { await db.update(scheduledMessages).set({ status: "sent", sentAt: now, updatedAt: now }).where(eq(scheduledMessages.id, msg.id)); return; }
+  if (!rule) { await db.update(scheduledMessages).set({ status: finalStatus, sentAt: now, updatedAt: now }).where(eq(scheduledMessages.id, msg.id)); return; }
   const newCount = (msg.recurrenceCount || 0) + 1;
   const max = msg.recurrenceMaxOccurrences;
   const endAt = msg.recurrenceEndAt ? new Date(msg.recurrenceEndAt) : null;
@@ -125,14 +126,18 @@ export async function processDueBroadcasts(): Promise<number> {
 
   let processed = 0;
   for (const msg of claimed) {
-    try { await sendBroadcast(msg); } catch (e) { console.error("[broadcast] envio falhou:", e); }
-    await finalizeSchedule(msg).catch((e) => console.error("[broadcast] finalize falhou:", e));
+    let status: "sent" | "partial" | "failed" = "sent";
+    try {
+      const r = await sendBroadcast(msg);
+      status = r.totalTargets === 0 ? "sent" : r.failedCount === 0 ? "sent" : r.sentCount > 0 ? "partial" : "failed";
+    } catch (e) { console.error("[broadcast] envio falhou:", e); status = "failed"; }
+    await finalizeSchedule(msg, status).catch((e) => console.error("[broadcast] finalize falhou:", e));
     processed++;
   }
   return processed;
 }
 
-async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promise<void> {
+async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promise<{ totalTargets: number; sentCount: number; failedCount: number }> {
   const adv = (msg.advancedFilters && typeof msg.advancedFilters === "object" ? msg.advancedFilters : {}) as Record<string, unknown>;
   const media = (Array.isArray(adv.media) ? adv.media : []) as MediaItem[];
   const inlineButtons = (Array.isArray(adv.inline_buttons) ? adv.inline_buttons : []) as Array<Record<string, unknown>>;
@@ -152,12 +157,13 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
     if (targetType === "leads" || targetType === "both") {
       const audience = await getAudienceLeads(bot.id, msg.filterType || "all", filterProductId);
       for (const lead of audience) {
-        totalTargets++;
         const chatId = lead.telegramChatId.toString();
         const text = replaceVars(msg.message || "", lead);
+        if (media.length === 0 && !text) continue; // nada a enviar — não conta como enviado
+        totalTargets++;
         try {
           if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
-          else if (text) await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
+          else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
         } catch (e) { failedCount++; console.error("[broadcast] lead falhou:", lead.id, e); }
       }
@@ -169,12 +175,13 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
         ? await db.select().from(botGroups).where(and(eq(botGroups.botId, bot.id), inArray(botGroups.id, targetGroupIds)))
         : await db.select().from(botGroups).where(eq(botGroups.botId, bot.id));
       for (const g of groups) {
-        totalTargets++;
         const chatId = g.telegramChatId.toString();
         const text = msg.message || "";
+        if (media.length === 0 && !text) continue;
+        totalTargets++;
         try {
           if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
-          else if (text) await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
+          else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
         } catch (e) { failedCount++; console.error("[broadcast] grupo falhou:", g.id, e); }
       }
@@ -187,4 +194,6 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
     status: failedCount === 0 ? "completed" : (sentCount > 0 ? "partial" : "failed"),
     totalTargets, sentCount, failedCount, finishedAt: new Date(), source: "scheduler", triggerKind: "broadcast",
   }).catch((e) => console.error("[broadcast] broadcast_run insert falhou:", e));
+
+  return { totalTargets, sentCount, failedCount };
 }
