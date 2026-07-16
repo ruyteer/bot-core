@@ -29,6 +29,7 @@ interface CreateBotRequest {
 }
 
 interface UpdateBotRequest {
+  defaultGatewayId?: string | null;
   name?:          string;
   isActive?:      boolean;
   protectContent?:boolean;
@@ -40,6 +41,7 @@ interface BotResponse {
   telegramUsername: string | null;
   isActive:         boolean;
   protectContent:   boolean;
+  defaultGatewayId: string | null;
   leadsCount:       number;
   salesCount:       number;
   createdAt:        string;
@@ -52,6 +54,7 @@ function toResponse(b: BotWithStats): BotResponse {
     telegramUsername: b.telegramUsername,
     isActive:         b.isActive,
     protectContent:   b.protectContent,
+    defaultGatewayId: b.defaultGatewayId ?? null,
     leadsCount:       b.leadsCount,
     salesCount:       b.salesCount,
     createdAt:        b.createdAt.toISOString(),

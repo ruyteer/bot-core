@@ -380,12 +380,6 @@ export class ExecuteSimplifiedFunnelUseCase {
     // amount chega em REAIS (preços do funil simplificado); gateway e tabela
     // payments trabalham em centavos. Display (fmtBRL) continua em reais.
     const amountCents = Math.round(amount * 100);
-    const gatewayId = String(payCfg.gateway_id || "");
-    if (!gatewayId) {
-      await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado neste funil.", protectContent: bot.protectContent });
-      return { paymentId: null, reused: false };
-    }
-
     // Dedup: reaproveita PIX pendente recente do mesmo (bot, lead, valor, ref).
     const existing = await payRepo.findReusablePending(bot.id, lead.id, amountCents, refKey);
     if (existing?.pixCode) {
@@ -393,9 +387,9 @@ export class ExecuteSimplifiedFunnelUseCase {
       return { paymentId: existing.id, reused: true };
     }
 
-    const gw = await gwRepo.findById(gatewayId);
+    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId, explicitGatewayId: String(payCfg.gateway_id || "") || null });
     if (!gw) {
-      await tg.sendMessage({ chatId, text: "⚠️ Gateway indisponível.", protectContent: bot.protectContent });
+      await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent });
       return { paymentId: null, reused: false };
     }
     const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);

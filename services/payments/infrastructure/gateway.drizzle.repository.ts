@@ -40,6 +40,16 @@ export class GatewayDrizzleRepository {
     return row ? this.toGateway(row) : null;
   }
 
+  // Resolve o gateway a usar para um bot, na ordem: override explícito (oferta/funil)
+  // → gateway padrão do bot → 1º gateway ativo do usuário. Retorna null se nenhum.
+  async findForBot(opts: { userId: string; defaultGatewayId?: string | null; explicitGatewayId?: string | null }): Promise<PaymentGateway | null> {
+    if (opts.explicitGatewayId) { const g = await this.findById(opts.explicitGatewayId); if (g) return g; }
+    if (opts.defaultGatewayId) { const g = await this.findById(opts.defaultGatewayId); if (g) return g; }
+    const [row] = await db.select().from(paymentGateways)
+      .where(and(eq(paymentGateways.userId, opts.userId), eq(paymentGateways.isActive, true))).limit(1);
+    return row ? this.toGateway(row) : null;
+  }
+
   async create(input: CreateGatewayInput): Promise<GatewaySafe> {
     const [row] = await db.insert(paymentGateways).values({
       userId:       input.userId,

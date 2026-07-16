@@ -5,6 +5,7 @@ export interface Bot {
   telegramUsername: string | null;
   isActive:         boolean;
   protectContent:   boolean;
+  defaultGatewayId: string | null;
   createdAt:        Date;
   updatedAt:        Date;
 }
@@ -27,6 +28,7 @@ export interface CreateBotInput {
 }
 
 export interface UpdateBotInput {
+  defaultGatewayId?: string | null;
   name?:          string;
   isActive?:      boolean;
   protectContent?:boolean;

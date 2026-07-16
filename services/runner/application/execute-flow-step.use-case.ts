@@ -3,7 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
   funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
-  funnelOffers, paymentGateways,
+  funnelOffers,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -869,12 +869,12 @@ export class ExecuteFlowStepUseCase {
     const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
     const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
 
-    if (!gatewayId || amount <= 0) {
+    if (amount <= 0) {
       await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent });
       return;
     }
 
-    const gw = await gwRepo.findById(gatewayId);
+    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId, explicitGatewayId: gatewayId || null });
     if (!gw) {
       await tg.sendMessage({ chatId, text: "Gateway de pagamento não configurado.", protectContent: bot.protectContent });
       return;
@@ -932,20 +932,17 @@ export class ExecuteFlowStepUseCase {
       .where(and(eq(funnelOffers.id, offerId), eq(funnelOffers.botId, bot.id)));
     if (!offer) { await tg.sendMessage({ chatId, text: "⚠️ Produto não encontrado.", protectContent: bot.protectContent }); return; }
 
-    const [gw] = await db.select().from(paymentGateways)
-      .where(and(eq(paymentGateways.userId, bot.userId), eq(paymentGateways.isActive, true))).limit(1);
-    if (!gw) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
-
     const amount = offer.price; // funnel_offers.price já é em centavos
     if (amount <= 0) { await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent }); return; }
 
-    const clientId = decrypt(gw.clientId);
-    const clientSecret = decrypt(gw.clientSecret);
+    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId });
+    if (!gw) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
+    const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
     const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
 
     let pix;
     try {
-      pix = await createPix(gw.provider as never, clientId, clientSecret, amount, offer.name, webhookUrl);
+      pix = await createPix(gw.provider, clientId, clientSecret, amount, offer.name, webhookUrl);
     } catch (err) {
       console.error("[runner] bcast_buy createPix falhou:", err);
       await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });

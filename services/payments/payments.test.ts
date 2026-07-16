@@ -6,6 +6,7 @@ import {
   normalizeNexuspagWebhook, normalizeWiinpayWebhook,
 } from "./application/gateway-clients.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
+import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { processWebhookEvent } from "./webhooks.js";
 import { testDb } from "../../test/helpers/db.js";
 import { payments, processedWebhooks } from "../shared/schema/index.js";
@@ -13,6 +14,7 @@ import { createBot, createGateway, createLead } from "../../test/helpers/seed.js
 import { published } from "../../test/stubs/encore-pubsub.js";
 
 const payRepo = new PaymentDrizzleRepository();
+const gwRepo = new GatewayDrizzleRepository();
 
 // ── Normalizadores de webhook ──────────────────────────────────────────────
 describe("normalizadores de webhook", () => {
@@ -132,5 +134,33 @@ describe("processWebhookEvent", () => {
     await expect(processWebhookEvent({ externalId: "nao-existe", provider: "buckpay", status: "paid", amount: 1, event: "paid" }, {})).resolves.toBeUndefined();
     const db = await testDb();
     expect((await db.select().from(processedWebhooks).where(eq(processedWebhooks.externalId, "nao-existe"))).length).toBe(1);
+  });
+});
+
+describe("GatewayDrizzleRepository.findForBot (gateway por bot + override)", () => {
+  it("override explícito tem prioridade sobre o padrão do bot", async () => {
+    const bot = await createBot();
+    const def = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const over = await createGateway({ userId: bot.userId, provider: "syncpay" });
+    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: def, explicitGatewayId: over });
+    expect(gw!.id).toBe(over);
+  });
+  it("sem override usa o gateway padrão do bot", async () => {
+    const bot = await createBot();
+    const def = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    await createGateway({ userId: bot.userId, provider: "syncpay" });
+    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: def });
+    expect(gw!.id).toBe(def);
+  });
+  it("sem override e sem padrão cai no 1º gateway ativo", async () => {
+    const bot = await createBot();
+    const a = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const gw = await gwRepo.findForBot({ userId: bot.userId });
+    expect(gw!.id).toBe(a);
+  });
+  it("retorna null quando o usuário não tem gateway", async () => {
+    const bot = await createBot();
+    const gw = await gwRepo.findForBot({ userId: bot.userId });
+    expect(gw).toBeNull();
   });
 });

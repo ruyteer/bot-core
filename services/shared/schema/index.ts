@@ -39,6 +39,9 @@ export const bots = pgTable("bots", {
   isActive:        boolean("is_active").notNull().default(true),
   protectContent:  boolean("protect_content").notNull().default(false),
   webhookSecret:   text("webhook_secret").notNull(),
+  // Gateway PIX padrão deste bot (usado por broadcast/remarketing/ofertas e como
+  // fallback no funil/oferta quando não há um gateway específico).
+  defaultGatewayId: uuid("default_gateway_id").references((): import("drizzle-orm/pg-core").AnyPgColumn => paymentGateways.id, { onDelete: "set null" }),
   createdAt:       timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:       timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

@@ -12,6 +12,7 @@ import { TelegramClient } from "./application/telegram.client.js";
 import { mergeLeadFields } from "./application/interpolate.js";
 import { processDueBroadcasts } from "../broadcasts/application/process-broadcasts.use-case.js";
 import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing/application/process-remarketing.use-case.js";
+import { ensureSchemaAtBoot } from "../shared/ensure-schema.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
@@ -130,5 +131,8 @@ async function tickDelays(): Promise<void> {
     tickRunningSince = 0;
   }
 }
+
+// Aplica DDLs idempotentes pendentes antes do 1º tick (self-hosted não tem migrator).
+void ensureSchemaAtBoot();
 
 setInterval(() => { void tickDelays(); }, 60_000);
