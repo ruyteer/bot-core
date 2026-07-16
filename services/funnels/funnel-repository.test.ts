@@ -40,6 +40,47 @@ describe("FunnelDrizzleRepository", () => {
     expect(conns.length).toBe(1);
   });
 
+  it("saveFlow aceita id de conexão não-uuid (default 'xy-edge__' do React Flow) regenerando server-side", async () => {
+    const { bot, funnelId } = await newFunnel();
+    const n1 = crypto.randomUUID(); const n2 = crypto.randomUUID();
+    await repo.saveFlow(funnelId, bot.userId, {
+      nodes: [
+        { id: n1, type: "trigger", content: {}, positionX: 0, positionY: 0 },
+        { id: n2, type: "message", content: { message: "x" }, positionX: 0, positionY: 0 },
+      ],
+      connections: [{ id: `xy-edge__${n1}-${n2}`, sourceNodeId: n1, sourceHandle: null, targetNodeId: n2 }],
+    });
+    const db = await testDb();
+    const conns = await db.select().from(nodeConnections).where(eq(nodeConnections.funnelId, funnelId));
+    expect(conns.length).toBe(1);
+    expect(conns[0].sourceNodeId).toBe(n1);
+    expect(conns[0].targetNodeId).toBe(n2);
+  });
+
+  it("saveFlow é transacional: falha no insert não apaga o fluxo antigo", async () => {
+    const { bot, funnelId } = await newFunnel();
+    const n1 = crypto.randomUUID(); const n2 = crypto.randomUUID();
+    await repo.saveFlow(funnelId, bot.userId, {
+      nodes: [
+        { id: n1, type: "trigger", content: {}, positionX: 0, positionY: 0 },
+        { id: n2, type: "message", content: { message: "x" }, positionX: 0, positionY: 0 },
+      ],
+      connections: [{ id: crypto.randomUUID(), sourceNodeId: n1, sourceHandle: null, targetNodeId: n2 }],
+    });
+
+    // Conexão apontando p/ nó inexistente → violação de FK no meio do replace.
+    await expect(repo.saveFlow(funnelId, bot.userId, {
+      nodes: [{ id: n1, type: "trigger", content: {}, positionX: 0, positionY: 0 }],
+      connections: [{ id: crypto.randomUUID(), sourceNodeId: n1, sourceHandle: null, targetNodeId: crypto.randomUUID() }],
+    })).rejects.toThrow();
+
+    const db = await testDb();
+    const nodes = await db.select().from(funnelNodes).where(eq(funnelNodes.funnelId, funnelId));
+    const conns = await db.select().from(nodeConnections).where(eq(nodeConnections.funnelId, funnelId));
+    expect(nodes.length).toBe(2);  // fluxo antigo intacto
+    expect(conns.length).toBe(1);  // conexões NÃO foram apagadas
+  });
+
   it("saveFlow rejeita funil de outro usuário", async () => {
     const { funnelId } = await newFunnel();
     await expect(repo.saveFlow(funnelId, crypto.randomUUID(), { nodes: [], connections: [] }))

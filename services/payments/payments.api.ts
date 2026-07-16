@@ -142,8 +142,15 @@ export const testGateway = api(
     const externalUrl = encoreExternalUrl();
     const webhookUrl  = `${externalUrl}/payments/webhook/${gw.provider}`;
 
-    const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl);
-    return { success: true, ...result };
+    try {
+      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl);
+      return { success: true, ...result };
+    } catch (err) {
+      // Sem isso o Encore converte o Error em "internal error" genérico e o
+      // painel não mostra a causa real (ex.: 403 de compliance do provedor).
+      const msg = err instanceof Error ? err.message : String(err);
+      throw APIError.unavailable(`Falha ao gerar PIX de teste: ${msg}`);
+    }
   },
 );
 

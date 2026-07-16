@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { eq, and, inArray, ne } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
@@ -123,35 +124,45 @@ export class FunnelDrizzleRepository implements FunnelRepository {
       .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
     if (!row) throw new Error("funnel not found");
 
-    // Full replace of nodes and connections
-    await db.delete(nodeConnections).where(eq(nodeConnections.funnelId, id));
-    await db.delete(funnelNodes).where(eq(funnelNodes.funnelId, id));
-
     const validTypes = ["trigger","message","media","audio","buttons","input","delay","condition","random","offer","wait_response"] as const;
     type NodeType = typeof validTypes[number];
 
-    if (input.nodes.length > 0) {
-      await db.insert(funnelNodes).values(input.nodes.map((n) => ({
-        id:        n.id,
-        funnelId:  id,
-        type:      (validTypes.includes(n.type as NodeType) ? n.type : "message") as NodeType,
-        content:   n.content,
-        positionX: n.positionX,
-        positionY: n.positionY,
-      })));
-    }
+    // As colunas de id são uuid, mas o React Flow gera ids tipo "xy-edge__..."
+    // para conexões desenhadas à mão. Regenera server-side qualquer id inválido
+    // (remapeando as referências das conexões quando for id de nó).
+    const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+    const nodeIdMap = new Map<string, string>();
+    for (const n of input.nodes) nodeIdMap.set(n.id, isUuid(n.id) ? n.id : randomUUID());
 
-    if (input.connections.length > 0) {
-      await db.insert(nodeConnections).values(input.connections.map((c) => ({
-        id:           c.id,
-        funnelId:     id,
-        sourceNodeId: c.sourceNodeId,
-        sourceHandle: c.sourceHandle,
-        targetNodeId: c.targetNodeId,
-      })));
-    }
+    // Full replace dentro de UMA transação: se qualquer insert falhar, o fluxo
+    // antigo permanece intacto (antes, um erro no meio apagava as conexões).
+    await db.transaction(async (tx) => {
+      await tx.delete(nodeConnections).where(eq(nodeConnections.funnelId, id));
+      await tx.delete(funnelNodes).where(eq(funnelNodes.funnelId, id));
 
-    await db.update(funnels).set({ updatedAt: new Date() }).where(eq(funnels.id, id));
+      if (input.nodes.length > 0) {
+        await tx.insert(funnelNodes).values(input.nodes.map((n) => ({
+          id:        nodeIdMap.get(n.id)!,
+          funnelId:  id,
+          type:      (validTypes.includes(n.type as NodeType) ? n.type : "message") as NodeType,
+          content:   n.content,
+          positionX: n.positionX,
+          positionY: n.positionY,
+        })));
+      }
+
+      if (input.connections.length > 0) {
+        await tx.insert(nodeConnections).values(input.connections.map((c) => ({
+          id:           isUuid(c.id) ? c.id : randomUUID(),
+          funnelId:     id,
+          sourceNodeId: nodeIdMap.get(c.sourceNodeId) ?? c.sourceNodeId,
+          sourceHandle: c.sourceHandle,
+          targetNodeId: nodeIdMap.get(c.targetNodeId) ?? c.targetNodeId,
+        })));
+      }
+
+      await tx.update(funnels).set({ updatedAt: new Date() }).where(eq(funnels.id, id));
+    });
   }
 
   async activate(id: string, userId: string): Promise<void> {
