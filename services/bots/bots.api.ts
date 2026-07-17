@@ -207,6 +207,19 @@ export const listGroups = api(
   },
 );
 
+// DELETE /bots/:id/groups/:chatId — remove um grupo/canal salvo (ex.: id órfão
+// de grupo básico que virou supergrupo antes do remapeamento automático).
+export const deleteGroup = api(
+  { method: "DELETE", path: "/bots/:id/groups/:chatId", expose: true, auth: true },
+  async ({ id, chatId }: { id: string; chatId: string }): Promise<{ ok: boolean }> => {
+    const { userID: userId } = getAuthData()!;
+    const bots = await repo.findByUserId(userId);
+    if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
+    await db.delete(botGroups).where(and(eq(botGroups.botId, id), eq(botGroups.telegramChatId, BigInt(chatId))));
+    return { ok: true };
+  },
+);
+
 // ─── Telegram profile helpers ─────────────────────────────────────────────────
 
 async function tgCall(token: string, method: string, body?: Record<string, unknown>) {

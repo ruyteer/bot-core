@@ -6,6 +6,9 @@ export interface TelegramMessageUpdate {
   from?: { id: number; first_name: string; last_name?: string; username?: string };
   text?: string;
   date: number;
+  // Mensagens de serviço de migração grupo→supergrupo (o chat ganha um id novo).
+  migrate_to_chat_id?:   number;
+  migrate_from_chat_id?: number;
 }
 
 export interface TelegramCallbackQuery {

@@ -194,6 +194,17 @@ export class ExecuteFlowStepUseCase {
     const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatIdStr = chatId.toString();
 
+    // ── Migração grupo→supergrupo: o chat ganha ID novo e o antigo morre.
+    //    Remapeia o registro salvo para o ID novo (em vez de deixar os dois).
+    if (update.message?.migrate_to_chat_id) {
+      await this.handleGroupMigration(botId, BigInt(update.message.chat.id), BigInt(update.message.migrate_to_chat_id));
+      return;
+    }
+    if (update.message?.migrate_from_chat_id) {
+      await this.handleGroupMigration(botId, BigInt(update.message.migrate_from_chat_id), BigInt(update.message.chat.id));
+      return;
+    }
+
     // ── Mensagens em grupo/canal: `/id` salva o grupo e devolve o ID; as
     //    demais são ignoradas (nunca registrar um grupo como lead) ──────────
     const inboundChatType = update.message?.chat.type;
@@ -401,8 +412,11 @@ export class ExecuteFlowStepUseCase {
       return;
     }
 
-    // Adicionado como membro/admin → salva + envia o ID no chat.
-    if (status === "member" || status === "administrator") {
+    // Só salva quando o bot vira ADMIN. Entrar como membro comum não registra:
+    // além de inútil pra VIP (sem permissão de convite), adicionar como membro
+    // e promover depois gerava registro duplicado quando o Telegram migrava o
+    // grupo básico para supergrupo (id novo).
+    if (status === "administrator") {
       const isChannel = type === "channel";
       const label = isChannel ? "Canal" : "Grupo";
       const info = await tg.getChat(String(chatId));
@@ -425,6 +439,34 @@ export class ExecuteFlowStepUseCase {
     await this.upsertGroup(botId, BigInt(chatId), name, type);
     const msg = `🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>\n\n✅ ${label} salvo automaticamente no painel.`;
     await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
+  }
+
+  // Migração grupo→supergrupo: atualiza o registro antigo IN-PLACE para o id
+  // novo (preserva o uuid da linha — ofertas VIP que referenciam bot_groups.id
+  // continuam válidas). Se o supergrupo já foi salvo em outra linha, funde as
+  // duas mantendo a antiga.
+  private async handleGroupMigration(botId: string, oldChatId: bigint, newChatId: bigint): Promise<void> {
+    const [oldRow] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, oldChatId)));
+    const [newRow] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, newChatId)));
+
+    if (!oldRow) return; // nada salvo com o id antigo — nada a remapear
+
+    let name = oldRow.name;
+    if (newRow) {
+      // Funde: repoint das ofertas que apontam pra linha nova → linha antiga,
+      // apaga a duplicada e herda o nome mais recente.
+      await db.update(funnelOffers).set({ telegramGroupId: oldRow.id })
+        .where(eq(funnelOffers.telegramGroupId, newRow.id));
+      await db.delete(botGroups).where(eq(botGroups.id, newRow.id));
+      name = newRow.name;
+    }
+
+    await db.update(botGroups)
+      .set({ telegramChatId: newChatId, type: "supergroup", name, updatedAt: new Date() })
+      .where(eq(botGroups.id, oldRow.id));
+    console.log(`[runner] grupo migrado p/ supergrupo: ${oldChatId} → ${newChatId} (bot ${botId})`);
   }
 
   // Upsert de grupo por (botId, telegramChatId) — sem depender de constraint única.
