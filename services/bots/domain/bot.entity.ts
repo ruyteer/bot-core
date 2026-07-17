@@ -32,4 +32,6 @@ export interface UpdateBotInput {
   name?:          string;
   isActive?:      boolean;
   protectContent?:boolean;
+  /** Token JÁ CRIPTOGRAFADO (a criptografia acontece no use case). */
+  telegramToken?: string;
 }

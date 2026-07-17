@@ -14,8 +14,19 @@ export class DeregisterWebhookUseCase {
       { method: "POST" },
     );
 
-    const json = (await res.json()) as { ok: boolean };
-    if (!json.ok) throw APIError.internal("Telegram deleteWebhook failed");
+    const json = (await res.json()) as { ok: boolean; error_code?: number; description?: string };
+
+    // Token revogado/apagado no BotFather (401/404): o webhook já está morto do
+    // lado do Telegram — desativa localmente mesmo assim, senão o usuário fica
+    // preso sem conseguir desligar o bot.
+    if (!json.ok && json.error_code !== 401 && json.error_code !== 404) {
+      throw APIError.internal(
+        `Telegram deleteWebhook falhou (${json.error_code ?? "?"}): ${json.description ?? "sem descrição"}`,
+      );
+    }
+    if (!json.ok) {
+      console.warn(`[bots] deleteWebhook: token inválido p/ bot ${botId} (${json.error_code}: ${json.description}) — desativando localmente`);
+    }
 
     await this.repo.update(botId, userId, { isActive: false });
     return { ok: true };

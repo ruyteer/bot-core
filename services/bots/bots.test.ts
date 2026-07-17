@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { CreateBotUseCase } from "./application/use-cases/create-bot.use-case.js";
 import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook.use-case.js";
+import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
+import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
 import { testDb } from "../../test/helpers/db.js";
 import { bots } from "../shared/schema/index.js";
@@ -44,6 +46,47 @@ describe("RegisterWebhookUseCase", () => {
   it("usuário sem permissão é barrado", async () => {
     const bot = await createBot();
     await expect(new RegisterWebhookUseCase(repo).execute(bot.id, crypto.randomUUID())).rejects.toThrow();
+  });
+});
+
+describe("DeregisterWebhookUseCase", () => {
+  it("token revogado (401) → desativa localmente mesmo assim", async () => {
+    const bot = await createBot();
+    forceTelegramError("deleteWebhook", 401);
+    const res = await new DeregisterWebhookUseCase(repo).execute(bot.id, bot.userId);
+    expect(res.ok).toBe(true);
+    const db = await testDb();
+    const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(row.isActive).toBe(false);
+  });
+
+  it("erro real do Telegram (≠401/404) → lança com a descrição", async () => {
+    const bot = await createBot();
+    forceTelegramError("deleteWebhook", 500);
+    await expect(new DeregisterWebhookUseCase(repo).execute(bot.id, bot.userId))
+      .rejects.toThrow(/forced error/);
+  });
+});
+
+describe("UpdateBotUseCase — troca de token", () => {
+  it("token novo válido → re-criptografa e sincroniza username", async () => {
+    const bot = await createBot({ token: "111:OLD" });
+    await new UpdateBotUseCase(repo).execute(bot.id, bot.userId, { telegramToken: "222:NEW" });
+    const internal = await repo.findInternalById(bot.id);
+    expect(internal!.telegramToken).toBe("222:NEW"); // descriptografa pro novo
+    const db = await testDb();
+    const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(row.telegramToken).not.toBe("222:NEW");   // armazenado criptografado
+    expect(row.telegramUsername).toBe("testbot");    // getMe sincronizou
+  });
+
+  it("token novo inválido (getMe falha) → rejeita sem alterar o token", async () => {
+    const bot = await createBot({ token: "111:OLD" });
+    forceTelegramError("getMe");
+    await expect(new UpdateBotUseCase(repo).execute(bot.id, bot.userId, { telegramToken: "bad" }))
+      .rejects.toThrow();
+    const internal = await repo.findInternalById(bot.id);
+    expect(internal!.telegramToken).toBe("111:OLD");
   });
 });
 

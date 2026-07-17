@@ -17,10 +17,11 @@ let otherCalls: CapturedFetch[] = [];
 let originalFetch: typeof globalThis.fetch | undefined;
 
 // Permite um teste forçar erro num método específico do Telegram (ex.: simular
-// createChatInviteLink falhando) ou num gateway.
-const forcedErrors = new Set<string>();
-export function forceTelegramError(method: string): void {
-  forcedErrors.add(method);
+// createChatInviteLink falhando) ou num gateway. errorCode opcional vira o
+// `error_code` da resposta (ex.: 401 = token revogado).
+const forcedErrors = new Map<string, number | undefined>();
+export function forceTelegramError(method: string, errorCode?: number): void {
+  forcedErrors.set(method, errorCode);
 }
 
 let pixSeq = 0;
@@ -86,7 +87,10 @@ export function installFetchMock(): void {
     if (tgMatch) {
       const method = tgMatch[1];
       telegramCalls.push({ method, body: body ?? {} });
-      if (forcedErrors.has(method)) return jsonResponse({ ok: false, description: "forced error" });
+      if (forcedErrors.has(method)) {
+        const code = forcedErrors.get(method);
+        return jsonResponse({ ok: false, ...(code ? { error_code: code } : {}), description: "forced error" });
+      }
       return jsonResponse({ ok: true, result: telegramResult(method, body ?? {}) });
     }
 

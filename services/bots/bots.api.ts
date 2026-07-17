@@ -33,6 +33,8 @@ interface UpdateBotRequest {
   name?:          string;
   isActive?:      boolean;
   protectContent?:boolean;
+  /** Novo token do BotFather (ex.: após revogar o antigo). Valida com getMe e re-criptografa. */
+  telegramToken?: string;
 }
 
 interface BotResponse {
@@ -124,6 +126,43 @@ export const deactivateWebhook = api(
   async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
     return deregisterWebhook.execute(id, userId);
+  },
+);
+
+// GET /bots/:id/webhook — diagnóstico: o que o Telegram diz sobre o token e o webhook.
+// Uso: descobrir por que o bot "não recebe mensagens" sem precisar de acesso ao BotFather.
+export const webhookInfo = api(
+  { method: "GET", path: "/bots/:id/webhook", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{
+    tokenValid:         boolean;
+    botUsername:        string | null;
+    webhookUrl:         string;
+    pendingUpdateCount: number;
+    lastErrorDate:      string | null;
+    lastErrorMessage:   string | null;
+  }> => {
+    const { userID: userId } = getAuthData()!;
+    const bot = await repo.findInternalById(id);
+    if (!bot) throw APIError.notFound("bot not found");
+    if (bot.userId !== userId) throw APIError.permissionDenied("access denied");
+
+    const me = await fetch(`https://api.telegram.org/bot${bot.telegramToken}/getMe`)
+      .then((r) => r.json() as Promise<{ ok: boolean; result?: { username?: string } }>)
+      .catch(() => ({ ok: false } as { ok: boolean; result?: { username?: string } }));
+
+    const info = await fetch(`https://api.telegram.org/bot${bot.telegramToken}/getWebhookInfo`)
+      .then((r) => r.json() as Promise<{ ok: boolean; result?: { url?: string; pending_update_count?: number; last_error_date?: number; last_error_message?: string } }>)
+      .catch(() => ({ ok: false } as { ok: boolean; result?: { url?: string; pending_update_count?: number; last_error_date?: number; last_error_message?: string } }));
+
+    const r = info.result;
+    return {
+      tokenValid:         me.ok,
+      botUsername:        me.result?.username ?? null,
+      webhookUrl:         r?.url ?? "",
+      pendingUpdateCount: r?.pending_update_count ?? 0,
+      lastErrorDate:      r?.last_error_date ? new Date(r.last_error_date * 1000).toISOString() : null,
+      lastErrorMessage:   r?.last_error_message ?? null,
+    };
   },
 );
 

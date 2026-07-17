@@ -100,6 +100,7 @@ export class BotDrizzleRepository implements BotRepository {
     if (input.protectContent !== undefined) set.protectContent = input.protectContent;
     if (input.telegramUsername !== undefined) set.telegramUsername = input.telegramUsername;
     if (input.defaultGatewayId !== undefined) set.defaultGatewayId = input.defaultGatewayId;
+    if (input.telegramToken    !== undefined) set.telegramToken    = input.telegramToken;
 
     const [row] = await db
       .update(bots)
