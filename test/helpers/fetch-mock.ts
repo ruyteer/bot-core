@@ -50,9 +50,25 @@ function telegramResult(method: string, body: Record<string, unknown>): unknown 
     case "editMessageReplyMarkup":
       return true;
     case "sendMediaGroup":
-      return [{ message_id: ++pixSeq }];
+      // Um message por item, com file_id de photo/video (p/ o cache de mídia).
+      return ((body.media as Array<{ type: string }>) ?? [{ type: "photo" }]).map((it) => ({
+        message_id: ++pixSeq,
+        ...(it.type === "video"
+          ? { video: { file_id: `cached_video_${pixSeq}` } }
+          : { photo: [{ file_id: `cached_photo_small_${pixSeq}` }, { file_id: `cached_photo_${pixSeq}` }] }),
+      }));
+    case "sendPhoto":
+      return { message_id: ++pixSeq, chat: { id: body.chat_id }, photo: [{ file_id: `cached_photo_small_${pixSeq}` }, { file_id: `cached_photo_${pixSeq}` }] };
+    case "sendVideo":
+      return { message_id: ++pixSeq, chat: { id: body.chat_id }, video: { file_id: `cached_video_${pixSeq}` } };
+    case "sendDocument":
+      return { message_id: ++pixSeq, chat: { id: body.chat_id }, document: { file_id: `cached_document_${pixSeq}` } };
+    case "sendAudio":
+      return { message_id: ++pixSeq, chat: { id: body.chat_id }, audio: { file_id: `cached_audio_${pixSeq}` } };
+    case "sendVoice":
+      return { message_id: ++pixSeq, chat: { id: body.chat_id }, voice: { file_id: `cached_voice_${pixSeq}` } };
     default:
-      // sendMessage / sendPhoto / sendVideo / sendDocument / sendAudio / sendVoice
+      // sendMessage
       return { message_id: ++pixSeq, chat: { id: body.chat_id } };
   }
 }

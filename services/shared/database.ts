@@ -14,8 +14,14 @@ function build(): DB {
   const pool = new Pool({
     connectionString: databaseUrl(),
     max: 10,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
+    // idle alto + keepAlive: com tráfego baixo, conexões que expiram a cada 30s
+    // faziam TODO update pagar handshake TCP+TLS novo (lento e instável — era a
+    // fonte dos "Connection terminated" do scheduler). O tick de 60s do runner
+    // mantém o pool aquecido dentro desta janela.
+    idleTimeoutMillis: 10 * 60_000,
+    connectionTimeoutMillis: 10_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
   return drizzle(pool, { schema });
 }

@@ -129,7 +129,7 @@ export async function processDueRemarketing(): Promise<number> {
       const bot = botCache.get(camp.botId);
       if (!bot) { await db.update(remarketingLeadState).set({ status: "error", pauseReason: "bot_missing", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
-      const tg = new TelegramClient(decrypt(bot.telegramToken));
+      const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
       const chatId = lead.telegramChatId.toString();
       const text = replaceVars(msg.message || "", lead);
       const media = (Array.isArray(msg.media) ? msg.media : (msg.media && typeof msg.media === "object" && Array.isArray((msg.media as { items?: unknown }).items) ? (msg.media as { items: MediaItem[] }).items : [])) as MediaItem[];

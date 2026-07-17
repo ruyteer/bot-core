@@ -171,7 +171,7 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   let totalTargets = 0, sentCount = 0, failedCount = 0;
 
   for (const bot of botRows) {
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const inlineKb = buildKeyboard(inlineButtons);
     const offerRows = await resolveOfferButtons(bot.id, offers);
     const allRows = [...((inlineKb?.inline_keyboard as Array<Array<Record<string, unknown>>>) ?? []), ...offerRows];

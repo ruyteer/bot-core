@@ -68,7 +68,7 @@ async function runDuePendingDelays(): Promise<number> {
         continue;
       }
 
-      const tg      = new TelegramClient(decrypt(bot.telegramToken));
+      const tg      = new TelegramClient(decrypt(bot.telegramToken), bot.id);
       const chatId  = lead.telegramChatId.toString();
       const varRows = await db.select().from(leadVariables)
         .where(and(eq(leadVariables.leadId, delay.leadId), eq(leadVariables.botId, delay.botId)));

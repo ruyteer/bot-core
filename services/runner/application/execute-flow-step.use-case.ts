@@ -191,7 +191,7 @@ export class ExecuteFlowStepUseCase {
     // Get bot token (for Telegram API calls)
     const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
     if (!bot) return;
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatIdStr = chatId.toString();
 
     // ── Mensagens em grupo/canal: `/id` salva o grupo e devolve o ID; as
@@ -392,7 +392,7 @@ export class ExecuteFlowStepUseCase {
 
     const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
     if (!bot || !bot.isActive) return;
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatId = ev.chat.id;
 
     // Removido/saiu → remove do sistema.
@@ -967,7 +967,7 @@ export class ExecuteFlowStepUseCase {
     const [bot]   = await db.select().from(bots).where(eq(bots.id, payment.botId));
     const [lead]  = await db.select().from(leads).where(eq(leads.id, payment.leadId));
     if (!offer || !bot || !lead) return;
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatId = lead.telegramChatId.toString();
 
     if (offer.productType === "vip_group" && offer.telegramGroupId) {
@@ -1009,7 +1009,7 @@ export class ExecuteFlowStepUseCase {
     const [node] = await db.select().from(funnelNodes).where(eq(funnelNodes.id, payment.nodeId));
     if (!prog || !lead || !bot || !node) return;
 
-    const tg     = new TelegramClient(decrypt(bot.telegramToken));
+    const tg     = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatId = lead.telegramChatId.toString();
     const vars   = await getVars(lead.id, bot.id);
 

@@ -475,7 +475,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     const [bot]  = await db.select().from(bots).where(eq(bots.id, payment.botId));
     const [lead] = await db.select().from(leads).where(eq(leads.id, payment.leadId));
     if (!bot || !lead) return;
-    const tg     = new TelegramClient(decrypt(bot.telegramToken));
+    const tg     = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatId = lead.telegramChatId.toString();
     const protect = bot.protectContent;
 
@@ -570,7 +570,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     if (!bot || !lead || !funnel || funnel.kind !== "simplified") return;
 
     const cfg = (funnel.simplifiedConfig as Record<string, unknown>) || {};
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatId = lead.telegramChatId.toString();
 
     if (task.kind === "upsell") {
