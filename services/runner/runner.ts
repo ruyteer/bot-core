@@ -102,37 +102,61 @@ export const processPendingDelays = api(
 
 // ── Scheduler interno ─────────────────────────────────────────────────────────
 // Os Cron Jobs do Encore só rodam no Encore Cloud; em self-hosted (Railway) não
-// disparam. Então processamos a fila com um setInterval no próprio processo.
-// Guarda por TEMPO (não booleana permanente): se um tick travar (ex.: rede),
-// o próximo assume que morreu após TICK_MAX_MS e segue — evita congelar a fila
-// pra sempre (sintoma: só voltava a enviar após um redeploy). Os processadores
-// usam claim atômico ("sending"/"processing"), então uma sobreposição eventual
-// não duplica envio.
-const TICK_MAX_MS = 3 * 60_000;
-let tickRunningSince = 0;
-async function tickDelays(): Promise<void> {
+// disparam. Então processamos a fila com setInterval no próprio processo.
+//
+// DOIS ticks separados:
+// - RÁPIDO (3s): só os delays do funil de fluxo — são o "timing" que o usuário
+//   percebe (delay de 3s tem que sair em ~3s, não em até 1min). Query leve.
+// - LENTO (60s): tarefas do simplificado, broadcasts e remarketing — não são
+//   sensíveis a latência de segundos.
+//
+// Cada tick tem guarda por TEMPO (não booleana permanente): se um travar (ex.:
+// rede), o próximo assume que morreu após o máximo e segue — evita congelar a
+// fila pra sempre. Os processadores usam claim atômico ("processing"/"sending"),
+// então uma sobreposição eventual não duplica envio.
+const FAST_TICK_MS     = 3_000;
+const FAST_TICK_MAX_MS = 60_000;
+const SLOW_TICK_MS     = 60_000;
+const SLOW_TICK_MAX_MS = 3 * 60_000;
+
+let fastRunningSince = 0;
+async function tickFast(): Promise<void> {
   const now = Date.now();
-  if (tickRunningSince && now - tickRunningSince < TICK_MAX_MS) return;
-  tickRunningSince = now;
+  if (fastRunningSince && now - fastRunningSince < FAST_TICK_MAX_MS) return;
+  fastRunningSince = now;
   try {
     const n = await runDuePendingDelays();
+    if (n > 0) console.log(`[runner] delays: ${n} processado(s)`);
+  } catch (err) {
+    console.error("[runner] tick rápido (delays) falhou:", err);
+  } finally {
+    fastRunningSince = 0;
+  }
+}
+
+let slowRunningSince = 0;
+async function tickSlow(): Promise<void> {
+  const now = Date.now();
+  if (slowRunningSince && now - slowRunningSince < SLOW_TICK_MAX_MS) return;
+  slowRunningSince = now;
+  try {
     const m = await simplifiedFunnel.processDueTasks();
     const b = await processDueBroadcasts();
     const enrolled = await enrollRemarketingTriggers();
     const rmk = await processDueRemarketing();
-    if (n > 0) console.log(`[runner] scheduler: ${n} delay(s) processado(s)`);
     if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
     if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
     if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);
     if (rmk > 0) console.log(`[runner] scheduler: ${rmk} mensagem(ns) de remarketing enviada(s)`);
   } catch (err) {
-    console.error("[runner] scheduler tick falhou:", err);
+    console.error("[runner] tick lento falhou:", err);
   } finally {
-    tickRunningSince = 0;
+    slowRunningSince = 0;
   }
 }
 
 // Aplica DDLs idempotentes pendentes antes do 1º tick (self-hosted não tem migrator).
 void ensureSchemaAtBoot();
 
-setInterval(() => { void tickDelays(); }, 60_000);
+setInterval(() => { void tickFast(); }, FAST_TICK_MS);
+setInterval(() => { void tickSlow(); }, SLOW_TICK_MS);

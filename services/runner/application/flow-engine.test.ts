@@ -50,6 +50,35 @@ describe("message node", () => {
     const actions = getTelegramCalls("sendChatAction");
     expect(actions.some((a) => a.body.action === "typing")).toBe(true);
   });
+
+  it("nó de Texto simples (sem blocks) com simulate_typing dispara typing antes da mensagem", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "olá", simulate_typing: true } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(12) });
+    expect(getTelegramCalls("sendChatAction").some((a) => a.body.action === "typing")).toBe(true);
+    expect(getSentMessages().some((m) => m.includes("olá"))).toBe(true);
+  });
+
+  it("nó de áudio simula 'record_voice' por padrão", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "a", type: "audio", content: { url: "https://x/a.ogg" } },
+      ],
+      connections: [{ from: "t", to: "a" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(13) });
+    expect(getTelegramCalls("sendChatAction").some((a) => a.body.action === "record_voice")).toBe(true);
+  });
 });
 
 // ── BUTTONS NODE ────────────────────────────────────────────────────────────

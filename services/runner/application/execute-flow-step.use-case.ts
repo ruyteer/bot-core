@@ -72,6 +72,24 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Envia o indicador "digitando…"/"gravando áudio…" e PAUSA antes do envio real.
+// Sem a pausa, o indicador some no mesmo instante que a mensagem chega (parecia
+// "não funcionar"). Duração proporcional ao tamanho do texto: 900ms–4s (o
+// indicador do Telegram expira em ~5s, então não passamos disso). O processamento
+// é assíncrono (fora do webhook), então pausar aqui é seguro.
+async function simulateAction(
+  tg: TelegramClient, chatId: string,
+  typing: boolean, recording: boolean, text?: string,
+): Promise<void> {
+  if (!typing && !recording) return;
+  await tg.sendChatAction(chatId, recording ? "record_voice" : "typing");
+  const len = text?.length ?? 40;
+  const ms = Math.min(4000, Math.max(900, len * 35));
+  await sleep(ms);
+}
+
 // ── Validação de input ─────────────────────────────────────────────────────────
 // O frontend (NodeEditPanel) salva `content.validation` com os valores:
 // "none" | "email" | "number" | "cpf". Tratamos também sinônimos (numeric,
@@ -544,6 +562,8 @@ export class ExecuteFlowStepUseCase {
       case "audio": {
         const url     = c.url as string | undefined;
         const caption = typeof c.caption === "string" ? interpolate(c.caption, vars) : undefined;
+        // Áudio: por padrão simula "gravando áudio…" (a não ser que o nó desligue).
+        await simulateAction(tg, chatId, !!c.simulate_typing, c.simulate_recording !== false, undefined);
         if (url) await tg.sendAudio(chatId, url, caption, protect);
         await saveOutbound(leadId, botId, { kind: "audio", url, nodeId: node.id });
         break;
@@ -605,6 +625,11 @@ export class ExecuteFlowStepUseCase {
         }
         const ms     = seconds * 1000;
         const nextId = await nextNode(funnelId, node.id);
+        // "digitando…"/"gravando…" durante a espera (o indicador do Telegram
+        // expira em ~5s, então cobre bem delays curtos, que é o caso de uso).
+        if (c.simulate_typing || c.simulate_recording) {
+          await tg.sendChatAction(chatId, c.simulate_recording ? "record_voice" : "typing");
+        }
         if (nextId && ms > 0) {
           await db.insert(scheduledDelays).values({
             botId,
@@ -708,14 +733,14 @@ export class ExecuteFlowStepUseCase {
 
     if (blocks.length > 0) {
       for (const block of blocks) {
-        // "digitando…"/"gravando áudio…" antes de enviar o bloco (cosmético, auto-expira ~5s).
-        if (block.simulate_typing)         await tg.sendChatAction(chatId, "typing");
-        else if (block.simulate_recording) await tg.sendChatAction(chatId, "record_voice");
-
         const url       = block.url as string | undefined;
         const text      = (block.message ?? block.content ?? block.text) as string | undefined;
         const caption   = typeof block.caption === "string" ? escapeHtml(interpolate(block.caption, vars)) : undefined;
         const mediaType = (block.media_type ?? block.type) as string | undefined;
+
+        // "digitando…"/"gravando áudio…" ANTES do envio, com pausa proporcional
+        // (sem pausa o indicador some no mesmo instante — parecia não funcionar).
+        await simulateAction(tg, chatId, !!block.simulate_typing, !!block.simulate_recording, text);
 
         if (block.type === "text" && text) {
           await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
@@ -732,6 +757,8 @@ export class ExecuteFlowStepUseCase {
     } else {
       const text = (c.message ?? c.text) as string | undefined;
       if (typeof text === "string" && text) {
+        // Nó de Texto simples (sem blocks): a flag fica em content.simulate_typing.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording, text);
         await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
       }
     }
