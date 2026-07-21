@@ -9,6 +9,7 @@ import { testDb } from "../../test/helpers/db.js";
 import { bots } from "../shared/schema/index.js";
 import { createProfile, createBot } from "../../test/helpers/seed.js";
 import { getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
+import { setProfilePhoto, tgCallOrThrow } from "./application/telegram-profile.js";
 
 const repo = new BotDrizzleRepository();
 
@@ -95,5 +96,30 @@ describe("BotDrizzleRepository.findInternalById", () => {
     const bot = await createBot({ token: "999:SECRET" });
     const internal = await repo.findInternalById(bot.id);
     expect(internal!.telegramToken).toBe("999:SECRET");
+  });
+});
+
+// ── Perfil do bot no Telegram ────────────────────────────────────────────────
+// setMyProfilePhoto/removeMyProfilePhoto existem desde a Bot API 9.4. O upload
+// exige um InputProfilePhoto com attach:// — mandar o binário cru em `photo`
+// (como era feito antes) o Telegram recusa.
+describe("telegram-profile", () => {
+  it("setProfilePhoto envia InputProfilePhoto static com attach:// e o arquivo à parte", async () => {
+    await setProfilePhoto("111:ABC", Buffer.from("fake-jpeg").toString("base64"));
+    const call = getTelegramCalls("setMyProfilePhoto")[0];
+    expect(call).toBeDefined();
+    expect(JSON.parse(call.body.photo as string)).toEqual({ type: "static", photo: "attach://pic" });
+    expect(call.body.pic).toMatchObject({ file: "pic.jpg" });
+  });
+
+  it("setProfilePhoto propaga o erro do Telegram em vez de fingir sucesso", async () => {
+    forceTelegramError("setMyProfilePhoto");
+    await expect(setProfilePhoto("111:ABC", "eA==")).rejects.toThrow(/forced error/);
+  });
+
+  it("tgCallOrThrow transforma ok:false em erro (allSettled não via falha nenhuma)", async () => {
+    forceTelegramError("setMyName");
+    await expect(tgCallOrThrow("111:ABC", "setMyName", { name: "X" })).rejects.toThrow(/setMyName/);
+    await expect(tgCallOrThrow("111:ABC", "setMyDescription", { description: "ok" })).resolves.toBeDefined();
   });
 });

@@ -11,6 +11,7 @@ import { DeleteBotUseCase } from "./application/use-cases/delete-bot.use-case.js
 import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook.use-case.js";
 import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
 import { SyncBotProfileUseCase } from "./application/use-cases/sync-bot-profile.use-case.js";
+import { tgCall, tgCallOrThrow, setProfilePhoto } from "./application/telegram-profile.js";
 import type { BotWithStats } from "./domain/bot.entity.js";
 
 const repo              = new BotDrizzleRepository();
@@ -222,14 +223,6 @@ export const deleteGroup = api(
 
 // ─── Telegram profile helpers ─────────────────────────────────────────────────
 
-async function tgCall(token: string, method: string, body?: Record<string, unknown>) {
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: body !== undefined ? "POST" : "GET",
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
-    body:    body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  return res.json() as Promise<{ ok: boolean; result?: unknown; description?: string }>;
-}
 
 interface TelegramProfileResponse {
   username:         string | null;
@@ -302,26 +295,22 @@ export const updateTelegramProfile = api(
 
     const tasks: Promise<unknown>[] = [];
 
-    if (name !== undefined)             tasks.push(tgCall(bot.telegramToken, "setMyName", { name }));
-    if (description !== undefined)      tasks.push(tgCall(bot.telegramToken, "setMyDescription", { description }));
-    if (shortDescription !== undefined) tasks.push(tgCall(bot.telegramToken, "setMyShortDescription", { short_description: shortDescription }));
+    if (name !== undefined)             tasks.push(tgCallOrThrow(bot.telegramToken, "setMyName", { name }));
+    if (description !== undefined)      tasks.push(tgCallOrThrow(bot.telegramToken, "setMyDescription", { description }));
+    if (shortDescription !== undefined) tasks.push(tgCallOrThrow(bot.telegramToken, "setMyShortDescription", { short_description: shortDescription }));
 
     if (removePhoto) {
-      tasks.push(tgCall(bot.telegramToken, "deleteMyProfilePhotos"));
+      tasks.push(tgCallOrThrow(bot.telegramToken, "removeMyProfilePhoto"));
     } else if (photoBase64) {
-      const buf = Buffer.from(photoBase64, "base64");
-      const blob = new Blob([buf], { type: "image/jpeg" });
-      const form = new FormData();
-      form.append("photo", blob, "photo.jpg");
-      tasks.push(
-        fetch(`https://api.telegram.org/bot${bot.telegramToken}/setMyProfilePhoto`, { method: "POST", body: form })
-          .then((r) => r.json()),
-      );
+      tasks.push(setProfilePhoto(bot.telegramToken, photoBase64));
     }
 
     const results = await Promise.allSettled(tasks);
-    const failed = results.filter((r) => r.status === "rejected");
-    if (failed.length > 0) throw APIError.internal("some telegram operations failed");
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed.length > 0) {
+      const msg = failed.map((f) => (f.reason as Error)?.message || String(f.reason)).join("; ");
+      throw APIError.unavailable(msg);
+    }
 
     return { ok: true };
   },

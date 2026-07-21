@@ -96,6 +96,13 @@ export function installFetchMock(): void {
     let body: Record<string, unknown> | null = null;
     if (init?.body && typeof init.body === "string") {
       try { body = JSON.parse(init.body); } catch { body = null; }
+    } else if (init?.body instanceof FormData) {
+      // Upload multipart (ex.: setMyProfilePhoto): campos de texto viram string;
+      // arquivos viram um marcador com nome e tamanho, para asserção nos testes.
+      body = {};
+      for (const [k, v] of init.body.entries()) {
+        body[k] = typeof v === "string" ? v : { file: (v as File).name, size: (v as File).size };
+      }
     }
 
     // Telegram Bot API
