@@ -237,6 +237,19 @@ export const paymentGateways = pgTable("payment_gateways", {
   updatedAt:    timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Ordem de fallback de gateways do bot: se a geração do PIX falhar no primeiro,
+// o runner tenta o próximo (position asc). Substitui bots.default_gateway_id e a
+// escolha de gateway por oferta/funil — a ordem do bot é a única fonte.
+export const botPaymentGateways = pgTable("bot_payment_gateways", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  gatewayId: uuid("gateway_id").notNull().references(() => paymentGateways.id, { onDelete: "cascade" }),
+  position:  integer("position").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  botGatewayUnique: unique("bot_payment_gateways_bot_id_gateway_id_key").on(t.botId, t.gatewayId),
+}));
+
 export const payments = pgTable("payments", {
   id:               uuid("id").defaultRandom().primaryKey(),
   userId:           uuid("user_id").notNull().references(() => profiles.id),

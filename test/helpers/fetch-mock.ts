@@ -24,6 +24,13 @@ export function forceTelegramError(method: string, errorCode?: number): void {
   forcedErrors.set(method, errorCode);
 }
 
+// Derruba um gateway PIX por trecho da URL (ex.: "realtechdev" = BuckPay), para
+// testar a cadeia de fallback. Casa por substring, não por URL exata.
+const forcedGatewayErrors = new Set<string>();
+export function forceGatewayError(urlFragment: string): void {
+  forcedGatewayErrors.add(urlFragment);
+}
+
 let pixSeq = 0;
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -121,6 +128,9 @@ export function installFetchMock(): void {
     if (/syncpay|realtechdev|nexuspag|wiinpay/.test(url)) {
       otherCalls.push({ url, body });
       if (forcedErrors.has(url)) return jsonResponse({ message: "forced error" }, 400);
+      for (const frag of forcedGatewayErrors) {
+        if (url.includes(frag)) return jsonResponse({ message: "forced error" }, 400);
+      }
       return gatewayResponse(url);
     }
 
@@ -133,6 +143,7 @@ export function resetFetchMock(): void {
   telegramCalls = [];
   otherCalls = [];
   forcedErrors.clear();
+  forcedGatewayErrors.clear();
 }
 
 export function uninstallFetchMock(): void {

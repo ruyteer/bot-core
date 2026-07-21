@@ -14,7 +14,7 @@ import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/eve
 // importáveis aqui sem cruzar a fronteira de serviço.
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
-import { createPix } from "../../payments/application/gateway-clients.js";
+import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
@@ -933,7 +933,6 @@ export class ExecuteFlowStepUseCase {
       eq(scheduledDelays.status, "pending"),
     ));
 
-    const gatewayId = typeof offer.gateway_id === "string" ? offer.gateway_id : "";
     // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
     const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
     const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
@@ -943,23 +942,26 @@ export class ExecuteFlowStepUseCase {
       return;
     }
 
-    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId, explicitGatewayId: gatewayId || null });
-    if (!gw) {
-      await tg.sendMessage({ chatId, text: "Gateway de pagamento não configurado.", protectContent: bot.protectContent });
-      return;
-    }
+    // A oferta não escolhe mais gateway: usa a ordem de fallback configurada no bot.
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
 
-    const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
-    const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
-
-    let pix;
+    let result;
     try {
-      pix = await createPix(gw.provider, clientId, clientSecret, amount, productName, webhookUrl);
+      result = await createPixWithFallback(chain, {
+        amountCents: amount,
+        description: productName,
+        webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+      });
     } catch (err) {
-      console.error("[runner] createPix falhou:", err);
+      console.error("[runner] createPix falhou em toda a cadeia:", err);
       await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
       return;
     }
+    if (!result) {
+      await tg.sendMessage({ chatId, text: "Gateway de pagamento não configurado.", protectContent: bot.protectContent });
+      return;
+    }
+    const { gateway: gw, pix } = result;
 
     // Persiste a cobrança com o contexto p/ retomar o funil quando pago.
     await payRepo.create({
@@ -1004,19 +1006,22 @@ export class ExecuteFlowStepUseCase {
     const amount = offer.price; // funnel_offers.price já é em centavos
     if (amount <= 0) { await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent }); return; }
 
-    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId });
-    if (!gw) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
-    const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
-    const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
 
-    let pix;
+    let result;
     try {
-      pix = await createPix(gw.provider, clientId, clientSecret, amount, offer.name, webhookUrl);
+      result = await createPixWithFallback(chain, {
+        amountCents: amount,
+        description: offer.name,
+        webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+      });
     } catch (err) {
-      console.error("[runner] bcast_buy createPix falhou:", err);
+      console.error("[runner] bcast_buy createPix falhou em toda a cadeia:", err);
       await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
       return;
     }
+    if (!result) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
+    const { gateway: gw, pix } = result;
 
     await payRepo.create({
       userId: bot.userId, botId: bot.id, leadId: lead.id, gatewayId: gw.id,

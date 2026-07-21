@@ -122,6 +122,35 @@ export const deleteGateway = api(
   },
 );
 
+interface BotGatewayChainItem {
+  id:       string;
+  provider: string;
+  label:    string;
+  isActive: boolean;
+  position: number;
+}
+
+// GET /bots/:botId/gateways — ordem de fallback de gateways do bot
+export const listBotGateways = api(
+  { method: "GET", path: "/bots/:botId/gateways", expose: true, auth: true },
+  async ({ botId }: { botId: string }): Promise<{ gateways: BotGatewayChainItem[] }> => {
+    const { userID: userId } = getAuthData()!;
+    const gateways = await gwRepo.listChain(botId, userId);
+    return { gateways };
+  },
+);
+
+// PUT /bots/:botId/gateways — substitui a ordem inteira (índice = prioridade)
+export const setBotGateways = api(
+  { method: "PUT", path: "/bots/:botId/gateways", expose: true, auth: true },
+  async ({ botId, gatewayIds }: { botId: string; gatewayIds: string[] }): Promise<{ ok: boolean }> => {
+    const { userID: userId } = getAuthData()!;
+    const ok = await gwRepo.setChain(botId, userId, gatewayIds);
+    if (!ok) throw APIError.notFound("bot not found");
+    return { ok: true };
+  },
+);
+
 // POST /gateways/:id/test — gera um PIX de R$ 10,00 para teste
 export const testGateway = api(
   { method: "POST", path: "/gateways/:id/test", expose: true, auth: true },

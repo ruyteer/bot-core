@@ -12,6 +12,8 @@ import { testDb } from "../../test/helpers/db.js";
 import { payments, processedWebhooks } from "../shared/schema/index.js";
 import { createBot, createGateway, createLead } from "../../test/helpers/seed.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
+import { forceGatewayError } from "../../test/helpers/fetch-mock.js";
+import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
 
 const payRepo = new PaymentDrizzleRepository();
 const gwRepo = new GatewayDrizzleRepository();
@@ -137,30 +139,85 @@ describe("processWebhookEvent", () => {
   });
 });
 
-describe("GatewayDrizzleRepository.findForBot (gateway por bot + override)", () => {
-  it("override explícito tem prioridade sobre o padrão do bot", async () => {
-    const bot = await createBot();
-    const def = await createGateway({ userId: bot.userId, provider: "buckpay" });
-    const over = await createGateway({ userId: bot.userId, provider: "syncpay" });
-    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: def, explicitGatewayId: over });
-    expect(gw!.id).toBe(over);
-  });
-  it("sem override usa o gateway padrão do bot", async () => {
-    const bot = await createBot();
-    const def = await createGateway({ userId: bot.userId, provider: "buckpay" });
-    await createGateway({ userId: bot.userId, provider: "syncpay" });
-    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: def });
-    expect(gw!.id).toBe(def);
-  });
-  it("sem override e sem padrão cai no 1º gateway ativo", async () => {
+describe("GatewayDrizzleRepository — ordem de fallback por bot", () => {
+  it("findChainForBot respeita a ordem configurada", async () => {
     const bot = await createBot();
     const a = await createGateway({ userId: bot.userId, provider: "buckpay" });
-    const gw = await gwRepo.findForBot({ userId: bot.userId });
-    expect(gw!.id).toBe(a);
+    const b = await createGateway({ userId: bot.userId, provider: "syncpay" });
+    await gwRepo.setChain(bot.id, bot.userId, [b, a]);
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+    expect(chain.map((g) => g.id)).toEqual([b, a]);
   });
-  it("retorna null quando o usuário não tem gateway", async () => {
+
+  it("gateway desativado sai da cadeia mesmo estando na ordem", async () => {
     const bot = await createBot();
-    const gw = await gwRepo.findForBot({ userId: bot.userId });
-    expect(gw).toBeNull();
+    const a = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const b = await createGateway({ userId: bot.userId, provider: "syncpay" });
+    await gwRepo.setChain(bot.id, bot.userId, [a, b]);
+    await gwRepo.toggle(a, bot.userId, false);
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+    expect(chain.map((g) => g.id)).toEqual([b]);
+  });
+
+  it("sem ordem configurada usa todos os gateways ativos do usuário", async () => {
+    const bot = await createBot();
+    const a = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+    expect(chain.map((g) => g.id)).toEqual([a]);
+  });
+
+  it("cadeia vazia quando o usuário não tem gateway", async () => {
+    const bot = await createBot();
+    expect(await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id })).toEqual([]);
+  });
+
+  it("setChain ignora gateway de outro usuário", async () => {
+    const bot = await createBot();
+    const other = await createBot();
+    const mine = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const theirs = await createGateway({ userId: other.userId, provider: "syncpay" });
+    await gwRepo.setChain(bot.id, bot.userId, [theirs, mine]);
+    expect((await gwRepo.listChain(bot.id, bot.userId)).map((g) => g.id)).toEqual([mine]);
+  });
+});
+
+describe("createPixWithFallback", () => {
+  it("cai para o próximo gateway quando o primeiro falha", async () => {
+    const bot = await createBot();
+    const bad  = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const good = await createGateway({ userId: bot.userId, provider: "syncpay" });
+    await gwRepo.setChain(bot.id, bot.userId, [bad, good]);
+    forceGatewayError("realtechdev"); // BuckPay fora do ar
+
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+    const res = await createPixWithFallback(chain, {
+      amountCents: 1500, description: "Curso",
+      webhookUrl: (p) => `https://x/webhook/${p}`,
+    });
+
+    expect(res!.gateway.id).toBe(good);
+    expect(res!.failures.map((f) => f.provider)).toEqual(["buckpay"]);
+    expect(res!.pix.pixCode).toBeTruthy();
+  });
+
+  it("lança quando todos falham, com o motivo de cada um", async () => {
+    const bot = await createBot();
+    const a = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const b = await createGateway({ userId: bot.userId, provider: "nexuspag" });
+    await gwRepo.setChain(bot.id, bot.userId, [a, b]);
+    forceGatewayError("realtechdev");
+    forceGatewayError("nexuspag");
+
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+    await expect(createPixWithFallback(chain, {
+      amountCents: 1500, description: "Curso", webhookUrl: (p) => `https://x/webhook/${p}`,
+    })).rejects.toThrow(/todos os gateways falharam/);
+  });
+
+  it("cadeia vazia retorna null (gateway não configurado)", async () => {
+    const res = await createPixWithFallback([], {
+      amountCents: 100, description: "X", webhookUrl: () => "https://x",
+    });
+    expect(res).toBeNull();
   });
 });

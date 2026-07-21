@@ -9,7 +9,7 @@ import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
-import { createPix } from "../../payments/application/gateway-clients.js";
+import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import type { SimplifiedPaymentCtx, SimplifiedDeliveryItem, Payment } from "../../payments/domain/payment.entity.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
@@ -387,22 +387,26 @@ export class ExecuteSimplifiedFunnelUseCase {
       return { paymentId: existing.id, reused: true };
     }
 
-    const gw = await gwRepo.findForBot({ userId: bot.userId, defaultGatewayId: bot.defaultGatewayId, explicitGatewayId: String(payCfg.gateway_id || "") || null });
-    if (!gw) {
-      await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent });
-      return { paymentId: null, reused: false };
-    }
-    const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
-    const webhookUrl = `${encoreExternalUrl()}/payments/webhook/${gw.provider}`;
+    // O funil não escolhe mais gateway: usa a ordem de fallback configurada no bot.
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
 
-    let pix;
+    let result;
     try {
-      pix = await createPix(gw.provider, clientId, clientSecret, amountCents, productName, webhookUrl);
+      result = await createPixWithFallback(chain, {
+        amountCents,
+        description: productName,
+        webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+      });
     } catch (err) {
-      console.error("[simplified] createPix falhou:", err);
+      console.error("[simplified] createPix falhou em toda a cadeia:", err);
       await tg.sendMessage({ chatId, text: "⚠️ Erro ao gerar PIX. Tente novamente.", protectContent: bot.protectContent });
       return { paymentId: null, reused: false };
     }
+    if (!result) {
+      await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent });
+      return { paymentId: null, reused: false };
+    }
+    const { gateway: gw, pix } = result;
 
     const created = await payRepo.create({
       userId:           bot.userId,
