@@ -1,7 +1,7 @@
 import {
   pgTable, pgEnum, uuid, text, boolean, timestamp,
   bigint, doublePrecision, jsonb, integer, primaryKey,
-  uniqueIndex, unique,
+  uniqueIndex, unique, index,
 } from "drizzle-orm/pg-core";
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
@@ -440,6 +440,19 @@ export const conversionEvents = pgTable("conversion_events", {
   errorMessage:   text("error_message"),
   createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Eventos de topo de funil. Existe porque `leads` guarda UMA linha por
+// (bot, chat) — dá para contar pessoas, não interações. Sem isto, "total de
+// starts" era o número de leads criados, e "starts por lead" dava sempre 1,00.
+export const leadEvents = pgTable("lead_events", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  leadId:    uuid("lead_id").references(() => leads.id, { onDelete: "cascade" }),
+  kind:      text("kind").notNull(),   // 'start'
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  botKindCreatedIdx: index("lead_events_bot_id_kind_created_at_idx").on(t.botId, t.kind, t.createdAt),
+}));
 
 export const mediaCache = pgTable("media_cache", {
   id:             uuid("id").defaultRandom().primaryKey(),

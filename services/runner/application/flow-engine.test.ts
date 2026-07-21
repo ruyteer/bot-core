@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
 import { testDb } from "../../../test/helpers/db.js";
-import { scheduledDelays, leadProgress, leadVariables, leads } from "../../shared/schema/index.js";
+import { scheduledDelays, leadProgress, leadVariables, leads, leadEvents } from "../../shared/schema/index.js";
+import { LeadDrizzleRepository } from "../../leads/infrastructure/lead.drizzle.repository.js";
 import {
   createBot, createFlowFunnel, startUpdate, textUpdate, callbackUpdate,
 } from "../../../test/helpers/seed.js";
@@ -11,6 +12,7 @@ import {
 } from "../../../test/helpers/fetch-mock.js";
 
 const useCase = new ExecuteFlowStepUseCase();
+const leadRepo = new LeadDrizzleRepository();
 
 async function leadIdByChat(botId: string, chatId: number): Promise<string> {
   const db = await testDb();
@@ -372,5 +374,48 @@ describe("interpolação de campos do lead", () => {
     await useCase.execute({ botId: bot.id, update: startUpdate(902, { firstName: "Sistema" }) });
     await useCase.execute({ botId: bot.id, update: textUpdate(902, "DigitadoPeloUser") });
     expect(getSentMessages()).toContain("valor: DigitadoPeloUser");
+  });
+});
+
+// ── MÉTRICAS DE TOPO DE FUNIL ───────────────────────────────────────────────
+// `leads` tem uma linha por (bot, chat), então contar leads nunca mediu /start:
+// "starts por lead" dava 1,00 sempre. Os eventos ficam em lead_events.
+describe("lead_events (métrica de starts)", () => {
+  it("cada /start do mesmo lead vira um evento; o lead continua único", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "oi" } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+
+    await useCase.execute({ botId: bot.id, update: startUpdate(4242) });
+    await useCase.execute({ botId: bot.id, update: startUpdate(4242) });
+    await useCase.execute({ botId: bot.id, update: startUpdate(4243) });
+
+    const db = await testDb();
+    const events = await db.select().from(leadEvents).where(eq(leadEvents.botId, bot.id));
+    expect(events.length).toBe(3);
+    expect(events.every((e) => e.kind === "start")).toBe(true);
+
+    const stats = await leadRepo.getStats([bot.id]);
+    expect(stats.starts).toBe(3);       // 3 comandos
+    expect(stats.activeLeads).toBe(2);  // 2 pessoas
+    expect(stats.starts / stats.activeLeads).toBeCloseTo(1.5); // antes: sempre 1,00
+  });
+
+  it("mensagem comum não conta como start", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [{ key: "t", type: "trigger" }, { key: "m", type: "message", content: { message: "oi" } }],
+      connections: [{ from: "t", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: textUpdate(4244, "bom dia") });
+    const stats = await leadRepo.getStats([bot.id]);
+    expect(stats.starts).toBe(0);
   });
 });

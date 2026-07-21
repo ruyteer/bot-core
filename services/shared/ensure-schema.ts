@@ -38,6 +38,25 @@ const STATEMENTS: string[] = [
   `INSERT INTO "bot_payment_gateways" ("bot_id", "gateway_id", "position")
    SELECT "id", "default_gateway_id", 0 FROM "bots" WHERE "default_gateway_id" IS NOT NULL
    ON CONFLICT ("bot_id", "gateway_id") DO NOTHING`,
+
+  // 0006_lead_events.sql
+  `CREATE TABLE IF NOT EXISTS "lead_events" (
+     "id"         uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+     "bot_id"     uuid NOT NULL,
+     "lead_id"    uuid,
+     "kind"       text NOT NULL,
+     "created_at" timestamp with time zone DEFAULT now() NOT NULL
+   )`,
+  `DO $$ BEGIN
+     ALTER TABLE "lead_events" ADD CONSTRAINT "lead_events_bot_id_bots_id_fk"
+       FOREIGN KEY ("bot_id") REFERENCES "bots"("id") ON DELETE cascade ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  `DO $$ BEGIN
+     ALTER TABLE "lead_events" ADD CONSTRAINT "lead_events_lead_id_leads_id_fk"
+       FOREIGN KEY ("lead_id") REFERENCES "leads"("id") ON DELETE cascade ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  `CREATE INDEX IF NOT EXISTS "lead_events_bot_id_kind_created_at_idx"
+     ON "lead_events" ("bot_id", "kind", "created_at")`,
 ];
 
 export async function ensureSchema(): Promise<void> {

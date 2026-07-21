@@ -3,7 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
   funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
-  funnelOffers,
+  funnelOffers, leadEvents,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -253,6 +253,14 @@ export class ExecuteFlowStepUseCase {
     // Save inbound message
     if (messageText) {
       await saveInbound(lead.id, botId, { kind: "text", text: messageText });
+    }
+
+    // Registra o /start como evento. Fica ANTES do roteamento (fluxo vs
+    // simplificado) para contar os dois. `leads` só guarda uma linha por chat,
+    // então sem isto não há como saber quantas vezes alguém deu /start.
+    // Deep link ("/start ref123") também conta.
+    if (typeof messageText === "string" && /^\/start(\s|$)/.test(messageText)) {
+      await db.insert(leadEvents).values({ botId, leadId: lead.id, kind: "start" });
     }
 
     // Answer callback immediately to stop Telegram spinner

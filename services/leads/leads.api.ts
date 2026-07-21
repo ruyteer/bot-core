@@ -74,6 +74,34 @@ export const list = api(
   },
 );
 
+interface LeadStatsResponse {
+  /** Total de comandos /start no período (conta repetição do mesmo lead). */
+  starts:      number;
+  /** Leads distintos que deram /start no período. */
+  activeLeads: number;
+  /** Leads criados no período (primeiro contato). */
+  newLeads:    number;
+}
+
+// GET /leads/stats?botId=...&start=...&end=...
+// Existe porque a tabela `leads` guarda uma linha por (bot, chat): dava para
+// contar pessoas, nunca interações. O painel usava a contagem de leads como
+// "total de starts", e "starts por lead" saía sempre 1,00.
+export const stats = api(
+  { method: "GET", path: "/leads/stats", expose: true, auth: true },
+  async ({ botId, start, end }: { botId?: string; start?: string; end?: string }): Promise<LeadStatsResponse> => {
+    const { userID: userId } = getAuthData()!;
+    const userBotIds = await repo.getUserBotIds(userId);
+    if (botId && !userBotIds.includes(botId)) throw APIError.notFound("bot not found");
+    const botIds = botId ? [botId] : userBotIds;
+    if (botIds.length === 0) return { starts: 0, activeLeads: 0, newLeads: 0 };
+
+    const startDate = start ? new Date(start) : undefined;
+    const endDate   = end   ? new Date(end)   : undefined;
+    return repo.getStats(botIds, startDate, endDate);
+  },
+);
+
 // GET /leads/:id
 export const get = api(
   { method: "GET", path: "/leads/:id", expose: true, auth: true },
