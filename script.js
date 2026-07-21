@@ -43,8 +43,15 @@ if (IMAGE) {
 }
 
 // 2. Dispara o deploy.
+// PRECISA ser serviceInstanceDeploy, não serviceInstanceRedeploy: o redeploy
+// repete o SNAPSHOT do último deployment e ignora a imagem que o passo 1 acabou
+// de configurar. Enquanto o serviço apontava para :latest isso passava
+// despercebido (redeployar :latest repuxava a imagem nova), mas depois que
+// passamos a pinar :sha-* a tag ficou imutável e o serviço congelou em
+// sha-c0728da64be0 (2026-07-17): builds verdes, deploys "SUCCESS", e nenhuma
+// linha de código nova em produção por dias.
 const out = await railway(`mutation {
-  serviceInstanceRedeploy(
+  serviceInstanceDeploy(
     environmentId: "${ENVIRONMENT_ID}"
     serviceId: "${SERVICE_ID}"
   )
