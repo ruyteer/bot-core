@@ -130,22 +130,25 @@ interface BotGatewayChainItem {
   position: number;
 }
 
-// GET /bots/:botId/gateways — ordem de fallback de gateways do bot
+// GET /bots/:id/gateways — ordem de fallback de gateways do bot.
+// O parâmetro PRECISA se chamar `id`: o serviço de bots já registra
+// `/bots/:id/...` e o roteador não aceita dois nomes de parâmetro na mesma
+// posição da árvore. Com `:botId` a rota era silenciosamente descartada (404).
 export const listBotGateways = api(
-  { method: "GET", path: "/bots/:botId/gateways", expose: true, auth: true },
-  async ({ botId }: { botId: string }): Promise<{ gateways: BotGatewayChainItem[] }> => {
+  { method: "GET", path: "/bots/:id/gateways", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ gateways: BotGatewayChainItem[] }> => {
     const { userID: userId } = getAuthData()!;
-    const gateways = await gwRepo.listChain(botId, userId);
+    const gateways = await gwRepo.listChain(id, userId);
     return { gateways };
   },
 );
 
-// PUT /bots/:botId/gateways — substitui a ordem inteira (índice = prioridade)
+// PUT /bots/:id/gateways — substitui a ordem inteira (índice = prioridade)
 export const setBotGateways = api(
-  { method: "PUT", path: "/bots/:botId/gateways", expose: true, auth: true },
-  async ({ botId, gatewayIds }: { botId: string; gatewayIds: string[] }): Promise<{ ok: boolean }> => {
+  { method: "PUT", path: "/bots/:id/gateways", expose: true, auth: true },
+  async ({ id, gatewayIds }: { id: string; gatewayIds: string[] }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
-    const ok = await gwRepo.setChain(botId, userId, gatewayIds);
+    const ok = await gwRepo.setChain(id, userId, gatewayIds);
     if (!ok) throw APIError.notFound("bot not found");
     return { ok: true };
   },
