@@ -419,3 +419,52 @@ describe("lead_events (métrica de starts)", () => {
     expect(stats.starts).toBe(0);
   });
 });
+
+// O painel oferece o toggle de simulação nos nós de mídia e de botões, mas o
+// runner só lia a flag em mensagem/áudio/delay — era salva e ignorada.
+describe("simulação de digitação nos nós de mídia e botões", () => {
+  it("nó de mídia com simulate_typing dispara typing antes de enviar", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "media", content: { url: "https://x/a.jpg", media_type: "image", simulate_typing: true } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(7001) });
+    expect(getTelegramCalls("sendChatAction").some((a) => a.body.action === "typing")).toBe(true);
+  });
+
+  it("nó de botões com simulate_recording dispara record_voice antes de enviar", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "b", type: "buttons", content: {
+          message: "Escolha:", simulate_recording: true,
+          buttons: [{ text: "A", callback: "a", action: "funnel" }],
+        } },
+      ],
+      connections: [{ from: "t", to: "b" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(7002) });
+    expect(getTelegramCalls("sendChatAction").some((a) => a.body.action === "record_voice")).toBe(true);
+  });
+
+  it("sem a flag, nenhum indicador é enviado", async () => {
+    const bot = await createBot();
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "b", type: "buttons", content: { message: "Oi", buttons: [{ text: "A", callback: "a", action: "funnel" }] } },
+      ],
+      connections: [{ from: "t", to: "b" }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(7003) });
+    expect(getTelegramCalls("sendChatAction").length).toBe(0);
+  });
+});

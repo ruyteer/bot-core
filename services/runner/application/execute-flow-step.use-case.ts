@@ -563,6 +563,10 @@ export class ExecuteFlowStepUseCase {
       }
 
       case "media":
+        // O painel oferece o toggle de simulação também no nó de mídia
+        // (NodeEditPanel, aba do nó `media`) — sem isto a flag era salva e ignorada.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
+          typeof c.caption === "string" ? c.caption : undefined);
         await this.executeMediaNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         break;
@@ -578,6 +582,9 @@ export class ExecuteFlowStepUseCase {
       }
 
       case "buttons":
+        // Idem para o nó de botões — o toggle existe no painel desde sempre.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
+          typeof c.message === "string" ? c.message : undefined);
         await this.executeButtonsNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         // Stay on this node waiting for callback
