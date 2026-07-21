@@ -1,6 +1,7 @@
 import { api } from "encore.dev/api";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { paymentPaid } from "../shared/events/index.js";
+import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
 import {
   normalizeSyncpayWebhook,
   normalizeBuckpayWebhook,
@@ -8,6 +9,11 @@ import {
   normalizeWiinpayWebhook,
   type NormalizedWebhookEvent,
 } from "./application/gateway-clients.js";
+
+// Valor em centavos -> "R$ 12,34"
+function formatBRL(cents: number): string {
+  return (Number(cents || 0) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
 
 const payRepo = new PaymentDrizzleRepository();
 
@@ -37,6 +43,16 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       await payRepo.markPaid(payment.id, event.amount ?? undefined);
       // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
       await paymentPaid.publish({ paymentId: payment.id });
+
+      // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
+      // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.
+      const amount = event.amount ?? payment.amount;
+      void sendPushToUser(payment.userId, {
+        eventType: "sale",
+        title:     "💰 Venda aprovada!",
+        body:      `${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
+        data:      { url: "/sales", payment_id: payment.id },
+      }).catch((err) => console.error("[payments] push de venda falhou:", err));
     } else if (event.status === "cancelled" || event.status === "expired") {
       await payRepo.updateStatus(payment.id, event.status);
     }
