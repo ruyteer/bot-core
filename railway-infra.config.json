@@ -4,7 +4,13 @@
     "ENCRYPTION_KEY": { "$env": "ENCRYPTION_KEY" },
     "SUPABASE_URL": { "$env": "SUPABASE_URL" },
     "ENCORE_EXTERNAL_URL": { "$env": "ENCORE_EXTERNAL_URL" },
-    "DATABASE_URL": { "$env": "DATABASE_URL" }
+    "DATABASE_URL": { "$env": "DATABASE_URL" },
+    "VAPID_PUBLIC_KEY": { "$env": "VAPID_PUBLIC_KEY" },
+    "VAPID_PRIVATE_KEY": { "$env": "VAPID_PRIVATE_KEY" },
+    "VAPID_SUBJECT": { "$env": "VAPID_SUBJECT" },
+    "SYNCPAY_SPLIT_USER_ID": { "$env": "SYNCPAY_SPLIT_USER_ID" },
+    "NEXUSPAG_SPLIT_USER_ID": { "$env": "NEXUSPAG_SPLIT_USER_ID" },
+    "WIINPAY_SPLIT_USER_ID": { "$env": "WIINPAY_SPLIT_USER_ID" }
   },
   "worker_threads": 0,
   "pubsub": [

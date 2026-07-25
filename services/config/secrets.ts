@@ -19,11 +19,3 @@ export const vapidSubject    = secret("VAPID_SUBJECT");
 export const syncpaySplitUserId  = secret("SYNCPAY_SPLIT_USER_ID");
 export const nexuspagSplitUserId = secret("NEXUSPAG_SPLIT_USER_ID");
 export const wiinpaySplitUserId  = secret("WIINPAY_SPLIT_USER_ID");
-
-// Split de monetização: R$0,40 por transação vão para a conta da PLATAFORMA em
-// cada gateway. O recebedor é a conta da plataforma NO MESMO PSP, identificada
-// pelo user_id/client_id abaixo (um por provider). Enquanto o secret estiver
-// vazio, o split é pulado e o PIX é gerado normalmente (sem taxa da plataforma).
-export const splitSyncpayUserId  = secret("SPLIT_SYNCPAY_USER_ID");
-export const splitNexuspagUserId = secret("SPLIT_NEXUSPAG_USER_ID");
-export const splitWiinpayUserId  = secret("SPLIT_WIINPAY_USER_ID");
