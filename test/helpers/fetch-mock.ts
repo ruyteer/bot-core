@@ -89,10 +89,10 @@ function gatewayResponse(url: string): Response {
     return jsonResponse({ pix_code: code, identifier: id });
   if (url.includes("realtechdev")) // BuckPay
     return jsonResponse({ data: { id, pix: { code, qrcode_base64: "x" } } });
-  if (url.includes("nexuspag"))
-    return jsonResponse({ pix_code: code, id });
-  if (url.includes("wiinpay"))
-    return jsonResponse({ pix_copy_paste: code, id });
+  if (url.includes("nexuspag")) // /api/pix/create → transaction aninhada
+    return jsonResponse({ success: true, transaction: { id, txid: `tx_${id}`, pix_copia_cola: code, qr_code_base64: "x" } });
+  if (url.includes("wiinpay")) // /payment/create → { data: { qr_code, paymentId } } (real)
+    return jsonResponse({ data: { message: "ok", qr_code: code, paymentId: id } });
   return jsonResponse({ ok: true });
 }
 
