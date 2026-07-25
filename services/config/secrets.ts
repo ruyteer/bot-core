@@ -19,3 +19,5 @@ export const vapidSubject    = secret("VAPID_SUBJECT");
 export const syncpaySplitUserId  = secret("SYNCPAY_SPLIT_USER_ID");
 export const nexuspagSplitUserId = secret("NEXUSPAG_SPLIT_USER_ID");
 export const wiinpaySplitUserId  = secret("WIINPAY_SPLIT_USER_ID");
+// BuckPay identifica o recebedor do split por E-MAIL cadastrado na Buck (não user_id).
+export const buckpaySplitEmail   = secret("BUCKPAY_SPLIT_EMAIL");

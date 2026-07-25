@@ -12,7 +12,7 @@ import { testDb } from "../../test/helpers/db.js";
 import { payments, processedWebhooks } from "../shared/schema/index.js";
 import { createBot, createGateway, createLead } from "../../test/helpers/seed.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
-import { forceGatewayError } from "../../test/helpers/fetch-mock.js";
+import { forceGatewayError, getOtherCalls } from "../../test/helpers/fetch-mock.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
 
 const payRepo = new PaymentDrizzleRepository();
@@ -52,6 +52,71 @@ describe("createPix", () => {
       expect(r.provider).toBe(p);
     });
   }
+});
+
+// ── Split de monetização (40c da plataforma) ────────────────────────────────
+describe("split por provider", () => {
+  const CASES = [
+    { p: "syncpay",  env: "SYNCPAY_SPLIT_USER_ID",  recv: "rc-sync",       urlPart: "cash-in" },
+    { p: "nexuspag", env: "NEXUSPAG_SPLIT_USER_ID", recv: "rc-nex",        urlPart: "nexuspag" },
+    { p: "wiinpay",  env: "WIINPAY_SPLIT_USER_ID",  recv: "rc-wiin",       urlPart: "wiinpay" },
+    { p: "buckpay",  env: "BUCKPAY_SPLIT_EMAIL",    recv: "x@orion.app",   urlPart: "realtechdev" },
+  ] as const;
+
+  for (const c of CASES) {
+    it(`${c.p}: sem secret NÃO envia split`, async () => {
+      await createPix(c.p as any, "client", "secret", 600, "P", "https://wh");
+      const call = getOtherCalls().find((x) => x.url.includes(c.urlPart));
+      expect(call?.body?.split ?? call?.body?.splits).toBeUndefined();
+    });
+
+    it(`${c.p}: com secret envia split para o recebedor`, async () => {
+      process.env[`TEST_SECRET_${c.env}`] = c.recv;
+      try {
+        await createPix(c.p as any, "client", "secret", 600, "P", "https://wh");
+        const call = getOtherCalls().find((x) => x.url.includes(c.urlPart));
+        const split = call?.body?.split ?? call?.body?.splits;
+        expect(split).toBeDefined();
+        expect(JSON.stringify(split)).toContain(c.recv);
+      } finally {
+        delete process.env[`TEST_SECRET_${c.env}`];
+      }
+    });
+  }
+
+  it("syncpay: percentual inteiro arredonda pra cima (600c → 7%)", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc";
+    try {
+      await createPix("syncpay", "c", "s", 600, "P", "https://wh");
+      const call = getOtherCalls().find((x) => x.url.includes("cash-in"));
+      expect((call!.body!.split as any)[0].percentage).toBe(7); // ceil(40/600*100)=7
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
+  });
+
+  it("buckpay: basis points arredonda pra cima (600c → 667 bps)", async () => {
+    process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL = "x@y.com";
+    try {
+      await createPix("buckpay", "c", "s", 600, "P", "https://wh");
+      const call = getOtherCalls().find((x) => x.url.includes("realtechdev"));
+      expect((call!.body!.splits as any)[0].percentage_bps).toBe(667); // ceil(40/600*10000)
+    } finally { delete process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL; }
+  });
+
+  it("nexuspag/wiinpay: valor fixo de 40 centavos", async () => {
+    process.env.TEST_SECRET_NEXUSPAG_SPLIT_USER_ID = "rc";
+    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
+    try {
+      await createPix("nexuspag", "c", "s", 600, "P", "https://wh");
+      await createPix("wiinpay", "c", "s", 600, "P", "https://wh");
+      const nx = getOtherCalls().find((x) => x.url.includes("nexuspag"));
+      const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
+      expect((nx!.body!.split as any)[0].amount).toBe(0.4);
+      expect((wp!.body!.split as any).value).toBe(0.4);
+    } finally {
+      delete process.env.TEST_SECRET_NEXUSPAG_SPLIT_USER_ID;
+      delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID;
+    }
+  });
 });
 
 // ── Repositório ─────────────────────────────────────────────────────────────

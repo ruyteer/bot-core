@@ -10,7 +10,8 @@
     "VAPID_SUBJECT": { "$env": "VAPID_SUBJECT" },
     "SYNCPAY_SPLIT_USER_ID": { "$env": "SYNCPAY_SPLIT_USER_ID" },
     "NEXUSPAG_SPLIT_USER_ID": { "$env": "NEXUSPAG_SPLIT_USER_ID" },
-    "WIINPAY_SPLIT_USER_ID": { "$env": "WIINPAY_SPLIT_USER_ID" }
+    "WIINPAY_SPLIT_USER_ID": { "$env": "WIINPAY_SPLIT_USER_ID" },
+    "BUCKPAY_SPLIT_EMAIL": { "$env": "BUCKPAY_SPLIT_EMAIL" }
   },
   "worker_threads": 0,
   "pubsub": [

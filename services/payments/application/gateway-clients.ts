@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PixPaymentResult, Provider } from "../domain/gateway.entity.js";
-import { syncpaySplitUserId, nexuspagSplitUserId, wiinpaySplitUserId } from "../../config/secrets.js";
+import { syncpaySplitUserId, nexuspagSplitUserId, wiinpaySplitUserId, buckpaySplitEmail } from "../../config/secrets.js";
 
 // Split de monetização da plataforma: R$0,40 por transação. O `receiverId` é a
 // conta da plataforma no PSP (secret por provider); quando null, sem split.
@@ -8,7 +8,7 @@ const PLATFORM_SPLIT_CENTS = 40;
 
 // Recebedor do split por provider, vindo dos secrets da plataforma. Vazio (secret
 // não configurado) = split desligado nesse gateway, e o PIX segue sem split.
-// BuckPay ainda não entra: split não implementado (aguardando a doc).
+// SyncPay/NexusPag/WiinPay: user_id/client_id. BuckPay: e-mail cadastrado na Buck.
 function splitReceiverFor(provider: Provider): string | null {
   const read = (fn: () => string): string | null => {
     try { return (fn() || "").trim() || null; } catch { return null; }
@@ -17,6 +17,7 @@ function splitReceiverFor(provider: Provider): string | null {
     case "syncpay":  return read(syncpaySplitUserId);
     case "nexuspag": return read(nexuspagSplitUserId);
     case "wiinpay":  return read(wiinpaySplitUserId);
+    case "buckpay":  return read(buckpaySplitEmail);
     default:         return null;
   }
 }
@@ -27,6 +28,14 @@ function splitReceiverFor(provider: Provider): string | null {
 function syncpaySplitPercentage(amountCents: number): number {
   const p = Math.ceil((PLATFORM_SPLIT_CENTS * 100) / amountCents);
   return Math.max(1, Math.min(99, p));
+}
+
+// BuckPay: split em basis points (1 bp = 0,01%), min 1 / max 9000, calculado
+// sobre o líquido. Convertemos os 40c fixos p/ bps sobre o valor bruto (não
+// sabemos a taxa no momento da criação) — aproximado, arredondando pra cima.
+function buckpaySplitBps(amountCents: number): number {
+  const bps = Math.ceil((PLATFORM_SPLIT_CENTS / amountCents) * 10000);
+  return Math.max(1, Math.min(9000, bps));
 }
 
 // ── SyncPay ───────────────────────────────────────────────────────────────────
@@ -85,7 +94,19 @@ const BUCKPAY_USER_AGENT = "Buckpay API"; // valor fornecido pelo gerente de con
 export async function buckpayCashIn(
   apiToken: string,
   amountCents: number, description: string, webhookUrl: string,
+  splitReceiverEmail?: string | null,
 ): Promise<PixPaymentResult> {
+  const body: Record<string, unknown> = {
+    external_id:    randomUUID(),
+    payment_method: "pix",
+    amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
+    postbackUrl:    webhookUrl,
+  };
+  if (splitReceiverEmail) {
+    // Split por e-mail + basis points (percentual). O recebedor precisa estar
+    // cadastrado na Buck. Calculado sobre o líquido.
+    body.splits = [{ email: splitReceiverEmail, percentage_bps: buckpaySplitBps(amountCents) }];
+  }
   const res = await fetch(`${BUCKPAY_BASE_URL}/v1/transactions`, {
     method:  "POST",
     headers: {
@@ -93,12 +114,7 @@ export async function buckpayCashIn(
       "User-Agent":   BUCKPAY_USER_AGENT,
       Authorization:  `Bearer ${apiToken}`,
     },
-    body: JSON.stringify({
-      external_id:    randomUUID(),
-      payment_method: "pix",
-      amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
-      postbackUrl:    webhookUrl,
-    }),
+    body: JSON.stringify(body),
   });
   const json = await res.json() as {
     data?:  { id?: string; pix?: { code?: string; qrcode_base64?: string } };
@@ -228,7 +244,7 @@ export async function createPix(
   const split = splitReceiverFor(provider);
   switch (provider) {
     case "syncpay":  return syncpayCashIn(clientId, clientSecret, amountCents, description, webhookUrl, split);
-    case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl);
+    case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl, split);
     case "nexuspag": return nexuspagCashIn(clientId, amountCents, description, webhookUrl, split);
     case "wiinpay":  return wiinpayCashIn(clientId, amountCents, description, webhookUrl, split);
   }
