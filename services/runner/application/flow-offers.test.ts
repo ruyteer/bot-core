@@ -126,7 +126,14 @@ describe("handlePaidOffer — entrega e retomada", () => {
     await useCase.handlePaidOffer((await payRepo.findById(pay.id))!);
 
     expect(getTelegramCalls("createChatInviteLink").length).toBe(1);
-    expect(getSentMessages().some((m) => m.includes("t.me/+testinvite"))).toBe(true);
+    // O link de convite agora vai num BOTÃO (reply_markup), não colado no texto.
+    const withButton = getTelegramCalls("sendMessage").find((c) => {
+      const kb = (c.body.reply_markup as { inline_keyboard?: Array<Array<{ url?: string }>> })?.inline_keyboard;
+      return kb?.some((row) => row.some((b) => b.url?.includes("t.me/+testinvite")));
+    });
+    expect(withButton).toBeDefined();
+    // e o link não deve mais aparecer cru no texto de nenhuma mensagem
+    expect(getSentMessages().some((m) => m.includes("t.me/+testinvite"))).toBe(false);
   });
 });
 

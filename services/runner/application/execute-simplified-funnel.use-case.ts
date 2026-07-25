@@ -3,7 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   bots, leads, funnels, payments, simplifiedScheduledTasks,
 } from "../../shared/schema/index.js";
-import { TelegramClient } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
 import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
@@ -506,7 +506,12 @@ export class ExecuteSimplifiedFunnelUseCase {
       const expireDate = (item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined;
       try {
         const link = await tg.createChatInviteLink(item.vip_group_id, { memberLimit: 1, expireDate });
-        await tg.sendMessage({ chatId, text: `🎉 <b>${name}</b>\n\n🔗 Entre no grupo VIP:\n${link}\n\n⚠️ Este link é único e só pode ser usado uma vez.`, protectContent: protect });
+        await tg.sendMessage({
+          chatId,
+          text: `🎉 <b>${name}</b>\n\nToque no botão abaixo para entrar no grupo VIP.\n⚠️ O convite é único e só pode ser usado uma vez.`,
+          replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+          protectContent: protect,
+        });
       } catch (err) {
         console.error("[simplified] createChatInviteLink:", err);
         await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n⚠️ Não foi possível gerar o link de convite automaticamente. Entre em contato com o suporte.`, protectContent: protect });

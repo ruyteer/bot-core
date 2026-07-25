@@ -5,7 +5,7 @@ import {
   funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
   funnelOffers, leadEvents,
 } from "../../shared/schema/index.js";
-import { TelegramClient } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { interpolate, mergeLeadFields } from "./interpolate.js";
 import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
@@ -1065,7 +1065,12 @@ export class ExecuteFlowStepUseCase {
         const expireDate = offer.accessDays > 0 ? Math.floor(Date.now() / 1000) + offer.accessDays * 86400 : undefined;
         try {
           const link = await tg.createChatInviteLink(grp.telegramChatId.toString(), { memberLimit: 1, expireDate });
-          await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado! Seu acesso: ${link}`, protectContent: bot.protectContent });
+          await tg.sendMessage({
+            chatId,
+            text: "✅ Pagamento confirmado! Toque no botão abaixo para entrar no grupo:",
+            replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+            protectContent: bot.protectContent,
+          });
           return;
         } catch (e) { console.error("[runner] deliverFunnelOffer invite:", e); }
       }
@@ -1145,7 +1150,12 @@ export class ExecuteFlowStepUseCase {
       const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
       try {
         const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
-        await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado! Seu acesso: ${link}`, protectContent: protect });
+        await tg.sendMessage({
+          chatId,
+          text: "✅ Pagamento confirmado! Toque no botão abaixo para entrar no grupo:",
+          replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+          protectContent: protect,
+        });
       } catch (err) {
         console.error("[runner] createChatInviteLink falhou:", err);
         await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: protect });

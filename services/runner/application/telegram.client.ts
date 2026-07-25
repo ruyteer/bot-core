@@ -11,6 +11,13 @@ export interface SendMessageOptions {
   protectContent?: boolean;
 }
 
+// Teclado inline com um único botão que abre uma URL (ex.: link de convite de
+// grupo). Um link de convite `https://t.me/+...` funciona direto como botão URL.
+// Botão converte melhor que o link cru colado no texto.
+export function urlButtonMarkup(text: string, url: string): { inline_keyboard: Array<Array<{ text: string; url: string }>> } {
+  return { inline_keyboard: [[{ text, url }]] };
+}
+
 export interface SendPhotoOptions {
   chatId:   string;
   photo:    string;   // URL or file_id
