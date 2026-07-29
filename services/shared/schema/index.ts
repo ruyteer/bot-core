@@ -534,6 +534,38 @@ export const paymentRevenueCredits = pgTable("payment_revenue_credits", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [primaryKey({ columns: [t.paymentId, t.userId] })]);
 
+// ─── COMPLIANCE ───────────────────────────────────────────────────────────────
+// Detecção passiva de conteúdo proibido. NÃO bloqueia salvar/enviar/cobrar — só
+// gera alerta para revisão manual do admin.
+
+export const blockedKeywords = pgTable("blocked_keywords", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  keyword:   text("keyword").notNull(),
+  category:  text("category").notNull().default("geral"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  keywordUnique: unique("blocked_keywords_keyword_key").on(t.keyword),
+}));
+
+export const complianceAlerts = pgTable("compliance_alerts", {
+  id:         uuid("id").defaultRandom().primaryKey(),
+  // Origem escaneada. source_id é uuid da entidade (funnel/offer/campaign/broadcast/bot).
+  sourceType: text("source_type").notNull(),   // 'funnel' | 'offer' | 'remarketing' | 'broadcast' | 'bot'
+  sourceId:   uuid("source_id").notNull(),
+  userId:     uuid("user_id").references(() => profiles.id, { onDelete: "cascade" }),  // dono da origem
+  keywords:   jsonb("keywords").notNull().default([]),   // string[] das palavras que casaram (efetivas)
+  category:   text("category"),                          // categoria da 1ª palavra
+  snippet:    text("snippet"),                           // trecho ~120 chars ao redor do 1º match
+  status:     text("status").notNull().default("pending"), // 'pending' | 'resolved' | 'dismissed'
+  // Palavras que o admin já descartou p/ esta origem — não recria alerta com elas.
+  dismissedKeywords: jsonb("dismissed_keywords").notNull().default([]),
+  createdAt:  timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt:  timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  sourceUnique:   unique("compliance_alerts_source_type_source_id_key").on(t.sourceType, t.sourceId),
+  statusIdx:      index("compliance_alerts_status_idx").on(t.status),
+}));
+
 // ─── TYPE EXPORTS ─────────────────────────────────────────────────────────────
 
 export type Profile                       = typeof profiles.$inferSelect;

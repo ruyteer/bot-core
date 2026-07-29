@@ -1,4 +1,5 @@
 import { api, APIError } from "encore.dev/api";
+import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
 import { db } from "../shared/database.js";
@@ -89,6 +90,7 @@ export const create = api(
   async (req: CreateBotRequest): Promise<BotResponse> => {
     const { userID: userId } = getAuthData()!;
     const bot = await createBot.execute({ userId, name: req.name, telegramToken: req.telegramToken });
+    scanSourceAsync("bot", bot.id);
     return toResponseWithStats(bot);
   },
 );
@@ -99,6 +101,7 @@ export const update = api(
   async ({ id, ...req }: { id: string } & UpdateBotRequest): Promise<BotResponse> => {
     const { userID: userId } = getAuthData()!;
     const bot = await updateBot.execute(id, userId, req);
+    scanSourceAsync("bot", bot.id);
     return toResponseWithStats(bot);
   },
 );
