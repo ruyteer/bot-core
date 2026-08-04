@@ -6,6 +6,21 @@ import { syncpaySplitUserId, nexuspagSplitUserId, wiinpaySplitUserId, buckpaySpl
 // conta da plataforma no PSP (secret por provider); quando null, sem split.
 const PLATFORM_SPLIT_CENTS = 40;
 
+// Extrai uma mensagem legível de um erro de gateway que pode vir como string,
+// { message } ou objeto. Sem isso, `throw new Error(obj)` virava "[object Object]"
+// e escondia a causa real (ex.: WiinPay "Split não pode ser para o próprio recebedor").
+function errMsg(...cands: unknown[]): string {
+  for (const c of cands) {
+    if (typeof c === "string" && c.trim()) return c;
+    if (c && typeof c === "object") {
+      const m = (c as { message?: unknown }).message;
+      if (typeof m === "string" && m.trim()) return m;
+      try { return JSON.stringify(c); } catch { /* ignore */ }
+    }
+  }
+  return "erro desconhecido do gateway";
+}
+
 // Recebedor do split por provider, vindo dos secrets da plataforma. Vazio (secret
 // não configurado) = split desligado nesse gateway, e o PIX segue sem split.
 // SyncPay/NexusPag/WiinPay: user_id/client_id. BuckPay: e-mail cadastrado na Buck.
@@ -171,7 +186,7 @@ export async function nexuspagCashIn(
   };
   const tx = json.transaction;
   if (!res.ok || !tx?.id || !tx.pix_copia_cola) {
-    throw new Error(json.error ?? json.message ?? "NexusPag cashin failed");
+    throw new Error(errMsg(json.error, json.message, "NexusPag cashin failed"));
   }
   return {
     pixCode:     tx.pix_copia_cola,
@@ -220,7 +235,7 @@ export async function wiinpayCashIn(
   const d = json.data ?? {};
   const pix = d.qr_code;
   const id  = d.paymentId ?? d.id;
-  if (!res.ok || !pix || !id) throw new Error(json.error ?? d.message ?? json.message ?? "WiinPay cashin failed");
+  if (!res.ok || !pix || !id) throw new Error(errMsg(json.error, d.message, json.message, "WiinPay cashin failed"));
   return {
     pixCode:     pix,
     qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(pix)}`,
@@ -233,6 +248,11 @@ export async function wiinpayCashIn(
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
+export interface CreatePixOpts {
+  // Admin não paga a taxa da plataforma: pula o split (o PIX vira 100% do vendedor).
+  skipSplit?: boolean;
+}
+
 export async function createPix(
   provider: Provider,
   clientId: string,
@@ -240,8 +260,9 @@ export async function createPix(
   amountCents: number,
   description: string,
   webhookUrl: string,
+  opts?: CreatePixOpts,
 ): Promise<PixPaymentResult> {
-  const split = splitReceiverFor(provider);
+  const split = opts?.skipSplit ? null : splitReceiverFor(provider);
   switch (provider) {
     case "syncpay":  return syncpayCashIn(clientId, clientSecret, amountCents, description, webhookUrl, split);
     case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl, split);

@@ -966,6 +966,7 @@ export class ExecuteFlowStepUseCase {
         amountCents: amount,
         description: productName,
         webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+        ownerUserId: bot.userId,
       });
     } catch (err) {
       console.error("[runner] createPix falhou em toda a cadeia:", err);
@@ -1029,6 +1030,7 @@ export class ExecuteFlowStepUseCase {
         amountCents: amount,
         description: offer.name,
         webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+        ownerUserId: bot.userId,
       });
     } catch (err) {
       console.error("[runner] bcast_buy createPix falhou em toda a cadeia:", err);

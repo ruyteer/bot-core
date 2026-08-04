@@ -4,6 +4,7 @@ import { encoreExternalUrl } from "../config/secrets.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { createPix } from "./application/gateway-clients.js";
+import { isPlatformAdmin } from "../shared/roles.js";
 import type { Provider } from "./domain/gateway.entity.js";
 import type { PaymentWithMeta } from "./domain/payment.entity.js";
 
@@ -174,8 +175,11 @@ export const testGateway = api(
     const externalUrl = encoreExternalUrl();
     const webhookUrl  = `${externalUrl}/payments/webhook/${gw.provider}`;
 
+    // Admin testando não paga a taxa da plataforma → PIX de teste sem split.
+    const skipSplit = await isPlatformAdmin(userId);
+
     try {
-      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl);
+      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl, { skipSplit });
       return { success: true, ...result };
     } catch (err) {
       // Sem isso o Encore converte o Error em "internal error" genérico e o

@@ -396,6 +396,7 @@ export class ExecuteSimplifiedFunnelUseCase {
         amountCents,
         description: productName,
         webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+        ownerUserId: bot.userId,
       });
     } catch (err) {
       console.error("[simplified] createPix falhou em toda a cadeia:", err);

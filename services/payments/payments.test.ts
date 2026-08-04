@@ -10,7 +10,8 @@ import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repos
 import { processWebhookEvent } from "./webhooks.js";
 import { testDb } from "../../test/helpers/db.js";
 import { payments, processedWebhooks } from "../shared/schema/index.js";
-import { createBot, createGateway, createLead } from "../../test/helpers/seed.js";
+import { createBot, createGateway, createLead, createProfile } from "../../test/helpers/seed.js";
+import { userRoles } from "../shared/schema/index.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
 import { forceGatewayError, getOtherCalls } from "../../test/helpers/fetch-mock.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
@@ -116,6 +117,40 @@ describe("split por provider", () => {
       delete process.env.TEST_SECRET_NEXUSPAG_SPLIT_USER_ID;
       delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID;
     }
+  });
+
+  it("skipSplit NÃO envia split mesmo com o secret configurado (admin)", async () => {
+    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
+    try {
+      await createPix("wiinpay", "c", "s", 600, "P", "https://wh", { skipSplit: true });
+      const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
+      expect(wp!.body!.split).toBeUndefined();
+    } finally { delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID; }
+  });
+});
+
+describe("createPixWithFallback — admin pula o split", () => {
+  it("dono admin → PIX sem split; dono comum → com split", async () => {
+    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
+    try {
+      const db = await testDb();
+      const adminId  = await createProfile();
+      const commonId = await createProfile();
+      await db.insert(userRoles).values({ userId: adminId, role: "admin" });
+
+      const adminGwId  = await createGateway({ userId: adminId,  provider: "wiinpay" });
+      const commonGwId = await createGateway({ userId: commonId, provider: "wiinpay" });
+      const adminGw  = (await gwRepo.findByIdOwned(adminGwId,  adminId))!;
+      const commonGw = (await gwRepo.findByIdOwned(commonGwId, commonId))!;
+
+      await createPixWithFallback([adminGw], { amountCents: 600, description: "P", webhookUrl: () => "https://wh", ownerUserId: adminId });
+      const adminCall = getOtherCalls().filter((x) => x.url.includes("wiinpay")).at(-1);
+      expect(adminCall!.body!.split).toBeUndefined(); // admin → sem split
+
+      await createPixWithFallback([commonGw], { amountCents: 600, description: "P", webhookUrl: () => "https://wh", ownerUserId: commonId });
+      const commonCall = getOtherCalls().filter((x) => x.url.includes("wiinpay")).at(-1);
+      expect((commonCall!.body!.split as any).value).toBe(0.4); // comum → com split
+    } finally { delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID; }
   });
 });
 

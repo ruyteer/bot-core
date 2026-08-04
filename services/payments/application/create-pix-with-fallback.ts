@@ -1,5 +1,6 @@
 import { createPix } from "./gateway-clients.js";
 import { GatewayDrizzleRepository } from "../infrastructure/gateway.drizzle.repository.js";
+import { isPlatformAdmin } from "../../shared/roles.js";
 import type { PaymentGateway, PixPaymentResult } from "../domain/gateway.entity.js";
 
 const gwRepo = new GatewayDrizzleRepository();
@@ -15,6 +16,8 @@ export interface CreatePixOptions {
   amountCents: number;
   description: string;
   webhookUrl:  (provider: string) => string;
+  // Dono do bot/gateway. Se for admin da plataforma, o PIX sai sem split (sem taxa).
+  ownerUserId?: string | null;
 }
 
 /**
@@ -31,6 +34,8 @@ export async function createPixWithFallback(
 ): Promise<PixWithFallbackResult | null> {
   if (chain.length === 0) return null;
 
+  // Admin não paga taxa: pula o split.
+  const skipSplit = await isPlatformAdmin(opts.ownerUserId);
   const failures: PixWithFallbackResult["failures"] = [];
 
   for (const gw of chain) {
@@ -39,6 +44,7 @@ export async function createPixWithFallback(
       const pix = await createPix(
         gw.provider, clientId, clientSecret,
         opts.amountCents, opts.description, opts.webhookUrl(gw.provider),
+        { skipSplit },
       );
       if (failures.length > 0) {
         console.warn(`[payments] PIX gerado no fallback ${gw.provider} (${gw.id}) após ${failures.length} falha(s)`);
