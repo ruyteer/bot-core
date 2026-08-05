@@ -13,6 +13,7 @@ import { mergeLeadFields } from "./application/interpolate.js";
 import { processDueBroadcasts } from "../broadcasts/application/process-broadcasts.use-case.js";
 import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing/application/process-remarketing.use-case.js";
 import { ensureSchemaAtBoot } from "../shared/ensure-schema.js";
+import { processPendingConversionEvents } from "../bots/application/pixel-events.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
@@ -144,6 +145,8 @@ async function tickSlow(): Promise<void> {
     const b = await processDueBroadcasts();
     const enrolled = await enrollRemarketingTriggers();
     const rmk = await processDueRemarketing();
+    const px = await processPendingConversionEvents();
+    if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);
     if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
     if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
     if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);

@@ -188,6 +188,10 @@ const STATEMENTS: string[] = [
        FOREIGN KEY ("lead_id") REFERENCES "leads"("id") ON DELETE set null ON UPDATE no action;
    EXCEPTION WHEN duplicate_object THEN null; END $$`,
   `CREATE INDEX IF NOT EXISTS "tracking_clicks_bot_id_created_at_idx" ON "tracking_clicks" ("bot_id", "created_at")`,
+
+  // 0010_kwai_click_id.sql
+  `ALTER TABLE "leads" ADD COLUMN IF NOT EXISTS "kwai_click_id" text`,
+  `ALTER TABLE "tracking_clicks" ADD COLUMN IF NOT EXISTS "kwai_click_id" text`,
 ];
 
 export async function ensureSchema(): Promise<void> {

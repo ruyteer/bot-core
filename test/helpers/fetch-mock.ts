@@ -134,6 +134,22 @@ export function installFetchMock(): void {
       return gatewayResponse(url);
     }
 
+    // Events APIs de pixels (Meta CAPI / TikTok / Kwai) — shapes reais de sucesso,
+    // com derrubada por fragmento (forceGatewayError) para testar falha.
+    if (/graph\.facebook\.com|business-api\.tiktok\.com|adsnebula\.com/.test(url)) {
+      otherCalls.push({ url, body });
+      for (const frag of forcedGatewayErrors) {
+        if (url.includes(frag)) {
+          if (url.includes("tiktok")) return jsonResponse({ code: 40001, message: "forced error" });
+          if (url.includes("facebook")) return jsonResponse({ error: { message: "forced error", code: 190 } }, 400);
+          return jsonResponse({ result: 0, error_msg: "forced error" });
+        }
+      }
+      if (url.includes("facebook")) return jsonResponse({ events_received: 1, fbtrace_id: "test_trace" });
+      if (url.includes("tiktok"))   return jsonResponse({ code: 0, message: "OK" });
+      return jsonResponse({ result: 1 });
+    }
+
     otherCalls.push({ url, body });
     return jsonResponse({ ok: true });
   }) as typeof globalThis.fetch;

@@ -3,6 +3,7 @@ import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repos
 import { paymentPaid } from "../shared/events/index.js";
 import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
 import { accrueReferralCommission } from "../referrals/application/accrue-commission.js";
+import { enqueuePixelEvents } from "../bots/application/pixel-events.js";
 import {
   normalizeSyncpayWebhook,
   normalizeBuckpayWebhook,
@@ -48,6 +49,12 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       // Indique e Ganhe: credita a comissão do indicador do seller (se houver).
       // Trata os próprios erros — nunca bloqueia a confirmação da venda.
       await accrueReferralCommission(payment.id, payment.userId);
+
+      // Pixels: Purchase para cada pixel ativo do bot (enviado pelo tick do
+      // runner). Idempotente pelo processedWebhooks — este bloco roda uma vez.
+      await enqueuePixelEvents(payment.botId, "Purchase", {
+        leadId: payment.leadId, paymentId: payment.id,
+      });
 
       // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
       // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.

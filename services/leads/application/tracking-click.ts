@@ -16,6 +16,7 @@ export interface ClickParams {
   fbclid?:     string | null;
   gclid?:      string | null;
   ttclid?:     string | null;
+  kwaiClickId?:string | null;
   clientIp?:   string | null;
   userAgent?:  string | null;
 }
@@ -54,6 +55,7 @@ export async function registerTrackingClick(params: ClickParams): Promise<{ url:
     fbclid:      cleanParam(params.fbclid),
     gclid:       cleanParam(params.gclid),
     ttclid:      cleanParam(params.ttclid),
+    kwaiClickId: cleanParam(params.kwaiClickId),
     clientIp:    params.clientIp?.slice(0, 100) ?? null,
     userAgent:   params.userAgent?.slice(0, 500) ?? null,
   });
@@ -95,7 +97,11 @@ export async function applyStartTracking(leadId: string, startPayload: string): 
         ...(click.utmContent  ? { utmContent:  click.utmContent }  : {}),
         ...(click.utmTerm     ? { utmTerm:     click.utmTerm }     : {}),
         ...(click.fbclid      ? { fbclid:      click.fbclid }      : {}),
+        // fbc no formato oficial (fb.1.<ts do clique>.<fbclid>) — é o que a
+        // CAPI usa para atribuição; o timestamp real do clique está aqui.
+        ...(click.fbclid      ? { fbc: `fb.1.${click.createdAt.getTime()}.${click.fbclid}` } : {}),
         ...(click.ttclid      ? { ttclid:      click.ttclid }      : {}),
+        ...(click.kwaiClickId ? { kwaiClickId: click.kwaiClickId } : {}),
         ...(click.clientIp    ? { clientIp:    click.clientIp }    : {}),
         ...(click.userAgent   ? { clientUserAgent: click.userAgent } : {}),
         updatedAt: new Date(),

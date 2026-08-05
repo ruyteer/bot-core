@@ -46,6 +46,8 @@ export const trackingRedirect = api.raw(
         fbclid:      q.get("fbclid"),
         gclid:       q.get("gclid"),
         ttclid:      q.get("ttclid"),
+        // Kwai não padroniza o nome do parâmetro entre docs/ferramentas.
+        kwaiClickId: q.get("clickid") ?? q.get("click_id") ?? q.get("kwai_click_id"),
         clientIp:    forwarded || req.socket?.remoteAddress || null,
         userAgent:   (req.headers["user-agent"] as string | undefined) ?? null,
       });

@@ -1,4 +1,4 @@
-import { eq, and, ne, desc } from "drizzle-orm";
+import { eq, and, ne, desc, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
@@ -19,6 +19,7 @@ import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
+import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -268,6 +269,16 @@ export class ExecuteFlowStepUseCase {
       // próprio payload). Grava UTMs/click ids no lead; nunca lança.
       const startPayload = messageText.slice("/start".length).trim();
       if (startPayload) await applyStartTracking(lead.id, startPayload);
+
+      // Pixels: evento Lead no PRIMEIRO /start (o registro que acabou de entrar
+      // é o nº 1). Roda depois do applyStartTracking, para o payload do clique
+      // (fbc, ttclid, kwai clickid) já estar no lead quando o dispatcher enviar.
+      const [startCount] = await db.select({ n: sql<number>`count(*)::int` })
+        .from(leadEvents)
+        .where(and(eq(leadEvents.leadId, lead.id), eq(leadEvents.kind, "start")));
+      if (Number(startCount?.n ?? 0) === 1) {
+        await enqueuePixelEvents(botId, "Lead", { leadId: lead.id });
+      }
     }
 
     // Answer callback immediately to stop Telegram spinner
