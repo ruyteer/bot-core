@@ -534,6 +534,55 @@ export const paymentRevenueCredits = pgTable("payment_revenue_credits", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [primaryKey({ columns: [t.paymentId, t.userId] })]);
 
+// ─── REFERRALS (Indique e Ganhe) ─────────────────────────────────────────────
+// O indicador ganha um % da taxa da plataforma (split por venda) gerada pelos
+// sellers que ele indicou. Saque manual (admin marca como pago) até existir
+// API de payout.
+
+export const referralCodes = pgTable("referral_codes", {
+  userId:            uuid("user_id").primaryKey().references(() => profiles.id, { onDelete: "cascade" }),
+  code:              text("code").notNull(),
+  // Override por seller (a "opção de aumentar comissão"). null = % padrão da
+  // plataforma (platform_config REFERRAL_COMMISSION_PERCENT, default 20).
+  commissionPercent: integer("commission_percent"),
+  createdAt:         timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt:         timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [unique("referral_codes_code_key").on(t.code)]);
+
+export const referrals = pgTable("referrals", {
+  // PK = indicado: cada usuário só pode ser indicado por UMA pessoa.
+  referredUserId: uuid("referred_user_id").primaryKey().references(() => profiles.id, { onDelete: "cascade" }),
+  referrerUserId: uuid("referrer_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index("referrals_referrer_user_id_idx").on(t.referrerUserId)]);
+
+export const referralCommissions = pgTable("referral_commissions", {
+  id:             uuid("id").defaultRandom().primaryKey(),
+  referrerUserId: uuid("referrer_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  referredUserId: uuid("referred_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  paymentId:      uuid("payment_id").notNull().references(() => payments.id, { onDelete: "cascade" }),
+  baseFeeCents:   integer("base_fee_cents").notNull(),   // taxa da plataforma na venda
+  percent:        integer("percent").notNull(),          // % aplicado no momento
+  amountCents:    integer("amount_cents").notNull(),     // centavos creditados
+  createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  // Idempotência: webhook reprocessado não credita duas vezes.
+  unique("referral_commissions_payment_id_key").on(t.paymentId),
+  index("referral_commissions_referrer_user_id_idx").on(t.referrerUserId),
+]);
+
+export const referralWithdrawals = pgTable("referral_withdrawals", {
+  id:          uuid("id").defaultRandom().primaryKey(),
+  userId:      uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  amountCents: integer("amount_cents").notNull(),
+  pixKey:      text("pix_key").notNull(),
+  status:      text("status").notNull().default("pending"),  // 'pending' | 'paid' | 'rejected'
+  notes:       text("notes"),
+  processedBy: uuid("processed_by").references(() => profiles.id, { onDelete: "set null" }),
+  processedAt: timestamp("processed_at", { withTimezone: true }),
+  createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index("referral_withdrawals_status_idx").on(t.status)]);
+
 // ─── COMPLIANCE ───────────────────────────────────────────────────────────────
 // Detecção passiva de conteúdo proibido. NÃO bloqueia salvar/enviar/cobrar — só
 // gera alerta para revisão manual do admin.
@@ -594,3 +643,7 @@ export type AdminNotification             = typeof adminNotifications.$inferSele
 export type AdminNotificationRecipient    = typeof adminNotificationRecipients.$inferSelect;
 export type UserNotificationPreferences   = typeof userNotificationPreferences.$inferSelect;
 export type PlatformConfig                = typeof platformConfig.$inferSelect;
+export type ReferralCode                  = typeof referralCodes.$inferSelect;
+export type Referral                      = typeof referrals.$inferSelect;
+export type ReferralCommission            = typeof referralCommissions.$inferSelect;
+export type ReferralWithdrawal            = typeof referralWithdrawals.$inferSelect;

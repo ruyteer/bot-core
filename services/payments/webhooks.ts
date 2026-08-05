@@ -2,6 +2,7 @@ import { api } from "encore.dev/api";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { paymentPaid } from "../shared/events/index.js";
 import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
+import { accrueReferralCommission } from "../referrals/application/accrue-commission.js";
 import {
   normalizeSyncpayWebhook,
   normalizeBuckpayWebhook,
@@ -43,6 +44,10 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       await payRepo.markPaid(payment.id, event.amount ?? undefined);
       // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
       await paymentPaid.publish({ paymentId: payment.id });
+
+      // Indique e Ganhe: credita a comissão do indicador do seller (se houver).
+      // Trata os próprios erros — nunca bloqueia a confirmação da venda.
+      await accrueReferralCommission(payment.id, payment.userId);
 
       // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
       // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.

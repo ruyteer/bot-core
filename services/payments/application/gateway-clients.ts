@@ -4,7 +4,7 @@ import { syncpaySplitUserId, nexuspagSplitUserId, wiinpaySplitUserId, buckpaySpl
 
 // Split de monetização da plataforma: R$0,40 por transação. O `receiverId` é a
 // conta da plataforma no PSP (secret por provider); quando null, sem split.
-const PLATFORM_SPLIT_CENTS = 40;
+export const PLATFORM_SPLIT_CENTS = 40;
 
 // Extrai uma mensagem legível de um erro de gateway que pode vir como string,
 // { message } ou objeto. Sem isso, `throw new Error(obj)` virava "[object Object]"
