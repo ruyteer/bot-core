@@ -425,6 +425,33 @@ export const trackingPixels = pgTable("tracking_pixels", {
   updatedAt:   timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Cliques dos links rastreáveis de tráfego pago (/r?b=...). A plataforma de
+// ads substitui as macros, o endpoint grava tudo aqui sob um token tk_ e
+// redireciona pro t.me/<bot>?start=tk_<token>. O runner resolve o token no
+// /start e grava as UTMs/click ids no lead.
+export const trackingClicks = pgTable("tracking_clicks", {
+  id:          uuid("id").defaultRandom().primaryKey(),
+  token:       text("token").notNull(),
+  botId:       uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  platform:    text("platform"),
+  utmSource:   text("utm_source"),
+  utmMedium:   text("utm_medium"),
+  utmCampaign: text("utm_campaign"),
+  utmContent:  text("utm_content"),
+  utmTerm:     text("utm_term"),
+  fbclid:      text("fbclid"),
+  gclid:       text("gclid"),
+  ttclid:      text("ttclid"),
+  clientIp:    text("client_ip"),
+  userAgent:   text("user_agent"),
+  leadId:      uuid("lead_id").references(() => leads.id, { onDelete: "set null" }),
+  consumedAt:  timestamp("consumed_at", { withTimezone: true }),
+  createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  unique("tracking_clicks_token_key").on(t.token),
+  index("tracking_clicks_bot_id_created_at_idx").on(t.botId, t.createdAt),
+]);
+
 export const conversionEvents = pgTable("conversion_events", {
   id:             uuid("id").defaultRandom().primaryKey(),
   botId:          uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
@@ -647,3 +674,4 @@ export type ReferralCode                  = typeof referralCodes.$inferSelect;
 export type Referral                      = typeof referrals.$inferSelect;
 export type ReferralCommission            = typeof referralCommissions.$inferSelect;
 export type ReferralWithdrawal            = typeof referralWithdrawals.$inferSelect;
+export type TrackingClick                 = typeof trackingClicks.$inferSelect;

@@ -18,6 +18,7 @@ import { createPixWithFallback } from "../../payments/application/create-pix-wit
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
+import { applyStartTracking } from "../../leads/application/tracking-click.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -261,6 +262,12 @@ export class ExecuteFlowStepUseCase {
     // Deep link ("/start ref123") também conta.
     if (typeof messageText === "string" && /^\/start(\s|$)/.test(messageText)) {
       await db.insert(leadEvents).values({ botId, leadId: lead.id, kind: "start" });
+
+      // Deep link com rastreamento: "/start tk_<token>" (tráfego pago, resolve
+      // o clique salvo pelo /r) ou "/start src_x__m_y" (orgânico, UTMs no
+      // próprio payload). Grava UTMs/click ids no lead; nunca lança.
+      const startPayload = messageText.slice("/start".length).trim();
+      if (startPayload) await applyStartTracking(lead.id, startPayload);
     }
 
     // Answer callback immediately to stop Telegram spinner
@@ -297,7 +304,11 @@ export class ExecuteFlowStepUseCase {
     }
 
     // ── /start command: enter funnel ────────────────────────────────────────
-    if (messageText === "/start" || !prog) {
+    // Cobre também deep links ("/start tk_..." do tráfego pago, "/start src_..."
+    // do orgânico): antes só o "/start" seco reiniciava o funil de um lead com
+    // progresso — quem voltava por um link rastreado ficava sem resposta.
+    const isStartCommand = typeof messageText === "string" && /^\/start(\s|$)/.test(messageText);
+    if (isStartCommand || !prog) {
       // Só funis de fluxo são executáveis aqui (o simplificado não tem nós).
       // orderBy + limit p/ ser determinístico quando há mais de um ativo.
       const [activeFunnel] = await db.select().from(funnels)
