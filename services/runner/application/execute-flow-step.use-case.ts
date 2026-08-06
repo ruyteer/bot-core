@@ -1,4 +1,4 @@
-import { eq, and, ne, desc, sql } from "drizzle-orm";
+import { eq, and, ne, desc, sql, isNull } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
@@ -1147,8 +1147,20 @@ export class ExecuteFlowStepUseCase {
         .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
     }
 
-    // Retoma o funil pelo ramo __paid.
-    const nextId = await nextNode(payment.funnelId, payment.nodeId, payment.paidHandle);
+    // Retoma o funil pelo ramo __paid. Sem conexão nesse handle, cai na saída
+    // GENÉRICA do nó (source_handle null): é onde muitos usuários ligam o
+    // "continuar após pagamento" no editor — antes era uma aresta morta e o
+    // funil parava no "Pagamento confirmado". Os handles __pending/__no_action
+    // não entram no fallback (têm semântica própria de timeout).
+    let nextId = await nextNode(payment.funnelId, payment.nodeId, payment.paidHandle);
+    if (!nextId) {
+      const [defaultConn] = await db.select().from(nodeConnections).where(and(
+        eq(nodeConnections.funnelId, payment.funnelId),
+        eq(nodeConnections.sourceNodeId, payment.nodeId),
+        isNull(nodeConnections.sourceHandle),
+      )).limit(1);
+      nextId = defaultConn?.targetNodeId ?? null;
+    }
     if (nextId) {
       await advanceProgress(prog.id, nextId, "active");
       await this.runNode(payment.funnelId, nextId, prog.id, lead.id, bot.id, chatId, tg, bot.protectContent, vars, null);
