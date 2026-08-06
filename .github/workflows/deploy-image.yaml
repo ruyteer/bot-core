@@ -1,0 +1,69 @@
+name: Build, Push and Deploy a Docker Image to Railway
+
+on:
+  push:
+    branches: [prd]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build-push-deploy-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4.2.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download Encore CLI script
+        uses: sozo-design/curl@v1.0.2
+        with:
+          args: --output install.sh -L https://encore.dev/install.sh
+
+      - name: Install Encore CLI
+        # Versão fixada p/ casar com a lib encore.dev do package.json (1.57.9).
+        # Sem pin, instala a CLI mais recente, que gera imagem com Node novo onde
+        # o alias ~encore quebra. Ao subir a lib, subir o pin junto.
+        run: bash install.sh 1.57.9
+
+      - name: Build Core Service
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          OWNER: ${{ env.OWNER }}
+          REPO: ${{ github.event.repository.name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE="${REGISTRY}/${OWNER}/${REPO}"
+          TAG="sha-${COMMIT_SHA:0:12}"
+
+          /home/runner/.encore/bin/encore build docker \
+            --base node:22-slim \
+            --config railway-infra.config.json \
+            ${IMAGE}:${TAG}
+
+          docker tag ${IMAGE}:${TAG} ${IMAGE}:latest
+          docker push ${IMAGE}:${TAG}
+          docker push ${IMAGE}:latest
+
+          # Passa a tag imutável pro passo de deploy (evita race do :latest).
+          echo "IMAGE_REF=${IMAGE}:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Trigger Railway deployment
+        run: node script.js ${{ secrets.RAILWAY_API_TOKEN }} "$IMAGE_REF"

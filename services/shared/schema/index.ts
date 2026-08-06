@@ -1,7 +1,7 @@
 import {
   pgTable, pgEnum, uuid, text, boolean, timestamp,
   bigint, doublePrecision, jsonb, integer, primaryKey,
-  uniqueIndex,
+  uniqueIndex, unique, index,
 } from "drizzle-orm/pg-core";
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
@@ -39,6 +39,9 @@ export const bots = pgTable("bots", {
   isActive:        boolean("is_active").notNull().default(true),
   protectContent:  boolean("protect_content").notNull().default(false),
   webhookSecret:   text("webhook_secret").notNull(),
+  // Gateway PIX padrão deste bot (usado por broadcast/remarketing/ofertas e como
+  // fallback no funil/oferta quando não há um gateway específico).
+  defaultGatewayId: uuid("default_gateway_id").references((): import("drizzle-orm/pg-core").AnyPgColumn => paymentGateways.id, { onDelete: "set null" }),
   createdAt:       timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:       timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -85,6 +88,7 @@ export const leads = pgTable("leads", {
   fbp:             text("fbp"),
   fbc:             text("fbc"),
   ttclid:          text("ttclid"),
+  kwaiClickId:     text("kwai_click_id"),
   externalId:      text("external_id"),
   clientIp:        text("client_ip"),
   clientUserAgent: text("client_user_agent"),
@@ -100,7 +104,10 @@ export const leadVariables = pgTable("lead_variables", {
   value:        text("value").notNull().default(""),
   createdAt:    timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:    timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Necessária para o upsert de setVar (ON CONFLICT lead_id, variable_name).
+  unique("lead_variables_lead_id_variable_name_unique").on(t.leadId, t.variableName),
+]);
 
 export const leadMessages = pgTable("lead_messages", {
   id:               uuid("id").defaultRandom().primaryKey(),
@@ -120,7 +127,7 @@ export const funnels = pgTable("funnels", {
   userId:           uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
   botId:            uuid("bot_id").references(() => bots.id, { onDelete: "set null" }),
   name:             text("name").notNull(),
-  kind:             text("kind").notNull().default("flow"),    // 'flow' | 'simple'
+  kind:             text("kind").notNull().default("flow"),    // 'flow' | 'simplified'
   isActive:         boolean("is_active").notNull().default(false),
   simplifiedConfig: jsonb("simplified_config").notNull().default({}),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -196,6 +203,25 @@ export const scheduledDelays = pgTable("scheduled_delays", {
   createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Tarefas agendadas do funil SIMPLIFICADO (upsell pós-compra, downsell pós-PIX
+// sem pagamento). Processadas pelo tick de 60s do runner — não cabem em
+// scheduled_delays (que exige um nó de fluxo).
+export const simplifiedScheduledTasks = pgTable("simplified_scheduled_tasks", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  leadId:    uuid("lead_id").notNull().references(() => leads.id, { onDelete: "cascade" }),
+  funnelId:  uuid("funnel_id").notNull().references(() => funnels.id, { onDelete: "cascade" }),
+  kind:      text("kind").notNull(),               // "upsell" | "downsell"
+  refId:     text("ref_id").notNull(),             // id do upsell/downsell no simplified_config
+  paymentId: uuid("payment_id").references(() => payments.id, { onDelete: "set null" }),
+  executeAt: timestamp("execute_at", { withTimezone: true }).notNull(),
+  status:    text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  // Idempotência no agendamento (retry não duplica).
+  unique("simplified_scheduled_payment_kind_ref_unique").on(t.paymentId, t.kind, t.refId),
+]);
+
 // ─── PAYMENTS ─────────────────────────────────────────────────────────────────
 
 export const paymentGateways = pgTable("payment_gateways", {
@@ -211,6 +237,19 @@ export const paymentGateways = pgTable("payment_gateways", {
   createdAt:    timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:    timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Ordem de fallback de gateways do bot: se a geração do PIX falhar no primeiro,
+// o runner tenta o próximo (position asc). Substitui bots.default_gateway_id e a
+// escolha de gateway por oferta/funil — a ordem do bot é a única fonte.
+export const botPaymentGateways = pgTable("bot_payment_gateways", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  gatewayId: uuid("gateway_id").notNull().references(() => paymentGateways.id, { onDelete: "cascade" }),
+  position:  integer("position").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  botGatewayUnique: unique("bot_payment_gateways_bot_id_gateway_id_key").on(t.botId, t.gatewayId),
+}));
 
 export const payments = pgTable("payments", {
   id:               uuid("id").defaultRandom().primaryKey(),
@@ -230,6 +269,14 @@ export const payments = pgTable("payments", {
   endToEnd:         text("end_to_end"),
   paidAt:           timestamp("paid_at", { withTimezone: true }),
   description:      text("description"),
+  // Funnel resume context — let the "paid" webhook resume the funnel where it stopped
+  funnelId:         uuid("funnel_id").references(() => funnels.id, { onDelete: "set null" }),
+  progressId:       uuid("progress_id").references(() => leadProgress.id, { onDelete: "set null" }),
+  nodeId:           uuid("node_id").references(() => funnelNodes.id, { onDelete: "set null" }),
+  paidHandle:       text("paid_handle"),   // source_handle to follow when paid, e.g. "<callback>__paid"
+  // Snapshot do contexto de entrega do funil SIMPLIFICADO (não tem nós/funnel_offers):
+  // { kind: "plan"|"upsell"|"downsell", funnelId, planId?, items: [{name, delivery_type, ...}] }
+  simplifiedCtx:    jsonb("simplified_ctx"),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:        timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -379,6 +426,34 @@ export const trackingPixels = pgTable("tracking_pixels", {
   updatedAt:   timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Cliques dos links rastreáveis de tráfego pago (/r?b=...). A plataforma de
+// ads substitui as macros, o endpoint grava tudo aqui sob um token tk_ e
+// redireciona pro t.me/<bot>?start=tk_<token>. O runner resolve o token no
+// /start e grava as UTMs/click ids no lead.
+export const trackingClicks = pgTable("tracking_clicks", {
+  id:          uuid("id").defaultRandom().primaryKey(),
+  token:       text("token").notNull(),
+  botId:       uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  platform:    text("platform"),
+  utmSource:   text("utm_source"),
+  utmMedium:   text("utm_medium"),
+  utmCampaign: text("utm_campaign"),
+  utmContent:  text("utm_content"),
+  utmTerm:     text("utm_term"),
+  fbclid:      text("fbclid"),
+  gclid:       text("gclid"),
+  ttclid:      text("ttclid"),
+  kwaiClickId: text("kwai_click_id"),
+  clientIp:    text("client_ip"),
+  userAgent:   text("user_agent"),
+  leadId:      uuid("lead_id").references(() => leads.id, { onDelete: "set null" }),
+  consumedAt:  timestamp("consumed_at", { withTimezone: true }),
+  createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  unique("tracking_clicks_token_key").on(t.token),
+  index("tracking_clicks_bot_id_created_at_idx").on(t.botId, t.createdAt),
+]);
+
 export const conversionEvents = pgTable("conversion_events", {
   id:             uuid("id").defaultRandom().primaryKey(),
   botId:          uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
@@ -394,6 +469,19 @@ export const conversionEvents = pgTable("conversion_events", {
   errorMessage:   text("error_message"),
   createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Eventos de topo de funil. Existe porque `leads` guarda UMA linha por
+// (bot, chat) — dá para contar pessoas, não interações. Sem isto, "total de
+// starts" era o número de leads criados, e "starts por lead" dava sempre 1,00.
+export const leadEvents = pgTable("lead_events", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  leadId:    uuid("lead_id").references(() => leads.id, { onDelete: "cascade" }),
+  kind:      text("kind").notNull(),   // 'start'
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  botKindCreatedIdx: index("lead_events_bot_id_kind_created_at_idx").on(t.botId, t.kind, t.createdAt),
+}));
 
 export const mediaCache = pgTable("media_cache", {
   id:             uuid("id").defaultRandom().primaryKey(),
@@ -475,6 +563,87 @@ export const paymentRevenueCredits = pgTable("payment_revenue_credits", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [primaryKey({ columns: [t.paymentId, t.userId] })]);
 
+// ─── REFERRALS (Indique e Ganhe) ─────────────────────────────────────────────
+// O indicador ganha um % da taxa da plataforma (split por venda) gerada pelos
+// sellers que ele indicou. Saque manual (admin marca como pago) até existir
+// API de payout.
+
+export const referralCodes = pgTable("referral_codes", {
+  userId:            uuid("user_id").primaryKey().references(() => profiles.id, { onDelete: "cascade" }),
+  code:              text("code").notNull(),
+  // Override por seller (a "opção de aumentar comissão"). null = % padrão da
+  // plataforma (platform_config REFERRAL_COMMISSION_PERCENT, default 20).
+  commissionPercent: integer("commission_percent"),
+  createdAt:         timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt:         timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [unique("referral_codes_code_key").on(t.code)]);
+
+export const referrals = pgTable("referrals", {
+  // PK = indicado: cada usuário só pode ser indicado por UMA pessoa.
+  referredUserId: uuid("referred_user_id").primaryKey().references(() => profiles.id, { onDelete: "cascade" }),
+  referrerUserId: uuid("referrer_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index("referrals_referrer_user_id_idx").on(t.referrerUserId)]);
+
+export const referralCommissions = pgTable("referral_commissions", {
+  id:             uuid("id").defaultRandom().primaryKey(),
+  referrerUserId: uuid("referrer_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  referredUserId: uuid("referred_user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  paymentId:      uuid("payment_id").notNull().references(() => payments.id, { onDelete: "cascade" }),
+  baseFeeCents:   integer("base_fee_cents").notNull(),   // taxa da plataforma na venda
+  percent:        integer("percent").notNull(),          // % aplicado no momento
+  amountCents:    integer("amount_cents").notNull(),     // centavos creditados
+  createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  // Idempotência: webhook reprocessado não credita duas vezes.
+  unique("referral_commissions_payment_id_key").on(t.paymentId),
+  index("referral_commissions_referrer_user_id_idx").on(t.referrerUserId),
+]);
+
+export const referralWithdrawals = pgTable("referral_withdrawals", {
+  id:          uuid("id").defaultRandom().primaryKey(),
+  userId:      uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  amountCents: integer("amount_cents").notNull(),
+  pixKey:      text("pix_key").notNull(),
+  status:      text("status").notNull().default("pending"),  // 'pending' | 'paid' | 'rejected'
+  notes:       text("notes"),
+  processedBy: uuid("processed_by").references(() => profiles.id, { onDelete: "set null" }),
+  processedAt: timestamp("processed_at", { withTimezone: true }),
+  createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index("referral_withdrawals_status_idx").on(t.status)]);
+
+// ─── COMPLIANCE ───────────────────────────────────────────────────────────────
+// Detecção passiva de conteúdo proibido. NÃO bloqueia salvar/enviar/cobrar — só
+// gera alerta para revisão manual do admin.
+
+export const blockedKeywords = pgTable("blocked_keywords", {
+  id:        uuid("id").defaultRandom().primaryKey(),
+  keyword:   text("keyword").notNull(),
+  category:  text("category").notNull().default("geral"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  keywordUnique: unique("blocked_keywords_keyword_key").on(t.keyword),
+}));
+
+export const complianceAlerts = pgTable("compliance_alerts", {
+  id:         uuid("id").defaultRandom().primaryKey(),
+  // Origem escaneada. source_id é uuid da entidade (funnel/offer/campaign/broadcast/bot).
+  sourceType: text("source_type").notNull(),   // 'funnel' | 'offer' | 'remarketing' | 'broadcast' | 'bot'
+  sourceId:   uuid("source_id").notNull(),
+  userId:     uuid("user_id").references(() => profiles.id, { onDelete: "cascade" }),  // dono da origem
+  keywords:   jsonb("keywords").notNull().default([]),   // string[] das palavras que casaram (efetivas)
+  category:   text("category"),                          // categoria da 1ª palavra
+  snippet:    text("snippet"),                           // trecho ~120 chars ao redor do 1º match
+  status:     text("status").notNull().default("pending"), // 'pending' | 'resolved' | 'dismissed'
+  // Palavras que o admin já descartou p/ esta origem — não recria alerta com elas.
+  dismissedKeywords: jsonb("dismissed_keywords").notNull().default([]),
+  createdAt:  timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt:  timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => ({
+  sourceUnique:   unique("compliance_alerts_source_type_source_id_key").on(t.sourceType, t.sourceId),
+  statusIdx:      index("compliance_alerts_status_idx").on(t.status),
+}));
+
 // ─── TYPE EXPORTS ─────────────────────────────────────────────────────────────
 
 export type Profile                       = typeof profiles.$inferSelect;
@@ -489,6 +658,7 @@ export type NodeConnection                = typeof nodeConnections.$inferSelect;
 export type FunnelOffer                   = typeof funnelOffers.$inferSelect;
 export type LeadProgress                  = typeof leadProgress.$inferSelect;
 export type ScheduledDelay                = typeof scheduledDelays.$inferSelect;
+export type SimplifiedScheduledTask       = typeof simplifiedScheduledTasks.$inferSelect;
 export type PaymentGateway                = typeof paymentGateways.$inferSelect;
 export type Payment                       = typeof payments.$inferSelect;
 export type ScheduledMessage              = typeof scheduledMessages.$inferSelect;
@@ -502,3 +672,8 @@ export type AdminNotification             = typeof adminNotifications.$inferSele
 export type AdminNotificationRecipient    = typeof adminNotificationRecipients.$inferSelect;
 export type UserNotificationPreferences   = typeof userNotificationPreferences.$inferSelect;
 export type PlatformConfig                = typeof platformConfig.$inferSelect;
+export type ReferralCode                  = typeof referralCodes.$inferSelect;
+export type Referral                      = typeof referrals.$inferSelect;
+export type ReferralCommission            = typeof referralCommissions.$inferSelect;
+export type ReferralWithdrawal            = typeof referralWithdrawals.$inferSelect;
+export type TrackingClick                 = typeof trackingClicks.$inferSelect;

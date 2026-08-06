@@ -4,7 +4,7 @@ import {
   payments, paymentGateways, bots, leads,
   paymentWebhookLogs, processedWebhooks,
 } from "../../shared/schema/index.js";
-import type { Payment, PaymentWithMeta } from "../domain/payment.entity.js";
+import type { Payment, PaymentWithMeta, SimplifiedPaymentCtx } from "../domain/payment.entity.js";
 
 export class PaymentDrizzleRepository {
   private toPayment(row: typeof payments.$inferSelect): Payment {
@@ -23,11 +23,81 @@ export class PaymentDrizzleRepository {
       saleType:         row.saleType,
       externalId:       row.externalId,
       pixCode:          row.pixCode,
+      endToEnd:         row.endToEnd,
       paidAt:           row.paidAt,
       description:      row.description,
+      funnelId:         row.funnelId,
+      progressId:       row.progressId,
+      nodeId:           row.nodeId,
+      paidHandle:       row.paidHandle,
+      simplifiedCtx:    (row.simplifiedCtx as SimplifiedPaymentCtx | null) ?? null,
       createdAt:        row.createdAt,
       updatedAt:        row.updatedAt,
     };
+  }
+
+  async create(data: {
+    userId:           string;
+    botId:            string;
+    leadId?:          string | null;
+    gatewayId:        string;
+    offerId?:         string | null;
+    offerName?:       string | null;
+    offerExternalRef?: string | null;
+    amount:           number;
+    status?:          string;
+    externalId?:      string | null;
+    pixCode?:         string | null;
+    description?:     string | null;
+    funnelId?:        string | null;
+    progressId?:      string | null;
+    nodeId?:          string | null;
+    paidHandle?:      string | null;
+    simplifiedCtx?:   SimplifiedPaymentCtx | null;
+  }): Promise<Payment> {
+    const [row] = await db.insert(payments).values({
+      userId:           data.userId,
+      botId:            data.botId,
+      leadId:           data.leadId,
+      gatewayId:        data.gatewayId,
+      offerId:          data.offerId,
+      offerName:        data.offerName,
+      offerExternalRef: data.offerExternalRef,
+      amount:           data.amount,
+      status:           data.status ?? "pending",
+      externalId:       data.externalId,
+      pixCode:          data.pixCode,
+      description:      data.description,
+      funnelId:         data.funnelId,
+      progressId:       data.progressId,
+      nodeId:           data.nodeId,
+      paidHandle:       data.paidHandle,
+      simplifiedCtx:    data.simplifiedCtx ?? null,
+    }).returning();
+    return this.toPayment(row);
+  }
+
+  async findById(id: string): Promise<Payment | null> {
+    const [row] = await db.select().from(payments).where(eq(payments.id, id));
+    return row ? this.toPayment(row) : null;
+  }
+
+  // Dedup de PIX: reaproveita uma cobrança pendente do mesmo (bot, lead, valor,
+  // ref) gerada na última 1h — evita PIX duplicado em cliques repetidos.
+  async findReusablePending(botId: string, leadId: string, amount: number, ref: string): Promise<Payment | null> {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const [row] = await db.select().from(payments)
+      .where(and(
+        eq(payments.botId, botId),
+        eq(payments.leadId, leadId),
+        eq(payments.amount, amount),
+        eq(payments.status, "pending"),
+        eq(payments.offerExternalRef, ref),
+        gte(payments.createdAt, oneHourAgo),
+      ))
+      .orderBy(sql`${payments.createdAt} DESC`)
+      .limit(1);
+    return row ? this.toPayment(row) : null;
   }
 
   async findByBotIds(botIds: string[], startDate?: Date, endDate?: Date): Promise<PaymentWithMeta[]> {

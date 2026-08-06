@@ -1,0 +1,45 @@
+{
+  "$schema": "https://encore.dev/schemas/infra.schema.json",
+  "secrets": {
+    "ENCRYPTION_KEY": { "$env": "ENCRYPTION_KEY" },
+    "SUPABASE_URL": { "$env": "SUPABASE_URL" },
+    "ENCORE_EXTERNAL_URL": { "$env": "ENCORE_EXTERNAL_URL" },
+    "DATABASE_URL": { "$env": "DATABASE_URL" },
+    "VAPID_PUBLIC_KEY": { "$env": "VAPID_PUBLIC_KEY" },
+    "VAPID_PRIVATE_KEY": { "$env": "VAPID_PRIVATE_KEY" },
+    "VAPID_SUBJECT": { "$env": "VAPID_SUBJECT" },
+    "SYNCPAY_SPLIT_USER_ID": { "$env": "SYNCPAY_SPLIT_USER_ID" },
+    "NEXUSPAG_SPLIT_USER_ID": { "$env": "NEXUSPAG_SPLIT_USER_ID" },
+    "WIINPAY_SPLIT_USER_ID": { "$env": "WIINPAY_SPLIT_USER_ID" },
+    "BUCKPAY_SPLIT_EMAIL": { "$env": "BUCKPAY_SPLIT_EMAIL" }
+  },
+  "worker_threads": 0,
+  "pubsub": [
+    {
+      "type": "nsq",
+      "hosts": "nsqd.railway.internal:4150",
+      "topics": {
+        "telegram-update-received": {
+          "name": "telegram-update-received",
+          "subscriptions": {
+            "runner-process-update": {
+              "name": "runner-process-update"
+            }
+          }
+        },
+        "flow-step-executed": {
+          "name": "flow-step-executed",
+          "subscriptions": {}
+        },
+        "payment-paid": {
+          "name": "payment-paid",
+          "subscriptions": {
+            "runner-payment-paid": {
+              "name": "runner-payment-paid"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

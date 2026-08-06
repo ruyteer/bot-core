@@ -1,6 +1,6 @@
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { db } from "../../shared/database.js";
-import { leads, leadProgress, leadMessages, funnels, funnelNodes, payments, bots } from "../../shared/schema/index.js";
+import { leads, leadProgress, leadMessages, funnels, funnelNodes, payments, bots, leadEvents } from "../../shared/schema/index.js";
 import type { LeadRepository } from "../domain/lead.repository.js";
 import type { Lead, LeadWithStats, LeadMessage, UpsertLeadInput } from "../domain/lead.entity.js";
 
@@ -121,6 +121,34 @@ export class LeadDrizzleRepository implements LeadRepository {
     if (!row) return null;
     const result = await this.findByBotIds([row.botId]);
     return result.find((l) => l.id === id) ?? null;
+  }
+
+  // Métricas de topo de funil. `starts` e `activeLeads` vêm de lead_events
+  // (uma linha por /start); `newLeads` da própria tabela leads (primeiro
+  // contato). Antes o painel derivava tudo de `leads`, onde só existe uma linha
+  // por chat — daí "starts por lead" ser sempre 1,00.
+  async getStats(botIds: string[], startDate?: Date, endDate?: Date): Promise<{ starts: number; activeLeads: number; newLeads: number }> {
+    if (botIds.length === 0) return { starts: 0, activeLeads: 0, newLeads: 0 };
+
+    const evConditions = [inArray(leadEvents.botId, botIds), eq(leadEvents.kind, "start")];
+    if (startDate) evConditions.push(gte(leadEvents.createdAt, startDate));
+    if (endDate)   evConditions.push(lte(leadEvents.createdAt, endDate));
+
+    const [ev] = await db.select({
+      starts:      sql<number>`count(*)::int`,
+      activeLeads: sql<number>`count(distinct ${leadEvents.leadId})::int`,
+    }).from(leadEvents).where(and(...evConditions));
+
+    const leadConditions = [inArray(leads.botId, botIds)];
+    if (startDate) leadConditions.push(gte(leads.createdAt, startDate));
+    if (endDate)   leadConditions.push(lte(leads.createdAt, endDate));
+    const [nl] = await db.select({ n: sql<number>`count(*)::int` }).from(leads).where(and(...leadConditions));
+
+    return {
+      starts:      Number(ev?.starts ?? 0),
+      activeLeads: Number(ev?.activeLeads ?? 0),
+      newLeads:    Number(nl?.n ?? 0),
+    };
   }
 
   async findByTelegramChatId(botId: string, telegramChatId: bigint): Promise<Lead | null> {

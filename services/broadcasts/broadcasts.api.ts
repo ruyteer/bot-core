@@ -1,4 +1,5 @@
 import { api, APIError } from "encore.dev/api";
+import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { scheduledMessages, bots, broadcastRuns } from "../shared/schema/index.js";
@@ -167,6 +168,7 @@ export const create = api(
       recurrenceEndAt:          req.recurrenceEndAt ? new Date(req.recurrenceEndAt) : null,
     }).returning();
 
+    scanSourceAsync("broadcast", row.id);
     return toScheduledResponse(row);
   },
 );
@@ -252,6 +254,7 @@ export const update = api(
     if (req.recurrenceCount !== undefined)        patch.recurrenceCount = req.recurrenceCount;
 
     const [updated] = await db.update(scheduledMessages).set(patch).where(eq(scheduledMessages.id, id)).returning();
+    scanSourceAsync("broadcast", id);
     return toScheduledResponse(updated);
   },
 );

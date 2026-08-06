@@ -8,6 +8,7 @@ import {
   pushSubscriptions,
 } from "../shared/schema/index.js";
 import { eq, and, isNull, or } from "drizzle-orm";
+import { vapidPublicKey } from "../config/secrets.js";
 
 // ─── Response shapes ─────────────────────────────────────────────────────────
 
@@ -195,6 +196,19 @@ export const updatePreferences = api(
 );
 
 // POST /notifications/push-subscription
+// GET /notifications/vapid-key — chave pública VAPID para o navegador se inscrever.
+// Fica no backend (e não chumbada no frontend) para que trocar o par de chaves
+// não exija um novo deploy do painel: o service worker já reinscreve sozinho
+// quando a applicationServerKey muda.
+export const getVapidKey = api(
+  { method: "GET", path: "/notifications/vapid-key", expose: true, auth: true },
+  async (): Promise<{ publicKey: string }> => {
+    let key = "";
+    try { key = vapidPublicKey() || ""; } catch { key = ""; }
+    return { publicKey: key };
+  },
+);
+
 export const savePushSubscription = api(
   { method: "POST", path: "/notifications/push-subscription", expose: true, auth: true },
   async ({ endpoint, p256dh, auth }: { endpoint: string; p256dh: string; auth: string }): Promise<{ ok: boolean }> => {

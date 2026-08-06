@@ -1,8 +1,7 @@
-import { api, APIError } from "encore.dev/api";
+import { api } from "encore.dev/api";
 import { eq } from "drizzle-orm";
 import { db } from "../shared/database.js";
 import { bots } from "../shared/schema/index.js";
-import { decrypt } from "../shared/crypto.js";
 import { telegramUpdateReceived, type TelegramUpdate } from "../shared/events/index.js";
 
 // Recebe updates do Telegram para um bot específico
@@ -47,32 +46,10 @@ export const handle = api.raw(
   },
 );
 
-// POST /bots/:botId/webhook/register — alias legacy (use bots.activateWebhook)
-export const registerWebhook = api(
-  { method: "POST", path: "/bots/:botId/webhook/register", expose: true, auth: true },
-  async ({ botId, baseUrl }: { botId: string; baseUrl: string }): Promise<{ ok: boolean }> => {
-    const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
-    if (!bot) throw APIError.notFound("bot not found");
-
-    const token = decrypt(bot.telegramToken);
-    const webhookUrl = `${baseUrl}/webhook/${botId}`;
-
-    const res = await fetch(
-      `https://api.telegram.org/bot${token}/setWebhook`,
-      {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url:          webhookUrl,
-          secret_token: bot.webhookSecret,
-          allowed_updates: ["message", "callback_query"],
-        }),
-      },
-    );
-
-    const json = (await res.json()) as { ok: boolean };
-    if (!json.ok) throw APIError.internal("failed to register webhook with Telegram");
-
-    return { ok: true };
-  },
-);
+// Havia aqui um alias legacy POST /bots/:botId/webhook/register. Removido:
+// o parâmetro `:botId` conflitava com o `/bots/:id/...` do serviço de bots
+// (o roteador não aceita dois nomes na mesma posição), então a rota nunca foi
+// registrada — e ela buscava o bot só por id, sem checar o dono. Renomear o
+// parâmetro teria ATIVADO um endpoint que deixa qualquer usuário autenticado
+// registrar webhook em bot alheio. Quem faz isso é bots.activateWebhook, que
+// valida a posse. Nenhum chamador no frontend.

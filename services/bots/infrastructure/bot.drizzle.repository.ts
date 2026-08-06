@@ -13,6 +13,7 @@ function toPublic(row: typeof bots.$inferSelect): Bot {
     telegramUsername: row.telegramUsername ?? null,
     isActive:         row.isActive,
     protectContent:   row.protectContent,
+    defaultGatewayId: row.defaultGatewayId ?? null,
     createdAt:        row.createdAt,
     updatedAt:        row.updatedAt,
   };
@@ -43,6 +44,7 @@ export class BotDrizzleRepository implements BotRepository {
         telegramUsername: bots.telegramUsername,
         isActive:         bots.isActive,
         protectContent:   bots.protectContent,
+        defaultGatewayId: bots.defaultGatewayId,
         createdAt:        bots.createdAt,
         updatedAt:        bots.updatedAt,
         leadsCount: sql<number>`(
@@ -64,6 +66,7 @@ export class BotDrizzleRepository implements BotRepository {
       telegramUsername: r.telegramUsername ?? null,
       isActive:         r.isActive,
       protectContent:   r.protectContent,
+      defaultGatewayId: r.defaultGatewayId ?? null,
       createdAt:        r.createdAt,
       updatedAt:        r.updatedAt,
       leadsCount:       r.leadsCount ?? 0,
@@ -96,6 +99,8 @@ export class BotDrizzleRepository implements BotRepository {
     if (input.isActive       !== undefined) set.isActive       = input.isActive;
     if (input.protectContent !== undefined) set.protectContent = input.protectContent;
     if (input.telegramUsername !== undefined) set.telegramUsername = input.telegramUsername;
+    if (input.defaultGatewayId !== undefined) set.defaultGatewayId = input.defaultGatewayId;
+    if (input.telegramToken    !== undefined) set.telegramToken    = input.telegramToken;
 
     const [row] = await db
       .update(bots)

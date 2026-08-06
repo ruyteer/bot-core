@@ -1,13 +1,65 @@
-import { eq, and } from "drizzle-orm";
+import { eq, and, ne, desc, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
-  funnels, funnelNodes, nodeConnections, scheduledDelays, bots,
+  funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
+  funnelOffers, leadEvents,
 } from "../../shared/schema/index.js";
-import { TelegramClient } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
-import { interpolate } from "./interpolate.js";
-import type { TelegramUpdate } from "../../shared/events/index.js";
+import { interpolate, mergeLeadFields } from "./interpolate.js";
+import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
+// Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
+// puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
+// importáveis aqui sem cruzar a fronteira de serviço.
+import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
+import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
+import { encoreExternalUrl } from "../../config/secrets.js";
+import type { Payment } from "../../payments/domain/payment.entity.js";
+import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
+import { applyStartTracking } from "../../leads/application/tracking-click.js";
+import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
+
+const gwRepo  = new GatewayDrizzleRepository();
+const payRepo = new PaymentDrizzleRepository();
+const simplifiedUseCase = new ExecuteSimplifiedFunnelUseCase();
+
+// Handle de uma oferta dentro de um nó `offer`. O frontend usa exatamente
+// `offer.callback || offer.product_name || offer_<i>` como id dos conectores
+// (`<handle>__paid|__pending|__no_action`) — replicamos para casar na retomada.
+function offerHandleId(offer: Record<string, unknown>, i: number): string {
+  const callback = typeof offer.callback === "string" ? offer.callback : "";
+  const name     = typeof offer.product_name === "string" ? offer.product_name : "";
+  return callback || name || `offer_${i}`;
+}
+
+// Coleta as ofertas "compráveis" de um nó com o handleId EXATO que o frontend usa
+// nos conectores (`<handleId>__paid|__pending|__no_action`). Cobre o nó `offer`
+// dedicado (content.offers) e blocos de oferta dentro de um nó `message`
+// (blocks[].offers, cujo fallback de handle é `offer_<blockIdx>_<offerIdx>`).
+// A ordem do retorno é o índice usado no callback `offer:<i>`.
+function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Record<string, unknown>; handleId: string }> {
+  const out: Array<{ offer: Record<string, unknown>; handleId: string }> = [];
+  const direct = content.offers as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(direct)) {
+    direct.forEach((offer, i) => out.push({ offer, handleId: offerHandleId(offer, i) }));
+  }
+  const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(blocks)) {
+    blocks.forEach((block, blockIdx) => {
+      if (block.type !== "offer") return;
+      const offers = block.offers as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(offers)) return;
+      offers.forEach((offer, offerIdx) => {
+        const callback = typeof offer.callback === "string" ? offer.callback : "";
+        const name     = typeof offer.product_name === "string" ? offer.product_name : "";
+        out.push({ offer, handleId: callback || name || `offer_${blockIdx}_${offerIdx}` });
+      });
+    });
+  }
+  return out;
+}
 
 interface ExecutionContext {
   botId:  string;
@@ -16,10 +68,94 @@ interface ExecutionContext {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Texto dos nós é plano (textarea), mas o Telegram usa parse_mode HTML por padrão.
+// Sem escapar, um `<`, `>` ou `&` no texto faz o Telegram rejeitar e abortar o passo.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Envia o indicador "digitando…"/"gravando áudio…" e PAUSA antes do envio real.
+// Sem a pausa, o indicador some no mesmo instante que a mensagem chega (parecia
+// "não funcionar"). Duração proporcional ao tamanho do texto: 900ms–4s (o
+// indicador do Telegram expira em ~5s, então não passamos disso). O processamento
+// é assíncrono (fora do webhook), então pausar aqui é seguro.
+async function simulateAction(
+  tg: TelegramClient, chatId: string,
+  typing: boolean, recording: boolean, text?: string,
+): Promise<void> {
+  if (!typing && !recording) return;
+  await tg.sendChatAction(chatId, recording ? "record_voice" : "typing");
+  const len = text?.length ?? 40;
+  const ms = Math.min(4000, Math.max(900, len * 35));
+  await sleep(ms);
+}
+
+// ── Validação de input ─────────────────────────────────────────────────────────
+// O frontend (NodeEditPanel) salva `content.validation` com os valores:
+// "none" | "email" | "number" | "cpf". Tratamos também sinônimos (numeric,
+// telefone/phone, etc.) por segurança. Qualquer valor desconhecido → sem validação.
+
+// Remove acentos e normaliza p/ comparação case-insensitive.
+function normalizeValidationKind(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return raw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+}
+
+function isValidEmail(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+}
+
+function isValidNumber(s: string): boolean {
+  // inteiro ou decimal com . ou , (opcionalmente com sinal)
+  return /^[+-]?\d+([.,]\d+)?$/.test(s.trim());
+}
+
+function isValidPhone(s: string): boolean {
+  // 10–13 dígitos, ignorando separadores comuns (+, -, espaços, parênteses)
+  const digits = s.replace(/[^\d]/g, "");
+  return digits.length >= 10 && digits.length <= 13;
+}
+
+function isValidCpf(s: string): boolean {
+  const cpf = s.replace(/[^\d]/g, "");
+  if (cpf.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(cpf)) return false; // todos os dígitos iguais
+
+  const calcDigit = (len: number): number => {
+    let sum = 0;
+    for (let i = 0; i < len; i++) sum += parseInt(cpf[i], 10) * (len + 1 - i);
+    const rest = (sum * 10) % 11;
+    return rest === 10 ? 0 : rest;
+  };
+  return calcDigit(9) === parseInt(cpf[9], 10) && calcDigit(10) === parseInt(cpf[10], 10);
+}
+
+// Retorna true se `value` passa na validação `kind`. Tipos desconhecidos/none → true.
+function passesValidation(kind: unknown, value: string): boolean {
+  const k = normalizeValidationKind(kind);
+  switch (k) {
+    case "email":   return isValidEmail(value);
+    case "number":
+    case "numero":
+    case "numeric": return isValidNumber(value);
+    case "cpf":     return isValidCpf(value);
+    case "telefone":
+    case "phone":   return isValidPhone(value);
+    default:        return true; // none/"" /desconhecido → sem validação
+  }
+}
+
 async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
   const rows = await db.select().from(leadVariables)
     .where(and(eq(leadVariables.leadId, leadId), eq(leadVariables.botId, botId)));
-  return new Map(rows.map((r) => [r.variableName, r.value]));
+  const map = new Map(rows.map((r) => [r.variableName, r.value]));
+  // Injeta campos nativos do lead ({{first_name}}, {{username}}, ...) sem
+  // sobrescrever variáveis já salvas pelo usuário.
+  const [lead] = await db.select().from(leads).where(eq(leads.id, leadId));
+  if (lead) mergeLeadFields(map, lead);
+  return map;
 }
 
 async function setVar(leadId: string, botId: string, name: string, value: string): Promise<void> {
@@ -57,6 +193,12 @@ export class ExecuteFlowStepUseCase {
   async execute(ctx: ExecutionContext): Promise<void> {
     const { botId, update } = ctx;
 
+    // ── Bot adicionado/removido de grupo/canal (my_chat_member) ─────────────
+    if (update.my_chat_member) {
+      await this.handleChatMemberEvent(botId, update.my_chat_member);
+      return;
+    }
+
     // Identify sender + message text
     const from = update.message?.from ?? update.callback_query?.from;
     if (!from) return;
@@ -69,8 +211,29 @@ export class ExecuteFlowStepUseCase {
     // Get bot token (for Telegram API calls)
     const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
     if (!bot) return;
-    const tg = new TelegramClient(decrypt(bot.telegramToken));
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const chatIdStr = chatId.toString();
+
+    // ── Migração grupo→supergrupo: o chat ganha ID novo e o antigo morre.
+    //    Remapeia o registro salvo para o ID novo (em vez de deixar os dois).
+    if (update.message?.migrate_to_chat_id) {
+      await this.handleGroupMigration(botId, BigInt(update.message.chat.id), BigInt(update.message.migrate_to_chat_id));
+      return;
+    }
+    if (update.message?.migrate_from_chat_id) {
+      await this.handleGroupMigration(botId, BigInt(update.message.migrate_from_chat_id), BigInt(update.message.chat.id));
+      return;
+    }
+
+    // ── Mensagens em grupo/canal: `/id` salva o grupo e devolve o ID; as
+    //    demais são ignoradas (nunca registrar um grupo como lead) ──────────
+    const inboundChatType = update.message?.chat.type;
+    if (inboundChatType && inboundChatType !== "private") {
+      if (typeof messageText === "string" && messageText.trim().startsWith("/id")) {
+        await this.handleIdCommand(botId, update.message!.chat.id, inboundChatType, tg);
+      }
+      return;
+    }
 
     // Upsert lead
     const [lead] = await db.insert(leads).values({
@@ -94,9 +257,39 @@ export class ExecuteFlowStepUseCase {
       await saveInbound(lead.id, botId, { kind: "text", text: messageText });
     }
 
+    // Registra o /start como evento. Fica ANTES do roteamento (fluxo vs
+    // simplificado) para contar os dois. `leads` só guarda uma linha por chat,
+    // então sem isto não há como saber quantas vezes alguém deu /start.
+    // Deep link ("/start ref123") também conta.
+    if (typeof messageText === "string" && /^\/start(\s|$)/.test(messageText)) {
+      await db.insert(leadEvents).values({ botId, leadId: lead.id, kind: "start" });
+
+      // Deep link com rastreamento: "/start tk_<token>" (tráfego pago, resolve
+      // o clique salvo pelo /r) ou "/start src_x__m_y" (orgânico, UTMs no
+      // próprio payload). Grava UTMs/click ids no lead; nunca lança.
+      const startPayload = messageText.slice("/start".length).trim();
+      if (startPayload) await applyStartTracking(lead.id, startPayload);
+
+      // Pixels: evento Lead no PRIMEIRO /start (o registro que acabou de entrar
+      // é o nº 1). Roda depois do applyStartTracking, para o payload do clique
+      // (fbc, ttclid, kwai clickid) já estar no lead quando o dispatcher enviar.
+      const [startCount] = await db.select({ n: sql<number>`count(*)::int` })
+        .from(leadEvents)
+        .where(and(eq(leadEvents.leadId, lead.id), eq(leadEvents.kind, "start")));
+      if (Number(startCount?.n ?? 0) === 1) {
+        await enqueuePixelEvents(botId, "Lead", { leadId: lead.id });
+      }
+    }
+
     // Answer callback immediately to stop Telegram spinner
     if (callbackQueryId) {
       await tg.answerCallbackQuery({ callbackQueryId }).catch(() => {});
+    }
+
+    // ── Compra via botão de OFERTA de broadcast/remarketing (bcast_buy_<id>) ──
+    if (callbackData && callbackData.startsWith("bcast_buy_")) {
+      await this.handleBroadcastBuy(callbackData.slice("bcast_buy_".length), lead, bot, chatIdStr, tg);
+      return;
     }
 
     // Check if lead is manually paused — drop all automation
@@ -106,10 +299,37 @@ export class ExecuteFlowStepUseCase {
 
     const vars = await getVars(lead.id, botId);
 
+    // ── Funil SIMPLIFICADO tem precedência (interpretador linear, stateless) ──
+    const [simplifiedFunnel] = await db.select().from(funnels)
+      .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true), eq(funnels.kind, "simplified")))
+      .orderBy(desc(funnels.updatedAt))
+      .limit(1);
+    if (simplifiedFunnel) {
+      const handled = await simplifiedUseCase.handle({
+        bot, lead, chatId: chatIdStr, funnel: simplifiedFunnel,
+        text: messageText, callbackData,
+        callbackMessageId: update.callback_query?.message?.message_id ?? null,
+        tg,
+      });
+      if (handled) return;
+    }
+
     // ── /start command: enter funnel ────────────────────────────────────────
-    if (messageText === "/start" || !prog) {
+    // Cobre também deep links ("/start tk_..." do tráfego pago, "/start src_..."
+    // do orgânico): antes só o "/start" seco reiniciava o funil de um lead com
+    // progresso — quem voltava por um link rastreado ficava sem resposta.
+    const isStartCommand = typeof messageText === "string" && /^\/start(\s|$)/.test(messageText);
+    if (isStartCommand || !prog) {
+      // Só funis de fluxo são executáveis aqui (o simplificado não tem nós).
+      // orderBy + limit p/ ser determinístico quando há mais de um ativo.
       const [activeFunnel] = await db.select().from(funnels)
-        .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true)));
+        .where(and(
+          eq(funnels.botId, botId),
+          eq(funnels.isActive, true),
+          ne(funnels.kind, "simplified"),
+        ))
+        .orderBy(desc(funnels.updatedAt))
+        .limit(1);
       if (!activeFunnel) return;
 
       // Find trigger node
@@ -146,6 +366,19 @@ export class ExecuteFlowStepUseCase {
         ? (await db.select().from(funnelNodes).where(eq(funnelNodes.id, prog.currentNodeId)))[0]
         : null;
 
+      // Clique num botão de compra (callback `offer:<i>`, curto p/ caber no limite
+      // de 64 bytes do TG). Funciona no nó `offer` dedicado E em ofertas embutidas
+      // num nó `message` — o índice é resolvido pela mesma ordem de collectNodeOffers.
+      if (currentNode && callbackData.startsWith("offer:")) {
+        const offersList = collectNodeOffers(currentNode.content as Record<string, unknown>);
+        const idx = parseInt(callbackData.slice("offer:".length), 10);
+        const picked = Number.isInteger(idx) ? offersList[idx] : undefined;
+        if (picked) {
+          await this.handleOfferPurchase(picked.offer, picked.handleId, currentNode, prog, lead, bot, chatIdStr, tg);
+        }
+        return;
+      }
+
       if (currentNode?.type === "buttons") {
         const nextId = await nextNode(prog.funnelId, currentNode.id, callbackData);
         if (nextId) {
@@ -163,17 +396,135 @@ export class ExecuteFlowStepUseCase {
         : null;
 
       if (currentNode?.type === "input" || currentNode?.type === "wait_response") {
-        const c = currentNode.content as { variable_name?: string };
+        const c = currentNode.content as {
+          variable_name?: string;
+          validation?:    string;
+          error_message?: string;
+        };
+
+        // 1) Validação de input: se houver `validation` configurado e a resposta
+        //    for inválida, reenvia a mensagem de erro e PERMANECE no nó (não salva
+        //    variável nem avança). Sem validation (ou tipo desconhecido) → segue.
+        if (!passesValidation(c.validation, messageText)) {
+          const errRaw = c.error_message ?? "Resposta inválida. Tente novamente.";
+          const errText = escapeHtml(interpolate(errRaw, vars));
+          await tg.sendMessage({ chatId: chatIdStr, text: errText, protectContent: bot.protectContent });
+          await saveOutbound(lead.id, botId, { kind: "text", text: errText, nodeId: currentNode.id });
+          return; // fica no mesmo nó esperando nova resposta
+        }
+
         if (c.variable_name) {
           await setVar(lead.id, botId, c.variable_name, messageText);
           vars.set(c.variable_name, messageText);
         }
-        const nextId = await nextNode(prog.funnelId, currentNode.id);
+
+        // 2) Resolução do próximo nó:
+        //    - wait_response: cancela timeouts pendentes deste progresso e avança
+        //      pelo handle "responded" (fallback p/ a conexão default).
+        //    - input: comportamento atual (conexão default).
+        let nextId: string | null;
+        if (currentNode.type === "wait_response") {
+          await db.delete(scheduledDelays).where(and(
+            eq(scheduledDelays.progressId, prog.id),
+            eq(scheduledDelays.status, "pending"),
+          ));
+          nextId = await nextNode(prog.funnelId, currentNode.id, "responded")
+                ?? await nextNode(prog.funnelId, currentNode.id);
+        } else {
+          nextId = await nextNode(prog.funnelId, currentNode.id);
+        }
+
         if (nextId) {
           await advanceProgress(prog.id, nextId, "active");
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
         }
       }
+    }
+  }
+
+  // ── Grupo/canal: bot virou (ou deixou de ser) membro/admin ──────────────────
+  private async handleChatMemberEvent(botId: string, ev: TelegramChatMemberUpdated): Promise<void> {
+    const status = ev.new_chat_member?.status;
+    const isBot  = ev.new_chat_member?.user?.is_bot;
+    const type   = ev.chat?.type;
+    if (!isBot || (type !== "group" && type !== "supergroup" && type !== "channel")) return;
+
+    const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
+    if (!bot || !bot.isActive) return;
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
+    const chatId = ev.chat.id;
+
+    // Removido/saiu → remove do sistema.
+    if (status === "left" || status === "kicked") {
+      await db.delete(botGroups).where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, BigInt(chatId))));
+      return;
+    }
+
+    // Só salva quando o bot vira ADMIN. Entrar como membro comum não registra:
+    // além de inútil pra VIP (sem permissão de convite), adicionar como membro
+    // e promover depois gerava registro duplicado quando o Telegram migrava o
+    // grupo básico para supergrupo (id novo).
+    if (status === "administrator") {
+      const isChannel = type === "channel";
+      const label = isChannel ? "Canal" : "Grupo";
+      const info = await tg.getChat(String(chatId));
+      const name = info?.title || label;
+      await this.upsertGroup(botId, BigInt(chatId), name, type);
+
+      const permissionNote = isChannel
+        ? `permissão de "<b>Postar mensagens</b>"`
+        : `permissão de "<b>Banir usuários</b>"`;
+      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem ${permissionNote}\n2️⃣ No painel, vá em <b>Produtos</b> e crie um produto do tipo "<b>${label} VIP</b>"\n3️⃣ Cole o ID no campo "ID do Grupo Telegram"\n\n🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>`;
+      await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
+    }
+  }
+
+  // ── Comando `/id` em grupo/canal: salva e devolve o ID ──────────────────────
+  private async handleIdCommand(botId: string, chatId: number, type: string, tg: TelegramClient): Promise<void> {
+    const label = type === "channel" ? "Canal" : "Grupo";
+    const info  = await tg.getChat(String(chatId));
+    const name  = info?.title || label;
+    await this.upsertGroup(botId, BigInt(chatId), name, type);
+    const msg = `🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>\n\n✅ ${label} salvo automaticamente no painel.`;
+    await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
+  }
+
+  // Migração grupo→supergrupo: atualiza o registro antigo IN-PLACE para o id
+  // novo (preserva o uuid da linha — ofertas VIP que referenciam bot_groups.id
+  // continuam válidas). Se o supergrupo já foi salvo em outra linha, funde as
+  // duas mantendo a antiga.
+  private async handleGroupMigration(botId: string, oldChatId: bigint, newChatId: bigint): Promise<void> {
+    const [oldRow] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, oldChatId)));
+    const [newRow] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, newChatId)));
+
+    if (!oldRow) return; // nada salvo com o id antigo — nada a remapear
+
+    let name = oldRow.name;
+    if (newRow) {
+      // Funde: repoint das ofertas que apontam pra linha nova → linha antiga,
+      // apaga a duplicada e herda o nome mais recente.
+      await db.update(funnelOffers).set({ telegramGroupId: oldRow.id })
+        .where(eq(funnelOffers.telegramGroupId, newRow.id));
+      await db.delete(botGroups).where(eq(botGroups.id, newRow.id));
+      name = newRow.name;
+    }
+
+    await db.update(botGroups)
+      .set({ telegramChatId: newChatId, type: "supergroup", name, updatedAt: new Date() })
+      .where(eq(botGroups.id, oldRow.id));
+    console.log(`[runner] grupo migrado p/ supergrupo: ${oldChatId} → ${newChatId} (bot ${botId})`);
+  }
+
+  // Upsert de grupo por (botId, telegramChatId) — sem depender de constraint única.
+  private async upsertGroup(botId: string, chatId: bigint, name: string, type: string): Promise<void> {
+    const [existing] = await db.select().from(botGroups)
+      .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, chatId)));
+    if (existing) {
+      await db.update(botGroups).set({ name, type, updatedAt: new Date() }).where(eq(botGroups.id, existing.id));
+    } else {
+      await db.insert(botGroups).values({ botId, telegramChatId: chatId, name, type });
     }
   }
 
@@ -217,20 +568,45 @@ export class ExecuteFlowStepUseCase {
     await advanceProgress(progressId, node.id, "active");
 
     switch (node.type) {
-      case "message":
-      case "media":
+      case "message": {
         await this.executeMessageNode(c, chatId, tg, protect, vars);
+        await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        // Nó de mensagem pode conter blocos de oferta (botões de compra). Se houver,
+        // comporta-se como nó offer: apresenta as ofertas, espera o clique e agenda
+        // o ramo __no_action — não avança automaticamente.
+        const msgOffers = collectNodeOffers(c);
+        if (msgOffers.length > 0) {
+          await this.presentOffers(c, msgOffers, chatId, tg, protect, vars);
+          await advanceProgress(progressId, node.id, "active");
+          await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
+          return;
+        }
+        break;
+      }
+
+      case "media":
+        // O painel oferece o toggle de simulação também no nó de mídia
+        // (NodeEditPanel, aba do nó `media`) — sem isto a flag era salva e ignorada.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
+          typeof c.caption === "string" ? c.caption : undefined);
+        await this.executeMediaNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         break;
 
       case "audio": {
-        const url = c.url as string | undefined;
-        if (url) await tg.sendAudio(chatId, url, undefined, protect);
+        const url     = c.url as string | undefined;
+        const caption = typeof c.caption === "string" ? interpolate(c.caption, vars) : undefined;
+        // Áudio: por padrão simula "gravando áudio…" (a não ser que o nó desligue).
+        await simulateAction(tg, chatId, !!c.simulate_typing, c.simulate_recording !== false, undefined);
+        if (url) await tg.sendAudio(chatId, url, caption, protect);
         await saveOutbound(leadId, botId, { kind: "audio", url, nodeId: node.id });
         break;
       }
 
       case "buttons":
+        // Idem para o nó de botões — o toggle existe no painel desde sempre.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
+          typeof c.message === "string" ? c.message : undefined);
         await this.executeButtonsNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         // Stay on this node waiting for callback
@@ -238,21 +614,59 @@ export class ExecuteFlowStepUseCase {
         return;
 
       case "input":
-      case "wait_response":
-        // Stay on this node; next step triggered by inbound message
+      case "wait_response": {
+        // Stay on this node; next step triggered by inbound message.
+        // O frontend salva a pergunta em `question`; fallback p/ `prompt` antigo.
         await advanceProgress(progressId, node.id, "active");
-        if (c.prompt) {
-          const prompt = interpolate(c.prompt as string, vars);
+        const promptRaw = (c.question ?? c.prompt) as string | undefined;
+        if (promptRaw) {
+          const prompt = escapeHtml(interpolate(promptRaw, vars));
           await tg.sendMessage({ chatId, text: prompt, protectContent: protect });
           await saveOutbound(leadId, botId, { kind: "text", text: prompt, nodeId: node.id });
         }
+
+        // Timeout do wait_response: o frontend salva `timeout_seconds` (em segundos)
+        // e liga o nó pelos handles "responded" e "no_response". Se houver timeout
+        // e um alvo no_response, agenda em scheduled_delays p/ o scheduler existente
+        // (runner.ts) rodar o ramo no_response quando vencer. Sem timeout ou sem
+        // alvo → não agenda (espera indefinidamente, como antes).
+        if (node.type === "wait_response") {
+          const timeoutSeconds = typeof c.timeout_seconds === "number" ? c.timeout_seconds : 0;
+          if (timeoutSeconds > 0) {
+            const noResponseId = await nextNode(funnelId, node.id, "no_response");
+            if (noResponseId) {
+              await db.insert(scheduledDelays).values({
+                botId,
+                leadId,
+                funnelId,
+                progressId,
+                nextNodeId: noResponseId,
+                executeAt:  new Date(Date.now() + timeoutSeconds * 1000),
+                status:     "pending",
+              });
+            }
+          }
+        }
         return;
+      }
 
       case "delay": {
-        const value  = (c.value as number) ?? 0;
-        const unit   = (c.unit as string) ?? "seconds";
-        const ms     = unit === "minutes" ? value * 60000 : unit === "hours" ? value * 3600000 : value * 1000;
+        // Frontend salva `seconds`; fallback p/ o par value/unit antigo.
+        let seconds: number;
+        if (typeof c.seconds === "number") {
+          seconds = c.seconds;
+        } else {
+          const value = (c.value as number) ?? 0;
+          const unit  = (c.unit as string) ?? "seconds";
+          seconds = unit === "minutes" ? value * 60 : unit === "hours" ? value * 3600 : value;
+        }
+        const ms     = seconds * 1000;
         const nextId = await nextNode(funnelId, node.id);
+        // "digitando…"/"gravando…" durante a espera (o indicador do Telegram
+        // expira em ~5s, então cobre bem delays curtos, que é o caso de uso).
+        if (c.simulate_typing || c.simulate_recording) {
+          await tg.sendChatAction(chatId, c.simulate_recording ? "record_voice" : "typing");
+        }
         if (nextId && ms > 0) {
           await db.insert(scheduledDelays).values({
             botId,
@@ -292,10 +706,34 @@ export class ExecuteFlowStepUseCase {
       case "random": {
         const connections = await db.select().from(nodeConnections)
           .where(and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, node.id)));
-        if (connections.length > 0) {
-          const pick = connections[Math.floor(Math.random() * connections.length)];
-          await this.runNode(funnelId, pick.targetNodeId, progressId, leadId, botId, chatId, tg, protect, vars, node.id, depth + 1);
+        if (connections.length === 0) return;
+
+        // Frontend salva `content.outputs` = [{ name, weight, handle }], onde handle
+        // é "out_0", "out_1", ... e os weights somam ~100. Escolha PONDERADA pelos
+        // weights; fallback p/ escolha uniforme entre as conexões quando não houver
+        // outputs/weights válidos.
+        const outputs = (c.outputs as Array<{ weight?: number; handle?: string }>) ?? [];
+        const valid   = outputs.filter((o) => typeof o.handle === "string" && (o.weight ?? 0) > 0);
+        const total   = valid.reduce((sum, o) => sum + (o.weight ?? 0), 0);
+
+        let targetId: string | null = null;
+        if (valid.length > 0 && total > 0) {
+          let r = Math.random() * total;
+          let chosenHandle = valid[valid.length - 1].handle!; // fallback p/ último
+          for (const o of valid) {
+            r -= o.weight ?? 0;
+            if (r < 0) { chosenHandle = o.handle!; break; }
+          }
+          targetId = connections.find((cn) => cn.sourceHandle === chosenHandle)?.targetNodeId
+                  ?? await nextNode(funnelId, node.id, chosenHandle);
         }
+
+        // Fallback uniforme se a ponderação não resolveu um alvo conectado.
+        if (!targetId) {
+          targetId = connections[Math.floor(Math.random() * connections.length)].targetNodeId;
+        }
+
+        await this.runNode(funnelId, targetId, progressId, leadId, botId, chatId, tg, protect, vars, node.id, depth + 1);
         return;
       }
 
@@ -304,6 +742,9 @@ export class ExecuteFlowStepUseCase {
         await this.executeOfferNode(c, chatId, tg, protect, vars);
         await saveOutbound(leadId, botId, { ...c, kind: "offer", nodeId: node.id });
         await advanceProgress(progressId, node.id, "active");
+        // Se o lead nunca clicar em comprar, dispara o ramo __no_action após o
+        // unpaid_timeout. Cancelado quando ele clica (handleOfferPurchase).
+        await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
         return;
     }
 
@@ -323,25 +764,93 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const blocks = (c.blocks as Array<{ type: string; content?: string; url?: string; caption?: string }>) ?? [];
+    // O frontend salva o texto em `message` (tanto no nó simples quanto em cada
+    // bloco); mantemos fallback p/ `content`/`text` de versões antigas.
+    const blocks = (c.blocks as Array<Record<string, unknown>>) ?? [];
 
     if (blocks.length > 0) {
       for (const block of blocks) {
-        if (block.type === "text" && block.content) {
-          await tg.sendMessage({ chatId, text: interpolate(block.content, vars), protectContent: protect });
-        } else if (block.type === "image" && block.url) {
-          await tg.sendPhoto({ chatId, photo: block.url, caption: block.caption ? interpolate(block.caption, vars) : undefined, protectContent: protect });
-        } else if (block.type === "video" && block.url) {
-          await tg.sendVideo(chatId, block.url, block.caption ? interpolate(block.caption, vars) : undefined, protect);
-        } else if (block.type === "document" && block.url) {
-          await tg.sendDocument(chatId, block.url, block.caption ? interpolate(block.caption, vars) : undefined, protect);
-        } else if (block.type === "audio" && block.url) {
-          await tg.sendAudio(chatId, block.url, undefined, protect);
+        const url       = block.url as string | undefined;
+        const text      = (block.message ?? block.content ?? block.text) as string | undefined;
+        const caption   = typeof block.caption === "string" ? escapeHtml(interpolate(block.caption, vars)) : undefined;
+        const mediaType = (block.media_type ?? block.type) as string | undefined;
+
+        // "digitando…"/"gravando áudio…" ANTES do envio, com pausa proporcional
+        // (sem pausa o indicador some no mesmo instante — parecia não funcionar).
+        await simulateAction(tg, chatId, !!block.simulate_typing, !!block.simulate_recording, text);
+
+        if (block.type === "text" && text) {
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
+        } else if ((block.type === "media" || block.type === "image" || block.type === "video" || block.type === "document") && url) {
+          if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
+          else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
+          else                               await tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
+        } else if (block.type === "audio" && url) {
+          await tg.sendAudio(chatId, url, caption, protect);
+        } else if (text) {
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
         }
       }
-    } else if (typeof c.text === "string") {
-      await tg.sendMessage({ chatId, text: interpolate(c.text, vars), protectContent: protect });
+    } else {
+      const text = (c.message ?? c.text) as string | undefined;
+      if (typeof text === "string" && text) {
+        // Nó de Texto simples (sem blocks): a flag fica em content.simulate_typing.
+        await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording, text);
+        await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
+      }
     }
+  }
+
+  private async executeMediaNode(
+    c:       Record<string, unknown>,
+    chatId:  string,
+    tg:      TelegramClient,
+    protect: boolean,
+    vars:    Map<string, string>,
+  ): Promise<void> {
+    // Nó de mídia: { url, media_type, caption, extra_items[] }. Com 2+ itens de
+    // imagem/vídeo, envia como ÁLBUM (sendMediaGroup) — o Telegram agrupa numa só
+    // mensagem. Documentos/áudios não entram em álbum e vão individualmente.
+    // O caption (HTML) vai só no 1º item do álbum (limite do Telegram).
+    const main   = { url: c.url, media_type: c.media_type, caption: c.caption } as Record<string, unknown>;
+    const extras = (c.extra_items as Array<Record<string, unknown>>) ?? [];
+    const items  = [main, ...extras].filter((it) => typeof it.url === "string" && it.url);
+
+    const capOf  = (it: Record<string, unknown>): string | undefined =>
+      typeof it.caption === "string" ? escapeHtml(interpolate(it.caption, vars)) : undefined;
+    const typeOf = (it: Record<string, unknown>): string => (it.media_type as string) || "image";
+    const isAlbumType = (t: string): boolean => t === "image" || t === "photo" || t === "video";
+
+    const single = (it: Record<string, unknown>): Promise<void> => {
+      const url = it.url as string;
+      const caption = capOf(it);
+      const t = typeOf(it);
+      if (t === "video")    return tg.sendVideo(chatId, url, caption, protect);
+      if (t === "document") return tg.sendDocument(chatId, url, caption, protect);
+      if (t === "audio")    return tg.sendAudio(chatId, url, caption, protect);
+      return tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
+    };
+
+    const albumItems = items.filter((it) => isAlbumType(typeOf(it)));
+    if (albumItems.length >= 2) {
+      try {
+        await tg.sendMediaGroup(
+          chatId,
+          albumItems.map((it, i) => ({
+            type:    typeOf(it) === "video" ? "video" as const : "photo" as const,
+            media:   it.url as string,
+            caption: i === 0 ? capOf(it) : undefined,
+          })),
+          protect,
+        );
+      } catch {
+        for (const it of albumItems) await single(it);
+      }
+      for (const it of items) if (!isAlbumType(typeOf(it))) await single(it);
+      return;
+    }
+
+    for (const it of items) await single(it);
   }
 
   private async executeButtonsNode(
@@ -351,9 +860,16 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const text    = typeof c.text === "string" ? interpolate(c.text, vars) : "Escolha uma opção:";
-    const buttons = (c.buttons as Array<{ label: string; value: string }>) ?? [];
-    const keyboard = buttons.map((b) => [{ text: b.label, callback_data: b.value }]);
+    // Frontend salva o texto em `message` e os botões como { text, callback, action };
+    // fallback p/ `text`/`label`/`value` antigos.
+    const raw     = (c.message ?? c.text) as string | undefined;
+    const text    = typeof raw === "string" && raw ? escapeHtml(interpolate(raw, vars)) : "Escolha uma opção:";
+    const buttons = (c.buttons as Array<Record<string, unknown>>) ?? [];
+    const keyboard = buttons.map((b) => {
+      const label = (b.text ?? b.label ?? "") as string;
+      if (typeof b.url === "string" && b.url) return [{ text: label, url: b.url }];
+      return [{ text: label, callback_data: (b.callback ?? b.value ?? "") as string }];
+    });
     await tg.sendMessage({
       chatId,
       text,
@@ -369,20 +885,312 @@ export class ExecuteFlowStepUseCase {
     protect: boolean,
     vars:    Map<string, string>,
   ): Promise<void> {
-    const offers = (c.offers as Array<{ product_name?: string; price?: number; payment_url?: string }>) ?? [];
-    if (offers.length === 0) return;
-    const offer = offers[0];
-    const priceText = offer.price ? ` — R$ ${(offer.price / 100).toFixed(2)}` : "";
-    const text = `*${offer.product_name ?? "Oferta"}*${priceText}`;
-    const buttons = offer.payment_url
-      ? [[{ text: "Comprar agora", url: offer.payment_url }]]
-      : [];
-    await tg.sendMessage({
-      chatId,
-      text: interpolate(text, vars),
-      parseMode: "Markdown",
-      protectContent: protect,
-      replyMarkup: buttons.length > 0 ? { inline_keyboard: buttons } : undefined,
+    const offersList = collectNodeOffers(c);
+    if (offersList.length === 0) return;
+    await this.presentOffers(c, offersList, chatId, tg, protect, vars);
+  }
+
+  // Renderiza um botão de compra por oferta (callback `offer:<i>`, na ordem de
+  // collectNodeOffers). Texto/imagem vêm de intro_message + 1ª oferta.
+  private async presentOffers(
+    content:    Record<string, unknown>,
+    offersList: Array<{ offer: Record<string, unknown>; handleId: string }>,
+    chatId:     string,
+    tg:         TelegramClient,
+    protect:    boolean,
+    vars:       Map<string, string>,
+  ): Promise<void> {
+    const keyboard = offersList.map(({ offer }, i) => {
+      // price vem do nó do funil em REAIS (MoneyInput no front emite reais).
+      const price = typeof offer.price === "number" ? offer.price : 0;
+      const label = (typeof offer.button_text === "string" && offer.button_text)
+        ? offer.button_text
+        : `Comprar — R$ ${price.toFixed(2)}`;
+      return [{ text: label, callback_data: `offer:${i}` }];
     });
+
+    const intro = typeof content.intro_message === "string" && content.intro_message
+      ? escapeHtml(interpolate(content.intro_message, vars))
+      : null;
+    const first = offersList[0].offer;
+    const firstName = typeof first.product_name === "string" ? first.product_name : "";
+    const caption = intro ?? (firstName ? escapeHtml(interpolate(firstName, vars)) : "Escolha uma oferta:");
+    const image = typeof first.image_url === "string" ? first.image_url : "";
+
+    if (image) {
+      await tg.sendPhoto({ chatId, photo: image, caption, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
+    } else {
+      await tg.sendMessage({ chatId, text: caption, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
+    }
+  }
+
+  // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
+  // Usa `unpaid_timeout` (minutos, default 5, mín. 60s) do conteúdo do nó. Agenda
+  // um delay por oferta cujo handle (`<handleId>__no_action|__pending`) tenha
+  // conexão. Para __pending, só a oferta `onlyHandleId` (a que o lead clicou).
+  private async scheduleOfferTimeouts(
+    funnelId:     string,
+    node:         typeof funnelNodes.$inferSelect,
+    progressId:   string,
+    leadId:       string,
+    botId:        string,
+    suffix:       "__no_action" | "__pending",
+    onlyHandleId?: string,
+  ): Promise<void> {
+    const content = node.content as Record<string, unknown> & { unpaid_timeout?: number };
+    const offersList = collectNodeOffers(content);
+    const timeoutMin = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+    const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
+
+    for (const { handleId } of offersList) {
+      if (onlyHandleId !== undefined && handleId !== onlyHandleId) continue;
+      const target = await nextNode(funnelId, node.id, `${handleId}${suffix}`);
+      if (!target) continue;
+      await db.insert(scheduledDelays).values({
+        botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
+      });
+    }
+  }
+
+  // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
+  private async handleOfferPurchase(
+    offer:  Record<string, unknown>,
+    handleId: string,
+    node:   typeof funnelNodes.$inferSelect,
+    prog:   typeof leadProgress.$inferSelect,
+    lead:   typeof leads.$inferSelect,
+    bot:    typeof bots.$inferSelect,
+    chatId: string,
+    tg:     TelegramClient,
+  ): Promise<void> {
+    // O lead interagiu com a oferta → cancela os timeouts __no_action pendentes
+    // deste progresso (só há os do nó de oferta atual).
+    await db.delete(scheduledDelays).where(and(
+      eq(scheduledDelays.progressId, prog.id),
+      eq(scheduledDelays.status, "pending"),
+    ));
+
+    // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
+    const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
+    const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
+
+    if (amount <= 0) {
+      await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent });
+      return;
+    }
+
+    // A oferta não escolhe mais gateway: usa a ordem de fallback configurada no bot.
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+
+    let result;
+    try {
+      result = await createPixWithFallback(chain, {
+        amountCents: amount,
+        description: productName,
+        webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+        ownerUserId: bot.userId,
+      });
+    } catch (err) {
+      console.error("[runner] createPix falhou em toda a cadeia:", err);
+      await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
+      return;
+    }
+    if (!result) {
+      await tg.sendMessage({ chatId, text: "Gateway de pagamento não configurado.", protectContent: bot.protectContent });
+      return;
+    }
+    const { gateway: gw, pix } = result;
+
+    // Persiste a cobrança com o contexto p/ retomar o funil quando pago.
+    await payRepo.create({
+      userId:      bot.userId,
+      botId:       bot.id,
+      leadId:      lead.id,
+      gatewayId:   gw.id,
+      offerName:   productName,
+      amount,
+      status:      "pending",
+      externalId:  pix.externalId,
+      pixCode:     pix.pixCode,
+      description: productName,
+      funnelId:    prog.funnelId,
+      progressId:  prog.id,
+      nodeId:      node.id,
+      paidHandle:  `${handleId}__paid`,
+    });
+
+    // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
+    // Cancelado quando o pagamento confirma (handlePaidOffer).
+    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "__pending", handleId);
+
+    const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
+    await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
+    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+    await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
+  }
+
+  // ── Compra avulsa de oferta (botão de broadcast/remarketing) → gera PIX ──────
+  private async handleBroadcastBuy(
+    offerId: string,
+    lead: typeof leads.$inferSelect,
+    bot:  typeof bots.$inferSelect,
+    chatId: string,
+    tg:   TelegramClient,
+  ): Promise<void> {
+    const [offer] = await db.select().from(funnelOffers)
+      .where(and(eq(funnelOffers.id, offerId), eq(funnelOffers.botId, bot.id)));
+    if (!offer) { await tg.sendMessage({ chatId, text: "⚠️ Produto não encontrado.", protectContent: bot.protectContent }); return; }
+
+    const amount = offer.price; // funnel_offers.price já é em centavos
+    if (amount <= 0) { await tg.sendMessage({ chatId, text: "Oferta indisponível no momento.", protectContent: bot.protectContent }); return; }
+
+    const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
+
+    let result;
+    try {
+      result = await createPixWithFallback(chain, {
+        amountCents: amount,
+        description: offer.name,
+        webhookUrl:  (provider) => `${encoreExternalUrl()}/payments/webhook/${provider}`,
+        ownerUserId: bot.userId,
+      });
+    } catch (err) {
+      console.error("[runner] bcast_buy createPix falhou em toda a cadeia:", err);
+      await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
+      return;
+    }
+    if (!result) { await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent }); return; }
+    const { gateway: gw, pix } = result;
+
+    await payRepo.create({
+      userId: bot.userId, botId: bot.id, leadId: lead.id, gatewayId: gw.id,
+      offerId: offer.id, offerName: offer.name, amount, status: "pending",
+      externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
+    });
+
+    const caption = `💠 <b>${escapeHtml(offer.name)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
+    await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
+    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+  }
+
+  // ── Entrega do produto de uma oferta avulsa (funnel_offers) após pagamento ───
+  private async deliverFunnelOffer(payment: Payment): Promise<void> {
+    if (!payment.offerId || !payment.leadId) return;
+    const [offer] = await db.select().from(funnelOffers).where(eq(funnelOffers.id, payment.offerId));
+    const [bot]   = await db.select().from(bots).where(eq(bots.id, payment.botId));
+    const [lead]  = await db.select().from(leads).where(eq(leads.id, payment.leadId));
+    if (!offer || !bot || !lead) return;
+    const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
+    const chatId = lead.telegramChatId.toString();
+
+    if (offer.productType === "vip_group" && offer.telegramGroupId) {
+      const [grp] = await db.select().from(botGroups).where(eq(botGroups.id, offer.telegramGroupId));
+      if (grp) {
+        const expireDate = offer.accessDays > 0 ? Math.floor(Date.now() / 1000) + offer.accessDays * 86400 : undefined;
+        try {
+          const link = await tg.createChatInviteLink(grp.telegramChatId.toString(), { memberLimit: 1, expireDate });
+          await tg.sendMessage({
+            chatId,
+            text: "✅ Pagamento confirmado! Toque no botão abaixo para entrar no grupo:",
+            replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+            protectContent: bot.protectContent,
+          });
+          return;
+        } catch (e) { console.error("[runner] deliverFunnelOffer invite:", e); }
+      }
+      await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: bot.protectContent });
+      return;
+    }
+    if (offer.productType === "text" && offer.deliveryText) {
+      await tg.sendMessage({ chatId, text: `✅ Pagamento confirmado!\n\n${offer.deliveryText}`, protectContent: bot.protectContent });
+      return;
+    }
+    const url = offer.deliveryUrl ?? "";
+    await tg.sendMessage({ chatId, text: url ? `✅ Pagamento confirmado! Acesse seu produto: ${url}` : "✅ Pagamento confirmado!", protectContent: bot.protectContent });
+  }
+
+  // ── Pago (chamado pela subscription do webhook): entrega + retoma o funil ────
+  async handlePaidOffer(payment: Payment): Promise<void> {
+    // Compra avulsa (oferta de broadcast/remarketing): sem contexto de funil, mas
+    // com offerId → entrega o produto direto e encerra.
+    if ((!payment.progressId || !payment.nodeId || !payment.paidHandle || !payment.funnelId) && payment.offerId) {
+      await this.deliverFunnelOffer(payment).catch((e) => console.error("[runner] deliverFunnelOffer falhou:", e));
+      return;
+    }
+    if (!payment.progressId || !payment.nodeId || !payment.paidHandle || !payment.funnelId || !payment.leadId) {
+      return; // cobrança sem contexto de funil (ex.: teste de gateway) — ignora
+    }
+
+    const [prog] = await db.select().from(leadProgress).where(eq(leadProgress.id, payment.progressId));
+    const [lead] = await db.select().from(leads).where(eq(leads.id, payment.leadId));
+    const [bot]  = await db.select().from(bots).where(eq(bots.id, payment.botId));
+    const [node] = await db.select().from(funnelNodes).where(eq(funnelNodes.id, payment.nodeId));
+    if (!prog || !lead || !bot || !node) return;
+
+    const tg     = new TelegramClient(decrypt(bot.telegramToken), bot.id);
+    const chatId = lead.telegramChatId.toString();
+    const vars   = await getVars(lead.id, bot.id);
+
+    // Pagou → cancela o timeout __pending pendente deste progresso.
+    await db.delete(scheduledDelays).where(and(
+      eq(scheduledDelays.progressId, payment.progressId),
+      eq(scheduledDelays.status, "pending"),
+    ));
+
+    // Localiza a oferta paga p/ entregar o produto (handle sem o sufixo __paid).
+    // collectNodeOffers cobre tanto o nó offer quanto ofertas embutidas em message.
+    const handleId = payment.paidHandle.replace(/__paid$/, "");
+    const offer    = collectNodeOffers(node.content as Record<string, unknown>)
+      .find((x) => x.handleId === handleId)?.offer;
+    if (offer) {
+      await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars)
+        .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
+    }
+
+    // Retoma o funil pelo ramo __paid.
+    const nextId = await nextNode(payment.funnelId, payment.nodeId, payment.paidHandle);
+    if (nextId) {
+      await advanceProgress(prog.id, nextId, "active");
+      await this.runNode(payment.funnelId, nextId, prog.id, lead.id, bot.id, chatId, tg, bot.protectContent, vars, null);
+    } else {
+      await advanceProgress(prog.id, null, "completed");
+    }
+  }
+
+  // Entrega do produto pago: link de conteúdo ou convite de grupo VIP.
+  private async deliverOffer(
+    offer:   Record<string, unknown>,
+    chatId:  string,
+    tg:      TelegramClient,
+    protect: boolean,
+    vars:    Map<string, string>,
+  ): Promise<void> {
+    const type = typeof offer.product_type === "string" ? offer.product_type : "content";
+
+    if (type === "vip_group") {
+      const groupId = (typeof offer.telegram_group_id === "string" ? offer.telegram_group_id : "").trim();
+      if (!groupId) return;
+      const accessDays = typeof offer.access_days === "number" ? offer.access_days : 0;
+      const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
+      try {
+        const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
+        await tg.sendMessage({
+          chatId,
+          text: "✅ Pagamento confirmado! Toque no botão abaixo para entrar no grupo:",
+          replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+          protectContent: protect,
+        });
+      } catch (err) {
+        console.error("[runner] createChatInviteLink falhou:", err);
+        await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: protect });
+      }
+      return;
+    }
+
+    const url = typeof offer.delivery_url === "string" ? offer.delivery_url : "";
+    const text = url
+      ? `✅ Pagamento confirmado! Acesse seu produto: ${escapeHtml(interpolate(url, vars))}`
+      : "✅ Pagamento confirmado!";
+    await tg.sendMessage({ chatId, text, protectContent: protect });
   }
 }

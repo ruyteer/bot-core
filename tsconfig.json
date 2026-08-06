@@ -9,7 +9,7 @@
     "outDir": "dist",
     "baseUrl": ".",
     "paths": {
-      "~encore/*": [".encore/internal/*"]
+      "~encore/*": ["./encore.gen/*"]
     }
   },
   "include": ["**/*.ts"],

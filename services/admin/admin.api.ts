@@ -4,8 +4,10 @@ import { db } from "../shared/database.js";
 import {
   profiles, userRoles, bots, funnels, leads, payments, paymentGateways,
   funnelOffers, adminNotifications, adminNotificationRecipients,
-  pushSubscriptions, paymentRevenueCredits, platformConfig,
+  pushSubscriptions, paymentRevenueCredits, platformConfig, paymentWebhookLogs,
 } from "../shared/schema/index.js";
+import { desc } from "drizzle-orm";
+import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
 import { eq, and, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 
@@ -23,6 +25,26 @@ function toIso(v: unknown): string {
 function toIsoOrNull(v: unknown): string | null {
   if (v == null) return null;
   return toIso(v);
+}
+
+// Segmento de audiência (mesma lógica em getAudienceCount, no push e no
+// audience_size do histórico). `p` é o alias de profiles.
+function audiencePredicate(audience: string): SQL {
+  switch (audience) {
+    case "no_bots":    return sql`NOT EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)`;
+    case "with_bots":  return sql`EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)`;
+    case "no_sales":   return sql`NOT EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')`;
+    case "with_sales": return sql`EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')`;
+    default:           return sql`TRUE`;
+  }
+}
+async function audienceCount(audience: string): Promise<number> {
+  const [row] = await exec<{ count: number }>(sql`SELECT count(*)::int AS count FROM profiles p WHERE ${audiencePredicate(audience)}`);
+  return row?.count ?? 0;
+}
+async function audienceUserIds(audience: string): Promise<string[]> {
+  const rows = await exec<{ id: string }>(sql`SELECT p.id FROM profiles p WHERE ${audiencePredicate(audience)}`);
+  return rows.map((r) => r.id);
 }
 
 // ─── Admin guard ──────────────────────────────────────────────────────────────
@@ -158,6 +180,7 @@ interface AdminUserRow {
   email:         string | null;
   created_at:    string;
   is_blocked:    boolean;
+  is_admin:      boolean;
   bots_count:    number;
   funnels_count: number;
   total_revenue: number;
@@ -180,13 +203,14 @@ export const listUsers = api(
 
     type UserRow = {
       id: string; name: string | null; email: string | null; created_at: string;
-      is_blocked: boolean; bots_count: number; funnels_count: number;
+      is_blocked: boolean; is_admin: boolean; bots_count: number; funnels_count: number;
       total_revenue: number; paid_count: number; total: number;
     };
 
     const rows = await exec<UserRow>(sql`
       SELECT
         p.id, p.name, p.email, p.created_at, p.is_blocked,
+        EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = p.id AND ur.role = 'admin') AS is_admin,
         count(DISTINCT b.id)::int                                                     AS bots_count,
         count(DISTINCT f.id)::int                                                     AS funnels_count,
         coalesce(sum(pay.amount) FILTER (WHERE pay.status = 'paid'), 0)::float / 100 AS total_revenue,
@@ -236,6 +260,7 @@ export const listUsers = api(
       email:         r.email,
       created_at:    toIso(r.created_at as unknown),
       is_blocked:    r.is_blocked,
+      is_admin:      r.is_admin,
       bots_count:    r.bots_count,
       funnels_count: r.funnels_count,
       total_revenue: r.total_revenue,
@@ -256,7 +281,7 @@ export const listUsers = api(
 // ─── GET /admin/users/:id ─────────────────────────────────────────────────────
 
 interface AdminUserDetails {
-  profile: { id: string; name: string | null; email: string | null; created_at: string; is_blocked: boolean } | null;
+  profile: { id: string; name: string | null; email: string | null; created_at: string; is_blocked: boolean; is_admin: boolean } | null;
   split_override: { fee_cents: number; updated_at: string } | null;
   metrics: {
     total_revenue: number; total_paid_count: number;
@@ -264,10 +289,14 @@ interface AdminUserDetails {
     avg_ticket: number; pending_count_30d: number; pending_amount_30d: number;
     bots_count: number; funnels_count: number; leads_count: number;
   };
-  by_provider:    Array<{ provider: string; qty: number; gross: number }>;
+  by_provider:    Array<{ provider: string | null; qty: number; gross: number }>;
   daily_revenue:  Array<{ day: string; gross: number; qty: number }>;
   bots:           Array<{ id: string; name: string; telegram_username: string | null; is_active: boolean; funnels_count: number; leads_count: number }>;
   recent_payments: Array<{ id: string; created_at: string; paid_at: string | null; amount: number; status: string; offer_name: string | null; provider: string | null }>;
+  // O frontend (AdminUserDetails) lê estes dois — sem eles, `data.gateways.length`
+  // dava TypeError e a página de detalhes quebrava no render.
+  gateways:        Array<{ id: string; provider: string; label: string; is_active: boolean }>;
+  impersonation_log: Array<{ id: string; created_at: string; action: string }>;
 }
 
 export const getUserDetails = api(
@@ -278,6 +307,14 @@ export const getUserDetails = api(
 
     const [profile] = await db.select().from(profiles).where(eq(profiles.id, id)).limit(1);
     if (!profile) throw APIError.notFound("user not found");
+
+    const [adminRole] = await db.select({ role: userRoles.role }).from(userRoles)
+      .where(and(eq(userRoles.userId, id), eq(userRoles.role, "admin"))).limit(1);
+
+    const userGateways = await db.select({
+      id: paymentGateways.id, provider: paymentGateways.provider,
+      label: paymentGateways.label, isActive: paymentGateways.isActive,
+    }).from(paymentGateways).where(eq(paymentGateways.userId, id));
 
     const splitRow = await db.select({ value: platformConfig.value, updatedAt: platformConfig.updatedAt })
       .from(platformConfig).where(eq(platformConfig.key, `USER_SPLIT_FEE_CENTS_${id}`)).limit(1);
@@ -352,6 +389,7 @@ export const getUserDetails = api(
         email:      profile.email,
         created_at: profile.createdAt.toISOString(),
         is_blocked: profile.isBlocked,
+        is_admin:   !!adminRole,
       },
       split_override,
       metrics:        metrics ?? { total_revenue: 0, total_paid_count: 0, revenue_30d: 0, paid_count_30d: 0, avg_ticket: 0, pending_count_30d: 0, pending_amount_30d: 0, bots_count: 0, funnels_count: 0, leads_count: 0 },
@@ -367,6 +405,9 @@ export const getUserDetails = api(
         offer_name: r.offer_name,
         provider:   r.provider,
       })),
+      gateways: userGateways.map((g) => ({ id: g.id, provider: g.provider, label: g.label, is_active: g.isActive })),
+      // Impersonation ainda não implementada — array vazio p/ satisfazer a UI.
+      impersonation_log: [],
     };
   },
 );
@@ -392,6 +433,72 @@ export const deleteUser = api(
     await requireAdmin(userID);
     await db.delete(profiles).where(eq(profiles.id, id));
     return { ok: true };
+  },
+);
+
+// ─── Gerenciamento de admin (grant/revoke da role) ────────────────────────────
+// Antes NÃO existia caminho no código: virar admin só por INSERT manual no banco.
+
+// POST /admin/users/:id/admin — promove o usuário a admin
+export const grantAdmin = api(
+  { method: "POST", path: "/admin/users/:id/admin", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+    const { userID } = getAuthData()!;
+    await requireAdmin(userID);
+    const [target] = await db.select({ id: profiles.id }).from(profiles).where(eq(profiles.id, id)).limit(1);
+    if (!target) throw APIError.notFound("user not found");
+    // PK composta (user_id, role) → idempotente.
+    await db.insert(userRoles).values({ userId: id, role: "admin" }).onConflictDoNothing();
+    return { ok: true };
+  },
+);
+
+// DELETE /admin/users/:id/admin — remove o admin do usuário
+export const revokeAdmin = api(
+  { method: "DELETE", path: "/admin/users/:id/admin", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+    const { userID } = getAuthData()!;
+    await requireAdmin(userID);
+    // Não deixa o último admin se auto-remover (trancaria o painel pra todos).
+    if (id === userID) {
+      const [{ n }] = await exec<{ n: number }>(sql`SELECT count(*)::int AS n FROM user_roles WHERE role = 'admin'`);
+      if (n <= 1) throw APIError.failedPrecondition("não é possível remover o último admin");
+    }
+    await db.delete(userRoles).where(and(eq(userRoles.userId, id), eq(userRoles.role, "admin")));
+    return { ok: true };
+  },
+);
+
+// ─── GET /admin/webhook-logs ──────────────────────────────────────────────────
+// A tela lia payment_webhook_logs direto do Supabase (com realtime), que morreu
+// na migração pro Encore. Agora vem por endpoint; o front troca realtime por poll.
+
+interface WebhookLogRow {
+  id: string; provider: string | null; external_id: string | null;
+  event: string | null; status: string | null; processed: boolean;
+  amount: number | null; matched_payment_id: string | null;
+  error_message: string | null; source_ip: string | null;
+  payload: unknown; created_at: string;
+}
+
+export const listWebhookLogs = api(
+  { method: "GET", path: "/admin/webhook-logs", expose: true, auth: true },
+  async ({ limit }: { limit?: number }): Promise<{ items: WebhookLogRow[] }> => {
+    const { userID } = getAuthData()!;
+    await requireAdmin(userID);
+    const rows = await db.select().from(paymentWebhookLogs)
+      .orderBy(desc(paymentWebhookLogs.createdAt))
+      .limit(Math.min(limit ?? 200, 500));
+    return {
+      items: rows.map((r) => ({
+        id: r.id, provider: r.provider, external_id: r.externalId,
+        event: r.event, status: r.status, processed: r.processed,
+        amount: r.amount == null ? null : r.amount / 100,
+        matched_payment_id: r.matchedPaymentId, error_message: r.errorMessage,
+        source_ip: r.sourceIp, payload: r.payload,
+        created_at: r.createdAt.toISOString(),
+      })),
+    };
   },
 );
 
@@ -617,7 +724,15 @@ export const listNotifications = api(
       SELECT
         n.id, n.title, n.body, n.display_mode, n.require_ack, n.audience,
         n.is_active, n.created_at,
-        0::int                                                                   AS audience_size,
+        (SELECT count(*)::int FROM profiles p WHERE
+          CASE n.audience
+            WHEN 'no_bots'    THEN NOT EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)
+            WHEN 'with_bots'  THEN     EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)
+            WHEN 'no_sales'   THEN NOT EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')
+            WHEN 'with_sales' THEN     EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')
+            ELSE TRUE
+          END
+        )                                                                        AS audience_size,
         count(r.user_id)::int                                                    AS seen_count,
         count(r.user_id) FILTER (WHERE r.read_at IS NOT NULL)::int               AS read_count,
         count(r.user_id) FILTER (WHERE r.acknowledged_at IS NOT NULL)::int       AS ack_count
@@ -640,7 +755,7 @@ export const listNotifications = api(
 
 export const createNotification = api(
   { method: "POST", path: "/admin/notifications", expose: true, auth: true },
-  async (req: { title: string; body: string; audience: string; displayMode: string; requireAck: boolean; imageUrl?: string }): Promise<{ id: string }> => {
+  async (req: { title: string; body: string; audience: string; displayMode: string; requireAck: boolean; imageUrl?: string; sendPush?: boolean }): Promise<{ id: string; pushSent: number }> => {
     const { userID } = getAuthData()!;
     await requireAdmin(userID);
     const [row] = await db.insert(adminNotifications).values({
@@ -650,10 +765,29 @@ export const createNotification = api(
       displayMode: req.displayMode,
       requireAck:  req.requireAck,
       imageUrl:    req.imageUrl,
+      sendPush:    !!req.sendPush,
       createdBy:   userID,
       isActive:    true,
     }).returning({ id: adminNotifications.id });
-    return { id: row.id };
+
+    // Push real para a audiência (antes o toggle era cosmético). Best-effort:
+    // falhas de push não derrubam a criação do comunicado.
+    let pushSent = 0;
+    if (req.sendPush) {
+      try {
+        const targets = await audienceUserIds(req.audience);
+        const results = await Promise.allSettled(targets.map((uid) => sendPushToUser(uid, {
+          eventType: "admin_announcement",
+          title:     req.title,
+          body:      req.body,
+          data:      { notification_id: row.id, image: req.imageUrl, url: "/" },
+        })));
+        pushSent = results.filter((r) => r.status === "fulfilled" && (r.value as { sent: number }).sent > 0).length;
+      } catch (err) {
+        console.error("[admin] broadcast push falhou:", err);
+      }
+    }
+    return { id: row.id, pushSent };
   },
 );
 
@@ -689,26 +823,7 @@ export const getAudienceCount = api(
     const { userID } = getAuthData()!;
     await requireAdmin(userID);
 
-    let countSql: SQL;
-    switch (audience) {
-      case "no_bots":
-        countSql = sql`SELECT count(*)::int AS count FROM profiles p WHERE NOT EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)`;
-        break;
-      case "with_bots":
-        countSql = sql`SELECT count(*)::int AS count FROM profiles p WHERE EXISTS (SELECT 1 FROM bots b WHERE b.user_id = p.id)`;
-        break;
-      case "no_sales":
-        countSql = sql`SELECT count(*)::int AS count FROM profiles p WHERE NOT EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')`;
-        break;
-      case "with_sales":
-        countSql = sql`SELECT count(*)::int AS count FROM profiles p WHERE EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')`;
-        break;
-      default:
-        countSql = sql`SELECT count(*)::int AS count FROM profiles`;
-    }
-
-    const [row] = await exec<{ count: number }>(countSql);
-    return { count: row.count };
+    return { count: await audienceCount(audience) };
   },
 );
 

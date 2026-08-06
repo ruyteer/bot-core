@@ -1,4 +1,5 @@
 import { api, APIError } from "encore.dev/api";
+import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments } from "../shared/schema/index.js";
@@ -191,6 +192,7 @@ export const create = api(
       isActive:        req.isActive ?? false,
     }).returning();
 
+    scanSourceAsync("remarketing", c.id);
     return toCampaignResponse(c);
   },
 );
@@ -229,6 +231,7 @@ export const update = api(
     if (req.botIds !== undefined)          patch.botIds = req.botIds;
 
     const [updated] = await db.update(remarketingCampaigns).set(patch).where(eq(remarketingCampaigns.id, id)).returning();
+    scanSourceAsync("remarketing", id);
     const msgCount = await db.select({ count: sql<number>`count(*)::int` }).from(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
     return toCampaignResponse(updated, msgCount[0]?.count ?? 0);
   },
@@ -269,6 +272,7 @@ export const duplicateCampaign = api(
       );
     }
 
+    scanSourceAsync("remarketing", newCampaign.id);
     return toCampaignResponse(newCampaign, messages.length);
   },
 );
@@ -306,6 +310,7 @@ export const saveMessages = api(
         }))
       );
     }
+    scanSourceAsync("remarketing", id);
     return { ok: true };
   },
 );

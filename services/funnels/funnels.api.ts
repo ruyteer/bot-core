@@ -1,4 +1,5 @@
 import { api, APIError } from "encore.dev/api";
+import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { FunnelDrizzleRepository } from "./infrastructure/funnel.drizzle.repository.js";
 import type { FunnelWithBots, FunnelDetail, SaveFlowInput } from "./domain/funnel.entity.js";
@@ -103,6 +104,7 @@ export const create = api(
       name:  req.name,
       kind:  req.kind ?? "flow",
     });
+    scanSourceAsync("funnel", funnel.id);
     return toResponse({ ...funnel, bots: [{ id: req.botId, name: "" }] });
   },
 );
@@ -115,6 +117,7 @@ export const update = api(
     const funnel = await repo.update(id, userId, req);
     const detail = await repo.findByIdOwned(funnel.id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
+    scanSourceAsync("funnel", funnel.id);
     return toResponse(detail);
   },
 );
@@ -154,6 +157,7 @@ export const saveFlow = api(
   async ({ id, nodes, connections }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
     await repo.saveFlow(id, userId, { nodes, connections });
+    scanSourceAsync("funnel", id);
     return { ok: true };
   },
 );
@@ -166,6 +170,7 @@ export const duplicate = api(
     const funnel = await repo.duplicate(id, userId, targetBotId);
     const detail = await repo.findByIdOwned(funnel.id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
+    scanSourceAsync("funnel", funnel.id);
     return toResponse(detail);
   },
 );
@@ -291,6 +296,7 @@ export const createOffer = api(
       isActive:        req.isActive ?? true,
     }).returning();
 
+    scanSourceAsync("offer", row.id);
     return { id: row.id, name: row.name, price: row.price, botId: row.botId, externalRef: row.externalRef };
   },
 );
@@ -322,6 +328,7 @@ export const createOffersBulk = api(
       }))
     ).returning();
 
+    for (const r of rows) scanSourceAsync("offer", r.id);
     return { offers: rows.map((r) => ({ id: r.id, name: r.name, price: r.price, botId: r.botId })) };
   },
 );

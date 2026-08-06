@@ -4,6 +4,7 @@ import { encoreExternalUrl } from "../config/secrets.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { createPix } from "./application/gateway-clients.js";
+import { isPlatformAdmin } from "../shared/roles.js";
 import type { Provider } from "./domain/gateway.entity.js";
 import type { PaymentWithMeta } from "./domain/payment.entity.js";
 
@@ -122,6 +123,38 @@ export const deleteGateway = api(
   },
 );
 
+interface BotGatewayChainItem {
+  id:       string;
+  provider: string;
+  label:    string;
+  isActive: boolean;
+  position: number;
+}
+
+// GET /bots/:id/gateways — ordem de fallback de gateways do bot.
+// O parâmetro PRECISA se chamar `id`: o serviço de bots já registra
+// `/bots/:id/...` e o roteador não aceita dois nomes de parâmetro na mesma
+// posição da árvore. Com `:botId` a rota era silenciosamente descartada (404).
+export const listBotGateways = api(
+  { method: "GET", path: "/bots/:id/gateways", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ gateways: BotGatewayChainItem[] }> => {
+    const { userID: userId } = getAuthData()!;
+    const gateways = await gwRepo.listChain(id, userId);
+    return { gateways };
+  },
+);
+
+// PUT /bots/:id/gateways — substitui a ordem inteira (índice = prioridade)
+export const setBotGateways = api(
+  { method: "PUT", path: "/bots/:id/gateways", expose: true, auth: true },
+  async ({ id, gatewayIds }: { id: string; gatewayIds: string[] }): Promise<{ ok: boolean }> => {
+    const { userID: userId } = getAuthData()!;
+    const ok = await gwRepo.setChain(id, userId, gatewayIds);
+    if (!ok) throw APIError.notFound("bot not found");
+    return { ok: true };
+  },
+);
+
 // POST /gateways/:id/test — gera um PIX de R$ 10,00 para teste
 export const testGateway = api(
   { method: "POST", path: "/gateways/:id/test", expose: true, auth: true },
@@ -142,8 +175,18 @@ export const testGateway = api(
     const externalUrl = encoreExternalUrl();
     const webhookUrl  = `${externalUrl}/payments/webhook/${gw.provider}`;
 
-    const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl);
-    return { success: true, ...result };
+    // Admin testando não paga a taxa da plataforma → PIX de teste sem split.
+    const skipSplit = await isPlatformAdmin(userId);
+
+    try {
+      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl, { skipSplit });
+      return { success: true, ...result };
+    } catch (err) {
+      // Sem isso o Encore converte o Error em "internal error" genérico e o
+      // painel não mostra a causa real (ex.: 403 de compliance do provedor).
+      const msg = err instanceof Error ? err.message : String(err);
+      throw APIError.unavailable(`Falha ao gerar PIX de teste: ${msg}`);
+    }
   },
 );
 
