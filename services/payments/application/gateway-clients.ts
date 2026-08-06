@@ -68,12 +68,58 @@ async function syncpayToken(clientId: string, clientSecret: string): Promise<str
   return data.access_token;
 }
 
+// A SyncPay IGNORA o campo webhook_url do cash-in: a doc diz que webhooks são
+// enviados SOMENTE a partir do cadastro na conta (POST /api/partner/v1/webhooks,
+// evento "cashin"). Sem esse cadastro, o PIX gera mas a confirmação de venda
+// nunca chega. Registramos o webhook na primeira cobrança de cada conta
+// (cache por processo; falha não bloqueia o PIX — tenta de novo na próxima).
+const syncpayWebhookEnsured = new Set<string>();
+export function __resetSyncpayWebhookCacheForTests(): void { syncpayWebhookEnsured.clear(); }
+
+async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl: string): Promise<void> {
+  if (syncpayWebhookEnsured.has(clientId)) return;
+  try {
+    const listRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+    });
+    const listData = await listRes.json().catch(() => null) as unknown;
+    const rows: Array<Record<string, unknown>> =
+      Array.isArray(listData) ? listData as Array<Record<string, unknown>>
+      : Array.isArray((listData as { data?: unknown })?.data) ? (listData as { data: Array<Record<string, unknown>> }).data
+      : [];
+    const exists = rows.some((w) =>
+      String(w.url ?? "") === webhookUrl && ["cashin", "all"].includes(String(w.event ?? "")));
+
+    if (!exists) {
+      const createRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          title: "OrionBot — confirmação de venda (cashin)",
+          url:   webhookUrl,
+          event: "cashin",
+          trigger_all_products: true,
+        }),
+      });
+      if (!createRes.ok) {
+        console.error("[syncpay] registro do webhook falhou:", createRes.status, await createRes.text().catch(() => ""));
+        return; // sem cache → nova tentativa no próximo PIX
+      }
+      console.log(`[syncpay] webhook cashin registrado: ${webhookUrl}`);
+    }
+    syncpayWebhookEnsured.add(clientId);
+  } catch (err) {
+    console.error("[syncpay] ensureWebhook falhou:", err);
+  }
+}
+
 export async function syncpayCashIn(
   clientId: string, clientSecret: string,
   amountCents: number, description: string, webhookUrl: string,
   splitReceiverId?: string | null,
 ): Promise<PixPaymentResult> {
   const token = await syncpayToken(clientId, clientSecret);
+  await ensureSyncpayWebhook(token, clientId, webhookUrl);
   const body: Record<string, unknown> = {
     amount:      amountCents / 100, // reais
     description,
