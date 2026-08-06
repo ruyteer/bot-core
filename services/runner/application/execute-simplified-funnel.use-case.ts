@@ -383,7 +383,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     // Dedup: reaproveita PIX pendente recente do mesmo (bot, lead, valor, ref).
     const existing = await payRepo.findReusablePending(bot.id, lead.id, amountCents, refKey);
     if (existing?.pixCode) {
-      await this.sendPixMessages(tg, chatId, existing.pixCode, amount, productName, payCfg, bot.protectContent);
+      await this.sendPixMessages(tg, chatId, existing.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
       return { paymentId: existing.id, reused: true };
     }
 
@@ -425,7 +425,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       simplifiedCtx:    ctx,
     });
 
-    await this.sendPixMessages(tg, chatId, pix.pixCode, amount, productName, payCfg, bot.protectContent);
+    await this.sendPixMessages(tg, chatId, pix.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
     return { paymentId: created.id, reused: false };
   }
 
@@ -438,9 +438,11 @@ export class ExecuteSimplifiedFunnelUseCase {
     productName: string,
     payCfg: Record<string, unknown>,
     protect: boolean,
+    leadName = "",
   ): Promise<void> {
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=15&data=${encodeURIComponent(pixCode)}`;
-    const pixVars = { nome: "", valor: fmtBRL(amount), produto: productName, descricao: "", mensagem: "" };
+    // {nome} era substituído por "" fixo — o lead nunca via o próprio nome.
+    const pixVars = { nome: leadName, valor: fmtBRL(amount), produto: productName, descricao: "", mensagem: "" };
 
     const qrCaption = payCfg.pix_caption_template
       ? replacePixVariables(String(payCfg.pix_caption_template), pixVars)
