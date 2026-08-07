@@ -50,6 +50,12 @@ const _paidSub = new Subscription(paymentPaid, "runner-payment-paid", {
 
 // ── Scheduled delays processor ────────────────────────────────────────────────
 
+// Cooldown por bot após 429: quando o Telegram penaliza um bot (retry_after de
+// minutos), tentar os DEMAIS delays dele no mesmo tick só gera mais 429, mais
+// updates e mais log. Levou 429 → os delays daquele bot são pulados (ficam
+// pending, sem custo) até o prazo passar.
+const botRateLimitUntil = new Map<string, number>();
+
 // Processa todos os delays vencidos uma vez. Reutilizado pelo endpoint manual
 // e pelo scheduler interno.
 async function runDuePendingDelays(): Promise<number> {
@@ -58,6 +64,8 @@ async function runDuePendingDelays(): Promise<number> {
 
   let processed = 0;
   for (const delay of pending) {
+    const cooldown = botRateLimitUntil.get(delay.botId);
+    if (cooldown && Date.now() < cooldown) continue;
     try {
       await db.update(scheduledDelays).set({ status: "processing" }).where(eq(scheduledDelays.id, delay.id));
 
@@ -97,7 +105,8 @@ async function runDuePendingDelays(): Promise<number> {
         await db.update(scheduledDelays)
           .set({ status: "pending", executeAt: new Date(Date.now() + waitSec * 1000) })
           .where(eq(scheduledDelays.id, delay.id));
-        console.warn(`[runner] delay ${delay.id}: 429 do Telegram — reagendado +${waitSec}s`);
+        botRateLimitUntil.set(delay.botId, Date.now() + waitSec * 1000);
+        console.warn(`[runner] bot ${delay.botId}: 429 do Telegram — cooldown ${waitSec}s (delay ${delay.id} reagendado)`);
       } else {
         // Uma linha, sem stack: o stack de centenas de falhas iguais estourou o
         // rate limit de LOG do Railway e escondeu o diagnóstico.
