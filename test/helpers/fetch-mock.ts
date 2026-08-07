@@ -119,7 +119,13 @@ export function installFetchMock(): void {
       telegramCalls.push({ method, body: body ?? {} });
       if (forcedErrors.has(method)) {
         const code = forcedErrors.get(method);
-        return jsonResponse({ ok: false, ...(code ? { error_code: code } : {}), description: "forced error" });
+        return jsonResponse({
+          ok: false,
+          ...(code ? { error_code: code } : {}),
+          description: code === 429 ? "Too Many Requests: retry after 7" : "forced error",
+          // Shape real do 429 do Telegram: retry_after em parameters.
+          ...(code === 429 ? { parameters: { retry_after: 7 } } : {}),
+        });
       }
       return jsonResponse({ ok: true, result: telegramResult(method, body ?? {}) });
     }

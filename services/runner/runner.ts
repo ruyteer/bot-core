@@ -1,14 +1,14 @@
 import { Subscription } from "encore.dev/pubsub";
 import { api } from "encore.dev/api";
-import { eq, and, lte } from "drizzle-orm";
+import { eq, and, lte, sql } from "drizzle-orm";
 import { db } from "../shared/database.js";
-import { scheduledDelays, bots, leads, leadVariables } from "../shared/schema/index.js";
+import { scheduledDelays, bots, leads, leadVariables, platformConfig } from "../shared/schema/index.js";
 import { telegramUpdateReceived, paymentPaid } from "../shared/events/index.js";
 import { ExecuteFlowStepUseCase } from "./application/execute-flow-step.use-case.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./application/execute-simplified-funnel.use-case.js";
 import { PaymentDrizzleRepository } from "../payments/infrastructure/payment.drizzle.repository.js";
 import { decrypt } from "../shared/crypto.js";
-import { TelegramClient } from "./application/telegram.client.js";
+import { TelegramClient, TelegramApiError } from "./application/telegram.client.js";
 import { mergeLeadFields } from "./application/interpolate.js";
 import { processDueBroadcasts } from "../broadcasts/application/process-broadcasts.use-case.js";
 import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing/application/process-remarketing.use-case.js";
@@ -84,13 +84,60 @@ async function runDuePendingDelays(): Promise<number> {
 
       await db.update(scheduledDelays).set({ status: "done" }).where(eq(scheduledDelays.id, delay.id));
       processed++;
+
+      // Espaçamento entre envios: rajadas de delays vencidos estouravam o rate
+      // limit do Telegram (~30 msg/s por bot) e derrubavam funis em massa.
+      await new Promise((r) => setTimeout(r, 40));
     } catch (err) {
-      console.error(`[runner] delay ${delay.id} failed:`, err);
-      await db.update(scheduledDelays).set({ status: "failed" }).where(eq(scheduledDelays.id, delay.id));
+      if (err instanceof TelegramApiError && err.isRateLimit) {
+        // 429 NÃO é falha do funil: reagenda com o retry_after do Telegram
+        // (+ jitter pra não realinhar a rajada). Antes virava "failed" e o
+        // lead ficava sem o resto do funil pra sempre.
+        const waitSec = (err.retryAfter ?? 30) + 5 + Math.floor(Math.random() * 15);
+        await db.update(scheduledDelays)
+          .set({ status: "pending", executeAt: new Date(Date.now() + waitSec * 1000) })
+          .where(eq(scheduledDelays.id, delay.id));
+        console.warn(`[runner] delay ${delay.id}: 429 do Telegram — reagendado +${waitSec}s`);
+      } else {
+        // Uma linha, sem stack: o stack de centenas de falhas iguais estourou o
+        // rate limit de LOG do Railway e escondeu o diagnóstico.
+        console.error(`[runner] delay ${delay.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+        await db.update(scheduledDelays).set({ status: "failed" }).where(eq(scheduledDelays.id, delay.id));
+      }
     }
   }
 
   return processed;
+}
+
+// ── Resgate one-shot dos delays mortos pelo incidente de 429 (2026-08-07) ────
+// Delays marcados "failed" nas últimas 24h eram, na maioria, 429 do Telegram —
+// os leads não receberam NADA, então reprocessar é o correto. Escalonados a 2s
+// por item pra não recriar a rajada. Marker em platform_config garante uma
+// execução única (redeploys não reenviam).
+async function requeueIncidentFailedDelays(): Promise<void> {
+  const MARKER = "RUNNER_REQUEUE_FAILED_20260807";
+  try {
+    const inserted = await db.insert(platformConfig)
+      .values({ key: MARKER, value: new Date().toISOString() })
+      .onConflictDoNothing()
+      .returning({ key: platformConfig.key });
+    if (inserted.length === 0) return; // já rodou
+
+    const res = await db.execute(sql`
+      WITH f AS (
+        SELECT id, row_number() OVER (ORDER BY created_at) AS rn
+        FROM scheduled_delays
+        WHERE status = 'failed' AND created_at > now() - interval '24 hours'
+      )
+      UPDATE scheduled_delays sd
+      SET status = 'pending', execute_at = now() + (f.rn * interval '2 seconds')
+      FROM f WHERE sd.id = f.id
+    `);
+    console.log(`[runner] resgate 429: ${res.rowCount ?? 0} delay(s) failed reenfileirado(s)`);
+  } catch (err) {
+    console.error("[runner] resgate de delays failed falhou:", err);
+  }
 }
 
 // Endpoint manual (também útil p/ trigger externo/teste).
@@ -159,7 +206,7 @@ async function tickSlow(): Promise<void> {
 }
 
 // Aplica DDLs idempotentes pendentes antes do 1º tick (self-hosted não tem migrator).
-void ensureSchemaAtBoot();
+void ensureSchemaAtBoot().then(() => requeueIncidentFailedDelays());
 
 setInterval(() => { void tickFast(); }, FAST_TICK_MS);
 setInterval(() => { void tickSlow(); }, SLOW_TICK_MS);
