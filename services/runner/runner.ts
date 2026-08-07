@@ -56,19 +56,54 @@ const _paidSub = new Subscription(paymentPaid, "runner-payment-paid", {
 // pending, sem custo) até o prazo passar.
 const botRateLimitUntil = new Map<string, number>();
 
-// Processa todos os delays vencidos uma vez. Reutilizado pelo endpoint manual
-// e pelo scheduler interno.
+// Quantos delays um tick processa. Com o espaçamento de 40ms + latência do
+// Telegram, 40 itens cabem folgados na janela de 3s do tick — e, acima de tudo,
+// o tick TERMINA. Sem limite, uma fila grande (ex.: 100k do resgate de 429)
+// fazia um tick durar horas: o guard de 60s liberava o próximo, os ticks se
+// empilhavam e todos batiam no mesmo bot em paralelo — rajada multiplicada,
+// 429 permanente. O claim atômico abaixo é o que impede dois ticks de pegarem
+// o mesmo delay.
+const DELAY_BATCH = 40;
+
+// Processa um lote de delays vencidos. Reutilizado pelo endpoint manual e pelo
+// scheduler interno.
 async function runDuePendingDelays(): Promise<number> {
-  const pending = await db.select().from(scheduledDelays)
-    .where(and(eq(scheduledDelays.status, "pending"), lte(scheduledDelays.executeAt, new Date())));
+  // Claim atômico: marca "processing" e devolve as linhas numa única query.
+  // FOR UPDATE SKIP LOCKED → ticks concorrentes pegam lotes disjuntos.
+  // execute_at = now() no claim marca QUANDO o item foi pego: é o relógio que a
+  // recuperação de órfãos usa (a tabela não tem updated_at, e created_at daria
+  // falso positivo em delay antigo recém-claimed → reprocessamento duplicado).
+  const claimed = await db.execute<typeof scheduledDelays.$inferSelect>(sql`
+    UPDATE scheduled_delays SET status = 'processing', execute_at = now()
+    WHERE id IN (
+      SELECT id FROM scheduled_delays
+      WHERE status = 'pending' AND execute_at <= now()
+      ORDER BY execute_at ASC
+      LIMIT ${DELAY_BATCH}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING id, bot_id AS "botId", lead_id AS "leadId", funnel_id AS "funnelId",
+              progress_id AS "progressId", next_node_id AS "nextNodeId"
+  `);
+  const pending = (claimed.rows ?? []) as Array<{
+    id: string; botId: string; leadId: string;
+    funnelId: string; progressId: string; nextNodeId: string;
+  }>;
 
   let processed = 0;
+  // 403 (usuário bloqueou o bot / chat inexistente) é desfecho ESPERADO, não
+  // incidente: com uma fila grande, logar cada um afoga o Railway. Agrega.
+  let blocked = 0;
   for (const delay of pending) {
     const cooldown = botRateLimitUntil.get(delay.botId);
-    if (cooldown && Date.now() < cooldown) continue;
+    if (cooldown && Date.now() < cooldown) {
+      // Bot penalizado: devolve à fila pro fim do cooldown, sem gastar chamada.
+      await db.update(scheduledDelays)
+        .set({ status: "pending", executeAt: new Date(cooldown) })
+        .where(eq(scheduledDelays.id, delay.id));
+      continue;
+    }
     try {
-      await db.update(scheduledDelays).set({ status: "processing" }).where(eq(scheduledDelays.id, delay.id));
-
       const [bot] = await db.select().from(bots).where(eq(bots.id, delay.botId));
       const [lead] = await db.select().from(leads).where(eq(leads.id, delay.leadId));
       if (!bot || !lead || lead.telegramChatId <= 0n) {
@@ -108,15 +143,38 @@ async function runDuePendingDelays(): Promise<number> {
         botRateLimitUntil.set(delay.botId, Date.now() + waitSec * 1000);
         console.warn(`[runner] bot ${delay.botId}: 429 do Telegram — cooldown ${waitSec}s (delay ${delay.id} reagendado)`);
       } else {
-        // Uma linha, sem stack: o stack de centenas de falhas iguais estourou o
-        // rate limit de LOG do Railway e escondeu o diagnóstico.
-        console.error(`[runner] delay ${delay.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+        const isBlocked = err instanceof TelegramApiError &&
+          (err.errorCode === 403 || err.errorCode === 400);
+        if (isBlocked) {
+          blocked++;
+        } else {
+          // Uma linha, sem stack: o stack de centenas de falhas iguais estourou
+          // o rate limit de LOG do Railway e escondeu o diagnóstico.
+          console.error(`[runner] delay ${delay.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         await db.update(scheduledDelays).set({ status: "failed" }).where(eq(scheduledDelays.id, delay.id));
       }
     }
   }
 
+  if (blocked > 0) console.log(`[runner] delays: ${blocked} lead(s) inalcançável(is) (bot bloqueado/chat inválido)`);
   return processed;
+}
+
+// Delays presos em "processing" (processo morto no meio — deploy, OOM) voltam
+// pra fila. Sem isso, o claim atômico os deixaria órfãos para sempre.
+async function recoverStuckProcessingDelays(): Promise<void> {
+  try {
+    const res = await db.execute(sql`
+      UPDATE scheduled_delays SET status = 'pending'
+      WHERE status = 'processing' AND execute_at < now() - interval '10 minutes'
+    `);
+    if ((res.rowCount ?? 0) > 0) {
+      console.log(`[runner] ${res.rowCount} delay(s) presos em processing devolvidos à fila`);
+    }
+  } catch (err) {
+    console.error("[runner] recuperação de delays presos falhou:", err);
+  }
 }
 
 // ── Resgate one-shot dos delays mortos pelo incidente de 429 (2026-08-07) ────
@@ -201,6 +259,7 @@ async function tickSlow(): Promise<void> {
     const b = await processDueBroadcasts();
     const enrolled = await enrollRemarketingTriggers();
     const rmk = await processDueRemarketing();
+    await recoverStuckProcessingDelays();
     const px = await processPendingConversionEvents();
     if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);
     if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
