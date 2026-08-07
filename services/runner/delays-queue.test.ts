@@ -8,7 +8,7 @@ import { testDb } from "../../test/helpers/db.js";
 import { createBot, createFlowFunnel, createLead } from "../../test/helpers/seed.js";
 import { getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 import { scheduledDelays, leadProgress } from "../shared/schema/index.js";
-import { processPendingDelays } from "./runner.js";
+import { processPendingDelays, pruneStaleRequeuedDelays } from "./runner.js";
 
 // Cria N delays vencidos para o mesmo bot/funil.
 async function seedDueDelays(n: number) {
@@ -82,6 +82,35 @@ describe("fila de delays — claim atômico em lote", () => {
     const db = await testDb();
     const rows = await db.select().from(scheduledDelays);
     expect(rows.every((r) => r.status === "failed")).toBe(true);
+  });
+
+  // Poda da fila do resgate: cancela só o que é antigo E foi artificialmente
+  // reagendado (assinatura do resgate). Delay legítimo não pode ser tocado.
+  it("poda cancela delay antigo reagendado e preserva delay legítimo", async () => {
+    await seedDueDelays(2);
+    const db = await testDb();
+    const rows = await db.select().from(scheduledDelays);
+
+    // Delay A: criado há 20h e empurrado pra agora (assinatura do resgate).
+    await db.execute(sql`
+      UPDATE scheduled_delays
+      SET created_at = now() - interval '20 hours', execute_at = now()
+      WHERE id = ${rows[0].id}
+    `);
+    // Delay B: criado há 4h para executar 5 min depois (delay normal de funil,
+    // só atrasado na fila) — não pode ser cancelado.
+    await db.execute(sql`
+      UPDATE scheduled_delays
+      SET created_at = now() - interval '4 hours', execute_at = now() - interval '3 hours 55 minutes'
+      WHERE id = ${rows[1].id}
+    `);
+
+    await pruneStaleRequeuedDelays();
+
+    const [a] = await db.select().from(scheduledDelays).where(eq(scheduledDelays.id, rows[0].id));
+    const [b] = await db.select().from(scheduledDelays).where(eq(scheduledDelays.id, rows[1].id));
+    expect(a.status).toBe("skipped");  // antigo + reagendado → cancelado
+    expect(b.status).toBe("pending");  // legítimo → preservado
   });
 
   it("delay preso em processing volta pra fila após o prazo", async () => {

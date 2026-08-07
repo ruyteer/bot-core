@@ -161,6 +161,36 @@ async function runDuePendingDelays(): Promise<number> {
   return processed;
 }
 
+// ── Poda one-shot da fila do resgate (decisão do usuário, 2026-08-07) ────────
+// O resgate reenfileirou 105.977 delays de até 24h. Drenar tudo levaria ~10h,
+// mantendo o 429 vivo e entregando continuação de funil defasada — o que gera
+// bloqueio e denúncia de spam contra os bots. Mantém só o que falhou nas
+// últimas 3h (lead ainda no contexto da conversa) e cancela o resto.
+//
+// O alvo é identificado pela assinatura do resgate: delay ANTIGO cujo
+// execute_at foi empurrado para muito depois da criação. Um delay legítimo de
+// funil executa perto de quando foi criado, então não é tocado.
+export async function pruneStaleRequeuedDelays(): Promise<void> {
+  const MARKER = "RUNNER_PRUNE_STALE_20260807";
+  try {
+    const inserted = await db.insert(platformConfig)
+      .values({ key: MARKER, value: new Date().toISOString() })
+      .onConflictDoNothing()
+      .returning({ key: platformConfig.key });
+    if (inserted.length === 0) return; // já rodou
+
+    const res = await db.execute(sql`
+      UPDATE scheduled_delays SET status = 'skipped'
+      WHERE status = 'pending'
+        AND created_at < now() - interval '3 hours'
+        AND execute_at > created_at + interval '2 hours'
+    `);
+    console.log(`[runner] poda da fila: ${res.rowCount ?? 0} delay(s) antigos (+3h) cancelados`);
+  } catch (err) {
+    console.error("[runner] poda da fila falhou:", err);
+  }
+}
+
 // Delays presos em "processing" (processo morto no meio — deploy, OOM) voltam
 // pra fila. Sem isso, o claim atômico os deixaria órfãos para sempre.
 async function recoverStuckProcessingDelays(): Promise<void> {
@@ -274,7 +304,9 @@ async function tickSlow(): Promise<void> {
 }
 
 // Aplica DDLs idempotentes pendentes antes do 1º tick (self-hosted não tem migrator).
-void ensureSchemaAtBoot().then(() => requeueIncidentFailedDelays());
+void ensureSchemaAtBoot()
+  .then(() => requeueIncidentFailedDelays())
+  .then(() => pruneStaleRequeuedDelays());
 
 setInterval(() => { void tickFast(); }, FAST_TICK_MS);
 setInterval(() => { void tickSlow(); }, SLOW_TICK_MS);
