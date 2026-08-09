@@ -94,6 +94,56 @@ describe("offer node — apresentação e compra", () => {
 });
 
 describe("handlePaidOffer — entrega e retomada", () => {
+  // Cenário do funil "Mica": o usuário liga a continuação pós-pagamento na
+  // saída GENÉRICA do nó de oferta (sem handle), não no handle __paid. Antes
+  // essa aresta era morta: entregava o "Pagamento confirmado" e o funil parava.
+  it("sem conexão __paid, retoma pela saída genérica (source_handle null)", async () => {
+    const { bot, funnelId, nodeIds } = await setupOffer({
+      // Sem callback → handle = product_name (como no funil exportado do usuário).
+      offer: { product_name: "Vem me ver pelada", price: 9.9, button_text: "Comprar", product_type: "content" },
+    });
+    // Conexão genérica off → paid (from/to sem handle).
+    const db = await testDb();
+    const { nodeConnections } = await import("../../shared/schema/index.js");
+    await db.insert(nodeConnections).values({
+      funnelId, sourceNodeId: nodeIds.off, sourceHandle: null, targetNodeId: nodeIds.paid,
+    });
+
+    await useCase.execute({ botId: bot.id, update: startUpdate(720) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(720, "offer:0") });
+
+    const [pay] = await db.select().from(payments);
+    expect(pay.paidHandle).toBe("Vem me ver pelada__paid");
+    await useCase.handlePaidOffer((await payRepo.findById(pay.id))!);
+
+    const msgs = getSentMessages();
+    expect(msgs.some((m) => m.includes("Pagamento confirmado"))).toBe(true);
+    expect(msgs).toContain("ACESSO-LIBERADO"); // continuou pela saída genérica
+  });
+
+  it("com __paid E saída genérica, o __paid tem prioridade", async () => {
+    const handle = "promo";
+    const { bot, funnelId, nodeIds } = await setupOffer({
+      offer: { product_name: "Curso", price: 50, callback: handle, button_text: "Comprar" },
+      extraConns: [{ from: "off", to: "paid", handle: `${handle}__paid` }],
+    });
+    const db = await testDb();
+    const { nodeConnections } = await import("../../shared/schema/index.js");
+    // Saída genérica apontando pro nó "errado" (noact) — não pode ser usada.
+    await db.insert(nodeConnections).values({
+      funnelId, sourceNodeId: nodeIds.off, sourceHandle: null, targetNodeId: nodeIds.noact,
+    });
+
+    await useCase.execute({ botId: bot.id, update: startUpdate(721) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(721, "offer:0") });
+    const [pay] = await db.select().from(payments);
+    await useCase.handlePaidOffer((await payRepo.findById(pay.id))!);
+
+    const msgs = getSentMessages();
+    expect(msgs).toContain("ACESSO-LIBERADO");      // seguiu o __paid
+    expect(msgs).not.toContain("NAO-CLICOU");       // ignorou a genérica
+  });
+
   it("entrega conteúdo e retoma pelo ramo __paid", async () => {
     const handle = "promo";
     const { bot } = await setupOffer({

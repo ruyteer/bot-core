@@ -4,6 +4,7 @@ import {
   createPix,
   normalizeSyncpayWebhook, normalizeBuckpayWebhook,
   normalizeNexuspagWebhook, normalizeWiinpayWebhook,
+  __resetSyncpayWebhookCacheForTests,
 } from "./application/gateway-clients.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
@@ -53,6 +54,37 @@ describe("createPix", () => {
       expect(r.provider).toBe(p);
     });
   }
+});
+
+// ── SyncPay: registro do webhook na conta ───────────────────────────────────
+// A SyncPay ignora o webhook_url do cash-in: sem POST /webhooks (evento cashin)
+// registrado na conta, a confirmação de venda nunca chega.
+describe("syncpay — registro automático do webhook cashin", () => {
+  it("primeiro PIX registra o webhook; o segundo usa o cache e não repete", async () => {
+    __resetSyncpayWebhookCacheForTests();
+    await createPix("syncpay", "client_a", "secret", 1990, "Produto", "https://core/payments/webhook/syncpay");
+
+    const posts = getOtherCalls().filter((c) =>
+      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "cashin");
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body).toMatchObject({
+      url: "https://core/payments/webhook/syncpay",
+      event: "cashin",
+      trigger_all_products: true,
+    });
+
+    await createPix("syncpay", "client_a", "secret", 500, "Outro", "https://core/payments/webhook/syncpay");
+    const postsAfter = getOtherCalls().filter((c) =>
+      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "cashin");
+    expect(postsAfter).toHaveLength(1); // cache — não registra de novo
+  });
+
+  it("falha no registro não bloqueia a geração do PIX", async () => {
+    __resetSyncpayWebhookCacheForTests();
+    forceGatewayError("/api/partner/v1/webhooks");
+    const r = await createPix("syncpay", "client_b", "secret", 1990, "Produto", "https://wh");
+    expect(r.pixCode).toBeTruthy(); // PIX sai mesmo com webhook não registrado
+  });
 });
 
 // ── Split de monetização (40c da plataforma) ────────────────────────────────

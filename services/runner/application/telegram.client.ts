@@ -32,6 +32,27 @@ export interface AnswerCallbackOptions {
   text?: string;
 }
 
+// Erro da API do Telegram com o código e a descrição REAIS. O erro genérico
+// ("Telegram sendPhoto failed") escondeu um incidente inteiro de 429 em
+// produção — sem o código, rate limit e bot bloqueado eram indistinguíveis.
+export class TelegramApiError extends Error {
+  constructor(
+    method: string,
+    public readonly errorCode?: number,
+    description?: string,
+    public readonly retryAfter?: number,
+  ) {
+    super(
+      `Telegram ${method} failed` +
+      (errorCode ? ` [${errorCode}]` : "") +
+      (description ? `: ${description}` : "") +
+      (retryAfter ? ` (retry_after=${retryAfter}s)` : ""),
+    );
+    this.name = "TelegramApiError";
+  }
+  get isRateLimit(): boolean { return this.errorCode === 429; }
+}
+
 // Tipos de mídia cacheáveis e como extrair o file_id da resposta do Telegram.
 type MediaKind = "photo" | "video" | "document" | "audio" | "voice";
 
@@ -109,7 +130,10 @@ export class TelegramClient {
       try {
         await this.call(method, { ...body, [field]: cached });
         return;
-      } catch {
+      } catch (err) {
+        // 429 não é file_id inválido: repetir com a URL só dobraria a carga
+        // no rate limit. Propaga para o chamador reagendar.
+        if (err instanceof TelegramApiError && err.isRateLimit) throw err;
         await this.invalidateFileId(kind, url);
       }
     }
@@ -130,8 +154,14 @@ export class TelegramClient {
         body:    JSON.stringify(body),
         signal:  controller.signal,
       });
-      const json = await res.json() as { ok: boolean; result?: unknown };
-      if (!json.ok) throw new Error(`Telegram ${method} failed`);
+      const json = await res.json() as {
+        ok: boolean; result?: unknown;
+        error_code?: number; description?: string;
+        parameters?: { retry_after?: number };
+      };
+      if (!json.ok) {
+        throw new TelegramApiError(method, json.error_code, json.description, json.parameters?.retry_after);
+      }
       return json.result;
     } finally {
       clearTimeout(timer);
