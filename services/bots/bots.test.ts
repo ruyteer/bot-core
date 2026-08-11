@@ -30,6 +30,40 @@ describe("CreateBotUseCase", () => {
     const db = await testDb();
     expect((await db.select().from(bots)).length).toBe(0);
   });
+
+  // O bug relatado: "sempre que cadastro um bot novo tenho que clicar em
+  // reconectar". O registro do webhook era orquestrado pelo cliente, e a tela
+  // "Meus Bots" não fazia essa chamada — o bot nascia sem webhook e, como
+  // `is_active` tem default `true` no schema, aparecia ativo mesmo assim.
+  it("criar o bot registra o webhook no Telegram, sem depender do cliente", async () => {
+    const userId = await createProfile();
+    const bot = await new CreateBotUseCase(repo).execute({ userId, name: "Bot", telegramToken: "111:ABC" });
+
+    const call = getTelegramCalls("setWebhook")[0];
+    expect(call).toBeDefined();
+    expect(call.body.url).toBe(`https://test.orionbot.local/webhook/${bot.id}`);
+    expect(call.body.allowed_updates as string[]).toContain("my_chat_member");
+
+    const db = await testDb();
+    const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(row.isActive).toBe(true);
+    // O secret enviado ao Telegram tem que ser o gravado, senão o handler
+    // rejeita todo update com 401.
+    expect(call.body.secret_token).toBe(row.webhookSecret);
+  });
+
+  it("setWebhook falhando não desfaz o bot, mas ele NÃO fica ativo", async () => {
+    // `is_active` deixa de ser um default otimista e passa a dizer a verdade:
+    // sem isto o bot aparecia ativo e simplesmente não recebia nada.
+    const userId = await createProfile();
+    forceTelegramError("setWebhook");
+    const bot = await new CreateBotUseCase(repo).execute({ userId, name: "Bot", telegramToken: "111:ABC" });
+
+    const db = await testDb();
+    const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(row.isActive).toBe(false);
+    expect(row.telegramUsername).toBe("testbot"); // o bot existe e é utilizável
+  });
 });
 
 describe("RegisterWebhookUseCase", () => {
