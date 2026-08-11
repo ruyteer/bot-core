@@ -10,7 +10,7 @@ import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repos
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { processWebhookEvent } from "./webhooks.js";
 import { testDb } from "../../test/helpers/db.js";
-import { payments, processedWebhooks } from "../shared/schema/index.js";
+import { payments, processedWebhooks, paymentWebhookLogs } from "../shared/schema/index.js";
 import { createBot, createGateway, createLead, createProfile } from "../../test/helpers/seed.js";
 import { userRoles } from "../shared/schema/index.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
@@ -268,6 +268,34 @@ describe("processWebhookEvent", () => {
     await expect(processWebhookEvent({ externalId: "nao-existe", provider: "buckpay", status: "paid", amount: 1, event: "paid" }, {})).resolves.toBeUndefined();
     const db = await testDb();
     expect((await db.select().from(processedWebhooks).where(eq(processedWebhooks.externalId, "nao-existe"))).length).toBe(1);
+  });
+
+  // Investigar "venda não confirmou" começa por olhar o que o provedor mandou.
+  // Enquanto o payload não reconhecido saía por um `return` mudo, "o provedor
+  // nunca chamou" e "chamou e não entendemos" eram indistinguíveis.
+  it("payload sem id reconhecível é registrado com o motivo, não descartado", async () => {
+    const cru = { evento: "cobranca.paga", transacao: { referencia: "abc" } };
+    await processWebhookEvent(
+      { externalId: "", provider: "nexuspag", status: "pending", amount: null, event: "cobranca.paga" },
+      cru,
+    );
+    const db = await testDb();
+    const [log] = await db.select().from(paymentWebhookLogs)
+      .where(eq(paymentWebhookLogs.provider, "nexuspag"));
+    expect(log).toBeDefined();
+    expect(log.payload).toEqual(cru);          // o corpo real fica disponível
+    expect(log.errorMessage).toContain("sem identificador");
+  });
+
+  it("id extraído mas sem pagamento correspondente registra o motivo", async () => {
+    await processWebhookEvent(
+      { externalId: "id-de-outro-lugar", provider: "nexuspag", status: "paid", amount: 100, event: "paid" },
+      { id: "id-de-outro-lugar" },
+    );
+    const db = await testDb();
+    const [log] = await db.select().from(paymentWebhookLogs)
+      .where(eq(paymentWebhookLogs.externalId, "id-de-outro-lugar"));
+    expect(log.errorMessage).toContain("não corresponde a nenhum pagamento");
   });
 });
 
