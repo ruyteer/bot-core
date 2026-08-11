@@ -1,6 +1,6 @@
 import { APIError } from "encore.dev/api";
-import { encoreExternalUrl } from "../../../config/secrets.js";
 import type { BotRepository } from "../../domain/bot.repository.js";
+import { setTelegramWebhook } from "../telegram-webhook.js";
 
 export class RegisterWebhookUseCase {
   constructor(private readonly repo: BotRepository) {}
@@ -10,26 +10,16 @@ export class RegisterWebhookUseCase {
     if (!bot) throw APIError.notFound("bot not found");
     if (bot.userId !== userId) throw APIError.permissionDenied("access denied");
 
-    const baseUrl = encoreExternalUrl();
-    if (!baseUrl) throw APIError.internal("ENCORE_EXTERNAL_URL not configured");
+    const result = await setTelegramWebhook({
+      botId,
+      telegramToken: bot.telegramToken,
+      webhookSecret: bot.webhookSecret,
+    });
 
-    const webhookUrl = `${baseUrl}/webhook/${botId}`;
-    const res = await fetch(
-      `https://api.telegram.org/bot${bot.telegramToken}/setWebhook`,
-      {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url:          webhookUrl,
-          secret_token: bot.webhookSecret,
-          allowed_updates: ["message", "callback_query", "my_chat_member"],
-        }),
-      },
-    );
-
-    const json = (await res.json()) as { ok: boolean; description?: string };
-    if (!json.ok) {
-      throw APIError.internal(`Telegram setWebhook failed: ${json.description ?? "unknown"}`);
+    // Reativação manual falha alto: quem clicou em "Reconectar" precisa ver o
+    // motivo. (Na criação do bot a mesma falha é tolerada — ver CreateBotUseCase.)
+    if (!result.ok) {
+      throw APIError.internal(`Telegram setWebhook failed: ${result.reason}`);
     }
 
     await this.repo.update(botId, userId, { isActive: true });

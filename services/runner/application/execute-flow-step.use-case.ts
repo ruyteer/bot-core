@@ -1,8 +1,8 @@
-import { eq, and, ne, desc, sql, isNull } from "drizzle-orm";
+import { eq, and, ne, or, desc, sql, isNull, inArray } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
-  funnels, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
+  funnels, funnelBots, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
   funnelOffers, leadEvents,
 } from "../../shared/schema/index.js";
 import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
@@ -24,6 +24,30 @@ import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
 const simplifiedUseCase = new ExecuteSimplifiedFunnelUseCase();
+
+/**
+ * "Este funil pertence a este bot?" — pelas DUAS vias que o produto oferece.
+ *
+ * `funnels.bot_id` é o bot primário, gravado na criação. Mas a UI permite
+ * vincular até 5 bots a um funil, e esse vínculo vive só na tabela
+ * `funnel_bots`: `assignBots()` reescreve `funnel_bots` e **nunca toca**
+ * `funnels.bot_id`.
+ *
+ * Enquanto este predicado olhava só a coluna, todo bot vinculado como
+ * secundário era invisível para o runner — o funil existia, aparecia ativo na
+ * interface e simplesmente não respondia. O sintoma relatado ("só funciona se
+ * ficar reativando") é essa incoerência: reativar o funil pelo bot primário
+ * funciona, pelos outros não, e a diferença não aparece em lugar nenhum.
+ */
+function belongsToBot(botId: string) {
+  return or(
+    eq(funnels.botId, botId),
+    inArray(
+      funnels.id,
+      db.select({ id: funnelBots.funnelId }).from(funnelBots).where(eq(funnelBots.botId, botId)),
+    ),
+  );
+}
 
 // Handle de uma oferta dentro de um nó `offer`. O frontend usa exatamente
 // `offer.callback || offer.product_name || offer_<i>` como id dos conectores
@@ -301,7 +325,7 @@ export class ExecuteFlowStepUseCase {
 
     // ── Funil SIMPLIFICADO tem precedência (interpretador linear, stateless) ──
     const [simplifiedFunnel] = await db.select().from(funnels)
-      .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true), eq(funnels.kind, "simplified")))
+      .where(and(belongsToBot(botId), eq(funnels.isActive, true), eq(funnels.kind, "simplified")))
       .orderBy(desc(funnels.updatedAt))
       .limit(1);
     if (simplifiedFunnel) {
@@ -324,7 +348,7 @@ export class ExecuteFlowStepUseCase {
       // orderBy + limit p/ ser determinístico quando há mais de um ativo.
       const [activeFunnel] = await db.select().from(funnels)
         .where(and(
-          eq(funnels.botId, botId),
+          belongsToBot(botId),
           eq(funnels.isActive, true),
           ne(funnels.kind, "simplified"),
         ))
