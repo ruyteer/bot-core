@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, and, inArray, ne } from "drizzle-orm";
+import { eq, and, inArray, ne, or, desc } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   funnels, funnelBots, funnelNodes, nodeConnections, bots,
@@ -169,12 +169,34 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     const [row] = await db.select({ botId: funnels.botId }).from(funnels)
       .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
     if (!row) throw new Error("funnel not found");
-    if (row.botId) {
-      // Deactivate all other funnels for this bot first
+
+    // "Um funil ativo por bot" precisa valer para TODOS os bots deste funil,
+    // não só para o primário. Enquanto olhava apenas `funnels.bot_id`, ativar
+    // um funil vinculado por `funnel_bots` não desativava o concorrente — os
+    // dois ficavam ativos para o mesmo bot e quem respondia dependia da ordem
+    // que o banco devolvesse. É a outra metade do "só funciona reativando".
+    const linked = await db.select({ botId: funnelBots.botId }).from(funnelBots)
+      .where(eq(funnelBots.funnelId, id));
+    const botIds = [...new Set([row.botId, ...linked.map((l) => l.botId)].filter(
+      (b): b is string => typeof b === "string" && b.length > 0,
+    ))];
+
+    if (botIds.length > 0) {
       await db.update(funnels)
         .set({ isActive: false, updatedAt: new Date() })
-        .where(and(eq(funnels.botId, row.botId), ne(funnels.id, id)));
+        .where(and(
+          ne(funnels.id, id),
+          or(
+            inArray(funnels.botId, botIds),
+            inArray(
+              funnels.id,
+              db.select({ id: funnelBots.funnelId }).from(funnelBots)
+                .where(inArray(funnelBots.botId, botIds)),
+            ),
+          ),
+        ));
     }
+
     await db.update(funnels).set({ isActive: true, updatedAt: new Date() })
       .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
   }
@@ -248,8 +270,24 @@ export class FunnelDrizzleRepository implements FunnelRepository {
   }
 
   async findActiveFunnelByBotId(botId: string): Promise<FunnelDetail | null> {
+    // Mesmo predicado do runner: o vínculo funil↔bot existe em duas vias, e
+    // `assignBots()` só escreve na tabela `funnel_bots`. Ver `belongsToBot`
+    // em execute-flow-step.use-case.ts.
     const [row] = await db.select().from(funnels)
-      .where(and(eq(funnels.botId, botId), eq(funnels.isActive, true)));
+      .where(and(
+        or(
+          eq(funnels.botId, botId),
+          inArray(
+            funnels.id,
+            db.select({ id: funnelBots.funnelId }).from(funnelBots).where(eq(funnelBots.botId, botId)),
+          ),
+        ),
+        eq(funnels.isActive, true),
+      ))
+      // Sem ordem explícita, "qual funil ativo vence" era o que o Postgres
+      // devolvesse primeiro — não-determinístico entre execuções.
+      .orderBy(desc(funnels.updatedAt))
+      .limit(1);
     if (!row) return null;
     return this.toDetail(this.toFunnel(row));
   }

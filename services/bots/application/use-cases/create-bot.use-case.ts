@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { encrypt } from "../../../shared/crypto.js";
 import type { Bot, CreateBotInput } from "../../domain/bot.entity.js";
 import type { BotRepository } from "../../domain/bot.repository.js";
+import { setTelegramWebhook } from "../telegram-webhook.js";
 
 interface TelegramGetMeResponse {
   ok:     boolean;
@@ -31,12 +32,27 @@ export class CreateBotUseCase {
       encryptedToken,
     });
 
-    // Sync username from Telegram
-    if (data.result?.username) {
-      return this.repo.update(bot.id, input.userId, {
-        telegramUsername: data.result.username,
-      });
-    }
-    return bot;
+    // Registrar o webhook aqui, e não no cliente.
+    //
+    // Antes isto era responsabilidade da UI: `BotSelector` chamava
+    // `activateWebhook` logo após criar, e `MeusBots` não chamava — então um
+    // bot criado pela tela "Meus Bots" nascia sem webhook, anunciava "Bot
+    // criado e ativado!" e só recebia updates depois que alguém clicasse em
+    // "Reconectar". Orquestração que todo cliente precisa lembrar de repetir é
+    // orquestração que um cliente vai esquecer.
+    //
+    // `is_active` tem default `true` no schema, o que deixava o bot quebrado
+    // aparecendo como ativo. Aqui ele passa a refletir a realidade: só fica
+    // ativo se o Telegram aceitou o webhook.
+    const webhook = await setTelegramWebhook({
+      botId:         bot.id,
+      telegramToken: input.telegramToken,
+      webhookSecret,
+    });
+
+    const patch: { telegramUsername?: string; isActive: boolean } = { isActive: webhook.ok };
+    if (data.result?.username) patch.telegramUsername = data.result.username;
+
+    return this.repo.update(bot.id, input.userId, patch);
   }
 }
