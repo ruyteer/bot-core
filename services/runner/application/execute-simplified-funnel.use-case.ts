@@ -8,7 +8,7 @@ import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
-import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import type { SimplifiedPaymentCtx, SimplifiedDeliveryItem, Payment } from "../../payments/domain/payment.entity.js";
 
@@ -19,6 +19,19 @@ const payRepo = new PaymentDrizzleRepository();
 
 function fmtBRL(centavos: number): string {
   return Number(centavos || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+// `sale_type` derivado do contexto do PIX do funil simplificado.
+// LIMITAÇÃO CONHECIDA: order bump não vira uma linha própria em `payments` — o
+// valor do bump é somado ao PIX do plano (um pagamento só). Por isso um plano
+// com bump é gravado como "offer" (o item principal) e o card "Order bumps"
+// permanece zerado enquanto o simplificado não separar as cobranças.
+function saleTypeFromCtx(kind: SimplifiedPaymentCtx["kind"]): SaleType {
+  switch (kind) {
+    case "upsell":   return "upsell";
+    case "downsell": return "downsell";
+    default:         return "offer";
+  }
 }
 
 function replacePixVariables(text: string, vars: { nome?: string; valor?: string; produto?: string; descricao?: string; mensagem?: string }): string {
@@ -418,6 +431,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       offerExternalRef: refKey,
       amount:           amountCents,
       status:           "pending",
+      saleType:         saleTypeFromCtx(ctx.kind),
       externalId:       pix.externalId,
       pixCode:          pix.pixCode,
       description:      productName,

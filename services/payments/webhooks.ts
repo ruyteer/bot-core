@@ -4,11 +4,18 @@ import { paymentPaid } from "../shared/events/index.js";
 import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
 import { accrueReferralCommission } from "../referrals/application/accrue-commission.js";
 import { enqueuePixelEvents } from "../bots/application/pixel-events.js";
+import { db } from "../shared/database.js";
+import { paymentRevenueCredits } from "../shared/schema/index.js";
+import { isPlatformAdmin } from "../shared/roles.js";
+import type { Provider } from "./domain/gateway.entity.js";
+import type { Payment } from "./domain/payment.entity.js";
 import {
   normalizeSyncpayWebhook,
   normalizeBuckpayWebhook,
   normalizeNexuspagWebhook,
   normalizeWiinpayWebhook,
+  platformSplitCents,
+  splitConfiguredFor,
   type NormalizedWebhookEvent,
 } from "./application/gateway-clients.js";
 
@@ -18,6 +25,36 @@ function formatBRL(cents: number): string {
 }
 
 const payRepo = new PaymentDrizzleRepository();
+
+// ── Receita da plataforma (payment_revenue_credits) ───────────────────────────
+// O split é aplicado NO PROVEDOR na criação do PIX (createPix) e nunca voltava
+// pra cá — `payment_revenue_credits` ficava vazia e o card "Taxas" do admin
+// mostrava R$ 0,00 pra sempre. Aqui reconstruímos o mesmo valor que o split
+// carregou, na confirmação do pagamento, usando a mesma fonte da verdade de
+// `application/gateway-clients.ts` (splitConfiguredFor/platformSplitCents).
+
+// Lança o crédito de receita da plataforma. Idempotente pela PK composta
+// (payment_id, user_id) — o webhook pode ser reentregue. Nunca derruba a
+// confirmação da venda.
+async function creditPlatformRevenue(payment: Payment, provider: Provider): Promise<void> {
+  try {
+    // Admin da plataforma gera PIX sem split (createPixWithFallback -> skipSplit),
+    // então não há taxa nenhuma a creditar.
+    if (await isPlatformAdmin(payment.userId)) return;
+    if (!splitConfiguredFor(provider)) return;
+    // Base = o mesmo amountCents passado ao createPix na criação da cobrança.
+    const fee = platformSplitCents(provider, payment.amount);
+    if (fee <= 0) return;
+    await db.insert(paymentRevenueCredits).values({
+      paymentId: payment.id,
+      userId:    payment.userId,
+      amount:    fee,
+      provider,
+    }).onConflictDoNothing();
+  } catch (err) {
+    console.error("[payments] falha ao creditar receita da plataforma:", err);
+  }
+}
 
 // ── Shared handler ────────────────────────────────────────────────────────────
 
@@ -64,6 +101,11 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
   if (payment) {
     if (event.status === "paid") {
       await payRepo.markPaid(payment.id, event.amount ?? undefined);
+
+      // Receita da plataforma (card "Taxas" do admin): persiste o valor que o
+      // split reteve nesta transação. Idempotente; trata os próprios erros.
+      await creditPlatformRevenue(payment, event.provider);
+
       // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
       await paymentPaid.publish({ paymentId: payment.id });
 

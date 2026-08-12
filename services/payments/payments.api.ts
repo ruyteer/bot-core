@@ -5,6 +5,9 @@ import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repos
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { createPix } from "./application/gateway-clients.js";
 import { isPlatformAdmin } from "../shared/roles.js";
+import { db } from "../shared/database.js";
+import { leads } from "../shared/schema/index.js";
+import { inArray } from "drizzle-orm";
 import type { Provider } from "./domain/gateway.entity.js";
 import type { PaymentWithMeta } from "./domain/payment.entity.js";
 
@@ -39,9 +42,57 @@ interface PaymentResponse {
   provider:         string | null;
   gatewayLabel:     string | null;
   externalId:       string | null;
+  // Atribuição do lead que gerou a venda. Antes o painel inferia "receita de
+  // anúncios" pela presença de @username e "campanha" pelo nome do produto —
+  // os dados reais já existiam na tabela `leads` e não eram expostos.
+  leadUtmSource:    string | null;
+  leadUtmMedium:    string | null;
+  leadUtmCampaign:  string | null;
+  leadUtmContent:   string | null;
+  leadUtmTerm:      string | null;
+  leadFbclid:       string | null;
+  leadTtclid:       string | null;
 }
 
-function toPaymentResponse(p: PaymentWithMeta): PaymentResponse {
+interface LeadAttribution {
+  utmSource:   string | null;
+  utmMedium:   string | null;
+  utmCampaign: string | null;
+  utmContent:  string | null;
+  utmTerm:     string | null;
+  fbclid:      string | null;
+  ttclid:      string | null;
+}
+
+// Uma linha por lead, casada por id → 1:1 com o pagamento, sem inflar nada.
+async function loadLeadAttribution(leadIds: string[]): Promise<Map<string, LeadAttribution>> {
+  const map = new Map<string, LeadAttribution>();
+  if (leadIds.length === 0) return map;
+  const rows = await db.select({
+    id:          leads.id,
+    utmSource:   leads.utmSource,
+    utmMedium:   leads.utmMedium,
+    utmCampaign: leads.utmCampaign,
+    utmContent:  leads.utmContent,
+    utmTerm:     leads.utmTerm,
+    fbclid:      leads.fbclid,
+    ttclid:      leads.ttclid,
+  }).from(leads).where(inArray(leads.id, leadIds));
+  for (const r of rows) {
+    map.set(r.id, {
+      utmSource:   r.utmSource   ?? null,
+      utmMedium:   r.utmMedium   ?? null,
+      utmCampaign: r.utmCampaign ?? null,
+      utmContent:  r.utmContent  ?? null,
+      utmTerm:     r.utmTerm     ?? null,
+      fbclid:      r.fbclid      ?? null,
+      ttclid:      r.ttclid      ?? null,
+    });
+  }
+  return map;
+}
+
+function toPaymentResponse(p: PaymentWithMeta, attr?: LeadAttribution): PaymentResponse {
   return {
     id:           p.id,
     createdAt:    p.createdAt.toISOString(),
@@ -61,6 +112,13 @@ function toPaymentResponse(p: PaymentWithMeta): PaymentResponse {
     provider:     p.provider,
     gatewayLabel: p.gatewayLabel,
     externalId:   p.externalId,
+    leadUtmSource:   attr?.utmSource   ?? null,
+    leadUtmMedium:   attr?.utmMedium   ?? null,
+    leadUtmCampaign: attr?.utmCampaign ?? null,
+    leadUtmContent:  attr?.utmContent  ?? null,
+    leadUtmTerm:     attr?.utmTerm     ?? null,
+    leadFbclid:      attr?.fbclid      ?? null,
+    leadTtclid:      attr?.ttclid      ?? null,
   };
 }
 
@@ -197,10 +255,15 @@ export const listPayments = api(
   { method: "GET", path: "/payments", expose: true, auth: true },
   async ({ botId, start, end }: { botId?: string; start?: string; end?: string }): Promise<{ payments: PaymentResponse[] }> => {
     const { userID: userId } = getAuthData()!;
-    const botIds = botId ? [botId] : await payRepo.getUserBotIds(userId);
+    // O botId vem do query param: sem checar posse, qualquer usuário autenticado
+    // lia os pagamentos de um bot alheio passando o uuid dele.
+    const userBotIds = await payRepo.getUserBotIds(userId);
+    if (botId && !userBotIds.includes(botId)) throw APIError.notFound("bot not found");
+    const botIds = botId ? [botId] : userBotIds;
     const startDate = start ? new Date(start) : undefined;
     const endDate   = end   ? new Date(end)   : undefined;
     const result    = await payRepo.findByBotIds(botIds, startDate, endDate);
-    return { payments: result.map(toPaymentResponse) };
+    const attrByLead = await loadLeadAttribution([...new Set(result.map((p) => p.leadId).filter((v): v is string => !!v))]);
+    return { payments: result.map((p) => toPaymentResponse(p, p.leadId ? attrByLead.get(p.leadId) : undefined)) };
   },
 );

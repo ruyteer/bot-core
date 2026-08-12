@@ -1,4 +1,4 @@
-import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
+import { eq, and, inArray, sql, gte, lte, asc, desc } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import { leads, leadProgress, leadMessages, funnels, funnelNodes, payments, bots, leadEvents } from "../../shared/schema/index.js";
 import type { LeadRepository } from "../domain/lead.repository.js";
@@ -27,7 +27,10 @@ export class LeadDrizzleRepository implements LeadRepository {
     const conditions = [inArray(leads.botId, botIds)];
     if (startDate) conditions.push(gte(leads.createdAt, startDate));
     if (endDate)   conditions.push(lte(leads.createdAt, endDate));
-    const rows = await db.select().from(leads).where(and(...conditions));
+    // Sem ORDER BY o Postgres devolve em ordem arbitrária, e a dashboard corta
+    // com slice(0,5) para montar "Leads recentes" — que então não eram os recentes.
+    const rows = await db.select().from(leads).where(and(...conditions))
+      .orderBy(desc(leads.createdAt));
     if (rows.length === 0) return [];
 
     const leadIds = rows.map((r) => r.id);
@@ -75,7 +78,10 @@ export class LeadDrizzleRepository implements LeadRepository {
     const paymentRows = await db
       .select({ leadId: payments.leadId, createdAt: payments.createdAt })
       .from(payments)
-      .where(and(inArray(payments.leadId, leadIds), sql`${payments.status} IN ('paid','approved')`));
+      .where(and(inArray(payments.leadId, leadIds), sql`${payments.status} IN ('paid','approved')`))
+      // O loop abaixo guarda a PRIMEIRA linha vista por lead; sem ordenar, essa
+      // linha era arbitrária e o "tempo até conversão" saía errado.
+      .orderBy(asc(payments.createdAt));
     const firstPayMap = new Map<string, Date>();
     for (const p of paymentRows) {
       if (p.leadId && !firstPayMap.has(p.leadId)) firstPayMap.set(p.leadId, p.createdAt);
