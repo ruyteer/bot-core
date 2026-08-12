@@ -22,7 +22,23 @@ const payRepo = new PaymentDrizzleRepository();
 // ── Shared handler ────────────────────────────────────────────────────────────
 
 export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<void> {
-  if (!event.externalId) return;
+  // Um `return` mudo aqui era o pior lugar possível para não deixar rastro: é
+  // exatamente o caso em que o payload do provedor não bate com o que o
+  // normalizador espera, e o único jeito de descobrir a forma real é vendo o
+  // corpo que ele mandou. Sem log, "o provedor nunca chamou" e "chamou e não
+  // entendemos" ficam indistinguíveis — e é a primeira pergunta de qualquer
+  // investigação de venda não confirmada. Registra e só então desiste.
+  if (!event.externalId) {
+    await payRepo.logWebhook({
+      provider:     event.provider,
+      event:        event.event,
+      payload:      rawPayload,
+      status:       event.status,
+      sourceIp,
+      errorMessage: "sem identificador: o normalizador não achou o id da transação neste payload",
+    });
+    return;
+  }
 
   // Idempotency — skip if already processed with same status
   const already = await payRepo.isProcessed(event.externalId, event.provider);
@@ -38,6 +54,11 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
     status:            event.status,
     sourceIp,
     matchedPaymentId:  payment?.id,
+    // Id extraído mas sem pagamento correspondente: quase sempre significa que
+    // gravamos um id na criação e o provedor devolve outro no webhook.
+    ...(payment ? {} : {
+      errorMessage: `id "${event.externalId}" não corresponde a nenhum pagamento de ${event.provider}`,
+    }),
   });
 
   if (payment) {

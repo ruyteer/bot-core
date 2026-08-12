@@ -182,6 +182,8 @@ export class PaymentDrizzleRepository {
     status?:   string;
     sourceIp?: string;
     matchedPaymentId?: string;
+    /** Por que este webhook não virou confirmação de venda. */
+    errorMessage?: string;
   }): Promise<void> {
     await db.insert(paymentWebhookLogs).values({
       provider:         data.provider,
@@ -191,6 +193,7 @@ export class PaymentDrizzleRepository {
       status:           data.status,
       sourceIp:         data.sourceIp,
       matchedPaymentId: data.matchedPaymentId,
+      errorMessage:     data.errorMessage,
     });
   }
 }
