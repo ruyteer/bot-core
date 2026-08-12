@@ -18,6 +18,19 @@ export function urlButtonMarkup(text: string, url: string): { inline_keyboard: A
   return { inline_keyboard: [[{ text, url }]] };
 }
 
+// Botão inline "copiar código PIX" usando `copy_text` do teclado inline — o
+// mecanismo de cópia do próprio app do Telegram, que funciona em todos os
+// clientes recentes. Substituiu o bloco `<pre><code>` (tap-to-copy), que não
+// aparecia/funcionava em vários celulares. Sempre anexado a QUALQUER PIX.
+export const PIX_COPY_BUTTON_LABEL = "📋 Copiar código PIX";
+
+export function pixCopyButtonMarkup(
+  pixCode: string,
+  label?: string,
+): { inline_keyboard: Array<Array<{ text: string; copy_text: { text: string } }>> } {
+  return { inline_keyboard: [[{ text: label || PIX_COPY_BUTTON_LABEL, copy_text: { text: pixCode } }]] };
+}
+
 export interface SendPhotoOptions {
   chatId:   string;
   photo:    string;   // URL or file_id
