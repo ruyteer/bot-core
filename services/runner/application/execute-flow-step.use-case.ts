@@ -13,7 +13,7 @@ import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/eve
 // puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
 // importáveis aqui sem cruzar a fronteira de serviço.
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
-import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
@@ -83,6 +83,19 @@ function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Rec
     });
   }
   return out;
+}
+
+// `sale_type` de uma compra no flow. O tipo vive no NÓ (`content.offer_kind`,
+// gravado pelo FunnelEditor: "upsell" | "downsell"; ausente/"main" = oferta
+// principal). Ofertas embutidas num nó `message` não têm kind → "offer".
+function saleTypeFromNodeContent(content: Record<string, unknown> | null | undefined): SaleType {
+  const kind = typeof content?.offer_kind === "string" ? content.offer_kind : "main";
+  switch (kind) {
+    case "upsell":     return "upsell";
+    case "downsell":   return "downsell";
+    case "order_bump": return "order_bump";
+    default:           return "offer";
+  }
 }
 
 interface ExecutionContext {
@@ -1034,6 +1047,7 @@ export class ExecuteFlowStepUseCase {
       offerName:   productName,
       amount,
       status:      "pending",
+      saleType:    saleTypeFromNodeContent(node.content as Record<string, unknown> | null),
       externalId:  pix.externalId,
       pixCode:     pix.pixCode,
       description: productName,

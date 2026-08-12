@@ -37,6 +37,13 @@ function splitReceiverFor(provider: Provider): string | null {
   }
 }
 
+// Fonte da verdade para "o split está configurado pra esse provider?" — usada
+// tanto na criação do PIX (createPix) quanto na reconstrução do crédito de
+// receita da plataforma no webhook (creditPlatformRevenue).
+export function splitConfiguredFor(provider: Provider): boolean {
+  return splitReceiverFor(provider) !== null;
+}
+
 // SyncPay só aceita split em PERCENTUAL INTEIRO. Escolhe o menor % cujo valor
 // atinja ou passe os 40c (min 1%, cap 99%). Em ticket > R$40, 1% já passa de 40c
 // — limitação da SyncPay, aceita (o valor fixo exato só existe em wiinpay/nexuspag).
@@ -51,6 +58,25 @@ function syncpaySplitPercentage(amountCents: number): number {
 function buckpaySplitBps(amountCents: number): number {
   const bps = Math.ceil((PLATFORM_SPLIT_CENTS / amountCents) * 10000);
   return Math.max(1, Math.min(9000, bps));
+}
+
+// Fonte da verdade para "quanto a plataforma efetivamente retém, em centavos,
+// nesse provider, pra esse valor bruto" — reusa os MESMOS helpers usados pra
+// montar o split enviado ao gateway (syncpaySplitPercentage/buckpaySplitBps/
+// PLATFORM_SPLIT_CENTS), pra nunca divergir do que é de fato enviado.
+// SyncPay/BuckPay enviam percentual/bps (não um valor fixo em centavos), então
+// aqui reconstruímos o valor retido aplicando esse percentual/bps de volta
+// sobre o amountCents. NexusPag/WiinPay enviam um valor fixo em reais.
+export function platformSplitCents(provider: Provider, amountCents: number): number {
+  if (amountCents <= 0) return 0;
+  switch (provider) {
+    case "syncpay":
+      return Math.round((amountCents * syncpaySplitPercentage(amountCents)) / 100);
+    case "buckpay":
+      return Math.round((amountCents * buckpaySplitBps(amountCents)) / 10000);
+    default:
+      return Math.min(PLATFORM_SPLIT_CENTS, amountCents);
+  }
 }
 
 // ── SyncPay ───────────────────────────────────────────────────────────────────

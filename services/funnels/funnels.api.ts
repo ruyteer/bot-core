@@ -5,6 +5,7 @@ import { FunnelDrizzleRepository } from "./infrastructure/funnel.drizzle.reposit
 import type { FunnelWithBots, FunnelDetail, SaveFlowInput } from "./domain/funnel.entity.js";
 import { db } from "../shared/database.js";
 import { funnelOffers, leadProgress, payments, funnelNodes, bots } from "../shared/schema/index.js";
+import type { SQL } from "drizzle-orm";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
 const repo = new FunnelDrizzleRepository();
@@ -175,42 +176,191 @@ export const duplicate = api(
   },
 );
 
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
+interface FunnelNodeStat {
+  nodeId:   string;
+  nodeType: string;
+  label:    string;
+  count:    number;
+}
+
+interface FunnelStatsResponse {
+  funnelName: string;
+  funnelKind: string;
+
+  /**
+   * Leads ATUALMENTE atribuídos a este funil. NÃO é histórico: `lead_progress`
+   * guarda uma linha por lead e o runner faz UPDATE do `funnel_id` quando o lead
+   * entra em outro funil. O rótulo correto na UI é "Leads no funil".
+   */
+  leadsInFunnel:   number;
+  /** @deprecated alias de `leadsInFunnel`, mantido para não quebrar clients antigos. */
+  totalLeads:      number;
+  activeLeads:     number;
+  completedLeads:  number;
+  /** leadsInFunnel − activeLeads − completedLeads (nunca negativo). */
+  abandonedLeads:  number;
+  /** Leads distintos com ao menos 1 pagamento aprovado neste funil. */
+  payingLeads:     number;
+
+  /** Receita aprovada em CENTAVOS (mesma unidade de `payments.amount` / "Minhas Vendas"). */
+  revenue: number;
+  /** Nº de pagamentos aprovados (não de leads). */
+  sales:   number;
+
+  /** Média (1ª compra − criação do lead) em MILISSEGUNDOS. null se ninguém comprou. */
+  avgTimeToPurchaseMs: number | null;
+
+  nodeStats: FunnelNodeStat[];
+
+  // ── Metadados de honestidade das métricas (para a UI rotular certo) ──
+  /** Origem da contagem de leads: "lead_progress" | "payments+simplified_scheduled_tasks". */
+  leadsSource:             string;
+  /** true = a contagem de leads é um subconjunto (não cobre todos que entraram). */
+  leadsArePartial:         boolean;
+  /** false = não há estado de "em andamento" persistido; `activeLeads` vem 0. */
+  activeLeadsTracked:      boolean;
+  /** true = a base do tempo é `leads.created_at` (1º contato com o bot), não a entrada no funil. */
+  avgTimeToPurchaseApprox: boolean;
+  /** Avisos legíveis (pt-BR) sobre limitações dos números acima. */
+  notes:                   string[];
+}
+
+// drizzle/node-postgres db.execute() devolve QueryResult<T> — extrai as linhas.
+async function execRows<T>(query: SQL): Promise<T[]> {
+  const result = await db.execute(query);
+  return result.rows as T[];
+}
+
+/**
+ * Receita/vendas do funil.
+ *
+ * Fonte = `payments.funnel_id` (preenchido pelos DOIS motores: `execute-flow-step`
+ * e `execute-simplified-funnel`). A fonte antiga (`funnel_offers.funnel_id` →
+ * `payments.offer_id`) dava sempre zero: `funnel_offers.funnel_id` nunca é
+ * gravado e o nó de oferta do fluxo cria o pagamento sem `offer_id`.
+ *
+ * Usa `payments.amount` (centavos) com `status='paid'` — exatamente o mesmo
+ * critério de "Minhas Vendas", então os totais fecham entre as duas telas.
+ */
+async function funnelMoney(funnelId: string): Promise<{ revenue: number; sales: number; payingLeads: number }> {
+  const [row] = await db
+    .select({
+      // sum/count voltam como numeric/bigint → string no driver pg. Number() no fim
+      // evita estourar int32 em contas grandes.
+      revenue: sql<string>`coalesce(sum(${payments.amount}), 0)`,
+      sales:   sql<string>`count(*)`,
+      payers:  sql<string>`count(distinct ${payments.leadId})`,
+    })
+    .from(payments)
+    .where(and(eq(payments.funnelId, funnelId), eq(payments.status, "paid")));
+
+  return {
+    revenue:     Number(row?.revenue ?? 0),
+    sales:       Number(row?.sales ?? 0),
+    payingLeads: Number(row?.payers ?? 0),
+  };
+}
+
+/**
+ * Tempo médio até a compra, em ms: média de (1º pagamento aprovado − criação do lead).
+ *
+ * Aproximação conhecida: `leads.created_at` é o 1º contato do lead com o BOT
+ * (a linha é upsertada por bot+chat), não a entrada neste funil — não existe
+ * hoje nenhuma coluna que registre "entrou no funil X às HH:MM".
+ */
+async function avgTimeToPurchaseMs(funnelId: string): Promise<number | null> {
+  const rows = await execRows<{ ms: string | null }>(sql`
+    SELECT avg(t.ms)::text AS ms
+    FROM (
+      SELECT extract(epoch FROM (min(p.paid_at) - l.created_at)) * 1000 AS ms
+      FROM payments p
+      JOIN leads l ON l.id = p.lead_id
+      WHERE p.funnel_id = ${funnelId}
+        AND p.status = 'paid'
+        AND p.paid_at IS NOT NULL
+      GROUP BY p.lead_id, l.created_at
+    ) t
+  `);
+  const raw = rows[0]?.ms;
+  if (raw == null) return null;
+  const ms = Number(raw);
+  return Number.isFinite(ms) ? Math.round(ms) : null;
+}
+
+/**
+ * Leads de um funil SIMPLIFICADO.
+ *
+ * O motor simplificado NUNCA escreve em `lead_progress` (ele retorna antes do
+ * insert em `execute-flow-step`), e `lead_events` não tem `funnel_id`. As duas
+ * únicas tabelas que ligam lead ↔ funil simplificado são `payments.funnel_id` e
+ * `simplified_scheduled_tasks.funnel_id`. Logo a contagem é PARCIAL: só aparece
+ * quem chegou a gerar PIX (ou a receber upsell/downsell agendado).
+ */
+async function simplifiedLeadCount(funnelId: string): Promise<number> {
+  const rows = await execRows<{ c: string }>(sql`
+    SELECT count(*)::text AS c FROM (
+      SELECT lead_id FROM payments
+        WHERE funnel_id = ${funnelId} AND lead_id IS NOT NULL
+      UNION
+      SELECT lead_id FROM simplified_scheduled_tasks
+        WHERE funnel_id = ${funnelId}
+    ) t
+  `);
+  return Number(rows[0]?.c ?? 0);
+}
+
 // GET /funnels/:id/stats
 export const stats = api(
   { method: "GET", path: "/funnels/:id/stats", expose: true, auth: true },
-  async ({ id }: { id: string }): Promise<{
-    funnelName: string;
-    funnelKind: string;
-    totalLeads: number;
-    activeLeads: number;
-    completedLeads: number;
-    revenue: number;
-    sales: number;
-    nodeStats: Array<{ nodeId: string; nodeType: string; label: string; count: number }>;
-  }> => {
+  async ({ id }: { id: string }): Promise<FunnelStatsResponse> => {
     const { userID: userId } = getAuthData()!;
     const funnel = await repo.findByIdOwned(id, userId);
     if (!funnel) throw APIError.notFound("funnel not found");
 
-    const [offerRows, progressRows] = await Promise.all([
-      db.select({ id: funnelOffers.id }).from(funnelOffers).where(eq(funnelOffers.funnelId, id)),
-      db.select({ leadId: leadProgress.leadId, currentNodeId: leadProgress.currentNodeId, status: leadProgress.status })
-        .from(leadProgress).where(eq(leadProgress.funnelId, id)),
-    ]);
+    const [money, avgMs] = await Promise.all([funnelMoney(id), avgTimeToPurchaseMs(id)]);
 
-    const offerIds = offerRows.map((o) => o.id);
-    let revenue = 0;
-    let sales = 0;
-    if (offerIds.length > 0) {
-      const paidRows = await db.select({ amount: payments.amount })
-        .from(payments)
-        .where(and(inArray(payments.offerId, offerIds), eq(payments.status, "paid")));
-      revenue = paidRows.reduce((sum, p) => sum + p.amount, 0);
-      sales = paidRows.length;
+    // ── Ramo SIMPLIFICADO: não existe `lead_progress`, tudo vem de payments ──
+    if (funnel.kind === "simplified") {
+      const leadsInFunnel = await simplifiedLeadCount(id);
+      // "Concluiu" = comprou. Não há estado intermediário persistido, então
+      // `activeLeads` é 0 por construção (e sinalizado por activeLeadsTracked).
+      const completedLeads = money.payingLeads;
+
+      return {
+        funnelName: funnel.name,
+        funnelKind: funnel.kind,
+        leadsInFunnel,
+        totalLeads:     leadsInFunnel,
+        activeLeads:    0,
+        completedLeads,
+        abandonedLeads: Math.max(0, leadsInFunnel - completedLeads),
+        payingLeads:    money.payingLeads,
+        revenue:        money.revenue,
+        sales:          money.sales,
+        avgTimeToPurchaseMs: avgMs,
+        nodeStats:      [],
+        leadsSource:             "payments+simplified_scheduled_tasks",
+        leadsArePartial:         true,
+        activeLeadsTracked:      false,
+        avgTimeToPurchaseApprox: true,
+        notes: [
+          "Funil simplificado não registra entrada de lead: a contagem cobre apenas leads que geraram PIX ou receberam upsell/downsell agendado.",
+          "Não há estado 'em andamento' persistido; 'Ativos' vem 0 e o abandono é 'gerou PIX e não pagou'.",
+          "Tempo médio até compra usa o 1º contato do lead com o bot como marco inicial.",
+        ],
+      };
     }
 
-    const totalLeads = progressRows.length;
-    const activeLeads = progressRows.filter((r) => r.status === "active").length;
+    // ── Ramo FLUXO: leads vêm de `lead_progress` ─────────────────────────────
+    const progressRows = await db
+      .select({ leadId: leadProgress.leadId, currentNodeId: leadProgress.currentNodeId, status: leadProgress.status })
+      .from(leadProgress)
+      .where(eq(leadProgress.funnelId, id));
+
+    const leadsInFunnel  = progressRows.length;
+    const activeLeads    = progressRows.filter((r) => r.status === "active").length;
     const completedLeads = progressRows.filter((r) => r.status === "completed").length;
 
     const nodeCounts = new Map<string, number>();
@@ -218,7 +368,7 @@ export const stats = api(
       if (r.currentNodeId) nodeCounts.set(r.currentNodeId, (nodeCounts.get(r.currentNodeId) ?? 0) + 1);
     });
 
-    let nodeStats: Array<{ nodeId: string; nodeType: string; label: string; count: number }> = [];
+    let nodeStats: FunnelNodeStat[] = [];
     if (nodeCounts.size > 0) {
       const nodeRows = await db.select({ id: funnelNodes.id, type: funnelNodes.type, content: funnelNodes.content })
         .from(funnelNodes).where(inArray(funnelNodes.id, [...nodeCounts.keys()]));
@@ -229,7 +379,28 @@ export const stats = api(
       }).sort((a, b) => b.count - a.count);
     }
 
-    return { funnelName: funnel.name, funnelKind: funnel.kind, totalLeads, activeLeads, completedLeads, revenue, sales, nodeStats };
+    return {
+      funnelName: funnel.name,
+      funnelKind: funnel.kind,
+      leadsInFunnel,
+      totalLeads: leadsInFunnel,
+      activeLeads,
+      completedLeads,
+      abandonedLeads: Math.max(0, leadsInFunnel - activeLeads - completedLeads),
+      payingLeads:    money.payingLeads,
+      revenue:        money.revenue,
+      sales:          money.sales,
+      avgTimeToPurchaseMs: avgMs,
+      nodeStats,
+      leadsSource:             "lead_progress",
+      leadsArePartial:         true,
+      activeLeadsTracked:      true,
+      avgTimeToPurchaseApprox: true,
+      notes: [
+        "'Leads no funil' são os leads cujo progresso aponta para este funil AGORA — o runner sobrescreve funnel_id quando o lead migra, então não é histórico.",
+        "Tempo médio até compra usa o 1º contato do lead com o bot como marco inicial.",
+      ],
+    };
   },
 );
 

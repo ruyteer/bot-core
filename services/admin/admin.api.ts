@@ -126,34 +126,45 @@ export const getRevenue = api(
           WHERE pw.status = 'paid' AND pw.created_at >= ${sinceDate}
         ), 0)::float / 100  AS window_fees,
         count(*) FILTER (WHERE p.status = 'paid' AND p.created_at >= ${sinceDate})::int    AS window_count,
-        count(*) FILTER (WHERE p.status = 'pending')::int                                  AS pending_count,
-        coalesce(sum(p.amount) FILTER (WHERE p.status = 'pending'), 0)::float / 100        AS pending_amount
+        count(*) FILTER (WHERE p.status = 'pending' AND p.created_at >= ${sinceDate})::int AS pending_count,
+        coalesce(sum(p.amount) FILTER (WHERE p.status = 'pending' AND p.created_at >= ${sinceDate}), 0)::float / 100 AS pending_amount
       FROM payments p
     `);
 
+    // As taxas por gateway vinham hardcoded em 0. payment_revenue_credits é 1:N
+    // por pagamento (PK composta payment_id+user_id) — agregar num LEFT JOIN
+    // direto multiplicaria o `gross` do gateway. Por isso a soma dos créditos é
+    // colapsada em 1:1 num LATERAL antes de entrar na agregação.
     const byProvider = await exec<ProviderRow>(sql`
       SELECT
         pg.provider,
         count(p.id)::int            AS qty,
         coalesce(sum(p.amount), 0)::float / 100  AS gross,
-        0::float                    AS fees
+        coalesce(sum(prc.amount), 0)::float / 100 AS fees
       FROM payments p
       LEFT JOIN payment_gateways pg ON p.gateway_id = pg.id
+      LEFT JOIN LATERAL (
+        SELECT sum(c.amount) AS amount FROM payment_revenue_credits c WHERE c.payment_id = p.id
+      ) prc ON TRUE
       WHERE p.status = 'paid' AND p.created_at >= ${sinceDate}
       GROUP BY pg.provider
       ORDER BY gross DESC
     `);
 
+    // date_trunc em UTC jogava as vendas das 21h–23h59 (BRT) para o dia seguinte.
     const daily = await exec<DailyRow>(sql`
       SELECT
-        to_char(date_trunc('day', p.created_at), 'YYYY-MM-DD') AS day,
+        to_char(date_trunc('day', p.created_at AT TIME ZONE 'America/Sao_Paulo'), 'YYYY-MM-DD') AS day,
         coalesce(sum(p.amount), 0)::float / 100  AS gross,
-        0::float                                  AS fees,
+        coalesce(sum(prc.amount), 0)::float / 100 AS fees,
         count(p.id)::int                          AS qty
       FROM payments p
+      LEFT JOIN LATERAL (
+        SELECT sum(c.amount) AS amount FROM payment_revenue_credits c WHERE c.payment_id = p.id
+      ) prc ON TRUE
       WHERE p.status = 'paid' AND p.created_at >= ${sinceDate}
-      GROUP BY date_trunc('day', p.created_at)
-      ORDER BY date_trunc('day', p.created_at) ASC
+      GROUP BY date_trunc('day', p.created_at AT TIME ZONE 'America/Sao_Paulo')
+      ORDER BY date_trunc('day', p.created_at AT TIME ZONE 'America/Sao_Paulo') ASC
     `);
 
     return {
@@ -204,8 +215,15 @@ export const listUsers = api(
     type UserRow = {
       id: string; name: string | null; email: string | null; created_at: string;
       is_blocked: boolean; is_admin: boolean; bots_count: number; funnels_count: number;
-      total_revenue: number; paid_count: number; total: number;
+      total_revenue: number; paid_count: number;
     };
+
+    // Mesmo motivo do listAdminPayments: com count(*) OVER () o total vinha da
+    // página, e numa página além do último registro voltava 0.
+    const [totalRow] = await exec<{ total: number }>(sql`
+      SELECT count(*)::int AS total FROM profiles p WHERE 1=1 ${searchCond}
+    `);
+    const total = totalRow?.total ?? 0;
 
     const rows = await exec<UserRow>(sql`
       SELECT
@@ -213,22 +231,22 @@ export const listUsers = api(
         EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = p.id AND ur.role = 'admin') AS is_admin,
         count(DISTINCT b.id)::int                                                     AS bots_count,
         count(DISTINCT f.id)::int                                                     AS funnels_count,
-        coalesce(sum(pay.amount) FILTER (WHERE pay.status = 'paid'), 0)::float / 100 AS total_revenue,
-        count(pay.id) FILTER (WHERE pay.status = 'paid')::int                        AS paid_count,
-        count(*) OVER ()::int                                                         AS total
+        -- payments NÃO entra no JOIN: com bots e funnels no mesmo FROM cada
+        -- pagamento era multiplicado por (nº bots × nº funis) do usuário.
+        coalesce((SELECT sum(pay.amount) FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid'), 0)::float / 100 AS total_revenue,
+        (SELECT count(*) FROM payments pay WHERE pay.user_id = p.id AND pay.status = 'paid')::int AS paid_count
       FROM profiles p
       LEFT JOIN bots     b   ON b.user_id   = p.id
       LEFT JOIN funnels  f   ON f.user_id   = p.id
-      LEFT JOIN payments pay ON pay.user_id = p.id
       WHERE 1=1 ${searchCond}
       GROUP BY p.id
       ORDER BY p.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `);
 
-    if (rows.length === 0) return { items: [], total: 0 };
+    // Página vazia (ex.: além do último registro) ainda devolve o total real.
+    if (rows.length === 0) return { items: [], total };
 
-    const total   = rows[0].total;
     const userIds = rows.map((r) => r.id);
 
     type BotRow = {
@@ -291,7 +309,7 @@ interface AdminUserDetails {
   };
   by_provider:    Array<{ provider: string | null; qty: number; gross: number }>;
   daily_revenue:  Array<{ day: string; gross: number; qty: number }>;
-  bots:           Array<{ id: string; name: string; telegram_username: string | null; is_active: boolean; funnels_count: number; leads_count: number }>;
+  bots:           Array<{ id: string; name: string; telegram_username: string | null; is_active: boolean; funnels_count: number; leads_count: number; paid_count: number; revenue: number }>;
   recent_payments: Array<{ id: string; created_at: string; paid_at: string | null; amount: number; status: string; offer_name: string | null; provider: string | null }>;
   // O frontend (AdminUserDetails) lê estes dois — sem eles, `data.gateways.length`
   // dava TypeError e a página de detalhes quebrava no render.
@@ -354,17 +372,22 @@ export const getUserDetails = api(
       GROUP BY pg.provider ORDER BY gross DESC
     `);
 
+    // date_trunc em UTC empurrava as vendas das 21h–23h59 (BRT) pro dia seguinte.
     const dailyRevenue = await exec<{ day: string; gross: number; qty: number }>(sql`
-      SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
+      SELECT to_char(date_trunc('day', created_at AT TIME ZONE 'America/Sao_Paulo'), 'YYYY-MM-DD') AS day,
              coalesce(sum(amount), 0)::float / 100 AS gross, count(*)::int AS qty
       FROM payments WHERE user_id = ${id} AND status = 'paid' AND created_at >= ${ago30}
-      GROUP BY date_trunc('day', created_at) ORDER BY 1 ASC
+      GROUP BY date_trunc('day', created_at AT TIME ZONE 'America/Sao_Paulo') ORDER BY 1 ASC
     `);
 
-    const userBots = await exec<{ id: string; name: string; telegram_username: string | null; is_active: boolean; funnels_count: number; leads_count: number }>(sql`
+    // paid_count/revenue por bot via subquery — um JOIN com payments aqui
+    // multiplicaria funnels_count/leads_count (produto cartesiano).
+    const userBots = await exec<{ id: string; name: string; telegram_username: string | null; is_active: boolean; funnels_count: number; leads_count: number; paid_count: number; revenue: number }>(sql`
       SELECT b.id, b.name, b.telegram_username, b.is_active,
              count(DISTINCT f.id)::int AS funnels_count,
-             count(DISTINCT l.id)::int AS leads_count
+             count(DISTINCT l.id)::int AS leads_count,
+             (SELECT count(*) FROM payments pay WHERE pay.bot_id = b.id AND pay.status = 'paid')::int AS paid_count,
+             coalesce((SELECT sum(pay.amount) FROM payments pay WHERE pay.bot_id = b.id AND pay.status = 'paid'), 0)::float / 100 AS revenue
       FROM bots b
       LEFT JOIN funnels f ON f.bot_id = b.id
       LEFT JOIN leads   l ON l.bot_id = b.id
@@ -372,9 +395,10 @@ export const getUserDetails = api(
       GROUP BY b.id ORDER BY b.created_at DESC
     `);
 
+    // offer_id é null nas vendas de funil; o nome real está em payments.offer_name.
     const recentPayments = await exec<{ id: string; created_at: unknown; paid_at: unknown; amount: number; status: string; offer_name: string | null; provider: string | null }>(sql`
       SELECT p.id, p.created_at, p.paid_at, p.amount, p.status,
-             fo.name AS offer_name, pg.provider
+             coalesce(p.offer_name, fo.name) AS offer_name, pg.provider
       FROM payments p
       LEFT JOIN funnel_offers    fo ON p.offer_id   = fo.id
       LEFT JOIN payment_gateways pg ON p.gateway_id = pg.id
@@ -585,11 +609,37 @@ export const listAdminPayments = api(
     const statusCond   = status   && status   !== "all" ? sql`AND p.status     = ${status}`   : sql``;
     const providerCond = provider && provider !== "all" ? sql`AND pg.provider   = ${provider}` : sql``;
     const sinceCond    = sinceDate                       ? sql`AND p.created_at >= ${sinceDate}` : sql``;
+    // p.offer_name entra na busca: nas vendas de funil o offer_id é null, então
+    // procurar só por fo.name nunca achava a oferta.
     const searchCond   = search
-      ? sql`AND (p.external_id ILIKE ${"%" + search + "%"} OR pr.email ILIKE ${"%" + search + "%"} OR pr.name ILIKE ${"%" + search + "%"} OR b.name ILIKE ${"%" + search + "%"} OR fo.name ILIKE ${"%" + search + "%"})`
+      ? sql`AND (p.external_id ILIKE ${"%" + search + "%"} OR pr.email ILIKE ${"%" + search + "%"} OR pr.name ILIKE ${"%" + search + "%"} OR b.name ILIKE ${"%" + search + "%"} OR fo.name ILIKE ${"%" + search + "%"} OR p.offer_name ILIKE ${"%" + search + "%"})`
       : sql``;
 
-    type RowType = AdminPaymentRow & { total: number; paid_count: number; pending_count: number; other_count: number; paid_sum: number; pending_sum: number };
+    const whereCond = sql`WHERE 1=1 ${statusCond} ${providerCond} ${sinceCond} ${searchCond}`;
+
+    // Os tiles de resumo saíam de window functions da própria página: numa página
+    // além do último registro o resultado era vazio e os 4 tiles zeravam. Agora
+    // os agregados vêm de uma query própria, independente da paginação.
+    const [agg] = await exec<{
+      total: number; paid_count: number; pending_count: number; other_count: number;
+      paid_sum: number; pending_sum: number;
+    }>(sql`
+      SELECT
+        count(*)::int                                                        AS total,
+        count(*) FILTER (WHERE p.status = 'paid')::int                       AS paid_count,
+        count(*) FILTER (WHERE p.status = 'pending')::int                    AS pending_count,
+        count(*) FILTER (WHERE p.status NOT IN ('paid','pending'))::int      AS other_count,
+        coalesce(sum(p.amount) FILTER (WHERE p.status = 'paid'), 0)::float / 100    AS paid_sum,
+        coalesce(sum(p.amount) FILTER (WHERE p.status = 'pending'), 0)::float / 100 AS pending_sum
+      FROM payments p
+      LEFT JOIN payment_gateways pg ON p.gateway_id = pg.id
+      LEFT JOIN bots             b  ON p.bot_id     = b.id
+      LEFT JOIN profiles         pr ON p.user_id    = pr.id
+      LEFT JOIN funnel_offers    fo ON p.offer_id   = fo.id
+      ${whereCond}
+    `);
+
+    type RowType = AdminPaymentRow;
 
     const rows = await exec<RowType>(sql`
       SELECT
@@ -599,39 +649,31 @@ export const listAdminPayments = api(
         pg.provider, pg.label AS gateway_label,
         b.name AS bot_name, b.telegram_username AS bot_username,
         pr.email AS user_email, pr.name AS user_name,
-        fo.name AS offer_name,
+        coalesce(p.offer_name, fo.name) AS offer_name,
         l.first_name AS lead_first_name, l.last_name AS lead_last_name,
         l.telegram_username AS lead_username,
-        l.telegram_chat_id::bigint AS lead_chat_id,
-        count(*) OVER ()::int AS total,
-        count(*) FILTER (WHERE p.status = 'paid')    OVER ()::int AS paid_count,
-        count(*) FILTER (WHERE p.status = 'pending') OVER ()::int AS pending_count,
-        count(*) FILTER (WHERE p.status NOT IN ('paid','pending')) OVER ()::int AS other_count,
-        coalesce(sum(p.amount) FILTER (WHERE p.status = 'paid')    OVER (), 0)::float / 100 AS paid_sum,
-        coalesce(sum(p.amount) FILTER (WHERE p.status = 'pending') OVER (), 0)::float / 100 AS pending_sum
+        l.telegram_chat_id::bigint AS lead_chat_id
       FROM payments p
       LEFT JOIN payment_gateways pg ON p.gateway_id = pg.id
       LEFT JOIN bots             b  ON p.bot_id     = b.id
       LEFT JOIN profiles         pr ON p.user_id    = pr.id
       LEFT JOIN leads            l  ON p.lead_id    = l.id
       LEFT JOIN funnel_offers    fo ON p.offer_id   = fo.id
-      WHERE 1=1 ${statusCond} ${providerCond} ${sinceCond} ${searchCond}
+      ${whereCond}
       ORDER BY p.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `);
 
-    const first = rows[0];
-
     return {
       page:      page ?? 1,
       page_size: limit,
-      total:     first?.total        ?? 0,
+      total:     agg?.total ?? 0,
       totals: {
-        paid_count:     first?.paid_count    ?? 0,
-        pending_count:  first?.pending_count ?? 0,
-        other_count:    first?.other_count   ?? 0,
-        paid_amount:    first?.paid_sum      ?? 0,
-        pending_amount: first?.pending_sum   ?? 0,
+        paid_count:     agg?.paid_count    ?? 0,
+        pending_count:  agg?.pending_count ?? 0,
+        other_count:    agg?.other_count   ?? 0,
+        paid_amount:    agg?.paid_sum      ?? 0,
+        pending_amount: agg?.pending_sum   ?? 0,
       },
       items: rows.map((r) => ({
         id:              r.id,

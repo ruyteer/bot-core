@@ -6,6 +6,14 @@ import {
 } from "../../shared/schema/index.js";
 import type { Payment, PaymentWithMeta, SimplifiedPaymentCtx } from "../domain/payment.entity.js";
 
+/**
+ * Valores aceitos em `payments.sale_type`. São EXATAMENTE os literais que o
+ * painel espera (`ui/src/components/SalesByTypeTiles.tsx` e
+ * `ui/src/pages/MyVendas.tsx`); qualquer outra string cai em "unknown" lá e
+ * some dos cards. Null = venda antiga (o front trata como "offer").
+ */
+export type SaleType = "offer" | "order_bump" | "upsell" | "downsell" | "remarketing";
+
 export class PaymentDrizzleRepository {
   private toPayment(row: typeof payments.$inferSelect): Payment {
     return {
@@ -46,6 +54,7 @@ export class PaymentDrizzleRepository {
     offerExternalRef?: string | null;
     amount:           number;
     status?:          string;
+    saleType?:        SaleType | null;
     externalId?:      string | null;
     pixCode?:         string | null;
     description?:     string | null;
@@ -65,6 +74,7 @@ export class PaymentDrizzleRepository {
       offerExternalRef: data.offerExternalRef,
       amount:           data.amount,
       status:           data.status ?? "pending",
+      saleType:         data.saleType ?? null,
       externalId:       data.externalId,
       pixCode:          data.pixCode,
       description:      data.description,
