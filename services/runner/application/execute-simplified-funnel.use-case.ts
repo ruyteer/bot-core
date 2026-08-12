@@ -3,7 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   bots, leads, funnels, payments, simplifiedScheduledTasks,
 } from "../../shared/schema/index.js";
-import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
@@ -452,12 +452,16 @@ export class ExecuteSimplifiedFunnelUseCase {
       : "👆 Ou copie o código acima e cole no app do seu banco.";
 
     const sendMode  = payCfg.pix_send_mode === "combined" ? "combined" : "separate";
-    const nativeCopy = payCfg.pix_native_copy !== false;
-    const pixCodeHtml = nativeCopy ? `<pre><code>${pixCode}</code></pre>` : `<code>${pixCode}</code>`;
+    // O "botão nativo de copiar" (bloco <pre><code>, tap-to-copy) foi removido:
+    // não funcionava em vários celulares. `pix_native_copy` é ignorado mesmo se
+    // vier true de um funil antigo salvo no banco. Mantemos o <code> no texto
+    // (clients velhos ainda conseguem selecionar) e o botão inline sempre ativo.
+    const pixCodeHtml = `<code>${pixCode}</code>`;
 
-    const copyButtonMarkup = payCfg.pix_copy_button_enabled === true
-      ? { inline_keyboard: [[{ text: String(payCfg.pix_copy_button_label || "📋 Copiar código PIX"), copy_text: { text: pixCode } }]] }
-      : undefined;
+    const copyButtonMarkup = pixCopyButtonMarkup(
+      pixCode,
+      typeof payCfg.pix_copy_button_label === "string" ? payCfg.pix_copy_button_label : undefined,
+    );
 
     if (sendMode === "combined") {
       await tg.sendPhoto({

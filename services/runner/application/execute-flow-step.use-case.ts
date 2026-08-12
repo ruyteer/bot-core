@@ -5,7 +5,7 @@ import {
   funnels, funnelBots, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
   funnelOffers, leadEvents,
 } from "../../shared/schema/index.js";
-import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { interpolate, mergeLeadFields } from "./interpolate.js";
 import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
@@ -1049,7 +1049,12 @@ export class ExecuteFlowStepUseCase {
 
     const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
-    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+    await tg.sendMessage({
+      chatId,
+      text: `<code>${escapeHtml(pix.pixCode)}</code>`,
+      protectContent: bot.protectContent,
+      replyMarkup: pixCopyButtonMarkup(pix.pixCode),
+    });
     await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
   }
 
@@ -1094,7 +1099,12 @@ export class ExecuteFlowStepUseCase {
 
     const caption = `💠 <b>${escapeHtml(offer.name)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
-    await tg.sendMessage({ chatId, text: `<code>${escapeHtml(pix.pixCode)}</code>`, protectContent: bot.protectContent });
+    await tg.sendMessage({
+      chatId,
+      text: `<code>${escapeHtml(pix.pixCode)}</code>`,
+      protectContent: bot.protectContent,
+      replyMarkup: pixCopyButtonMarkup(pix.pixCode),
+    });
   }
 
   // ── Entrega do produto de uma oferta avulsa (funnel_offers) após pagamento ───
