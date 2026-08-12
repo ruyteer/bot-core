@@ -6,6 +6,8 @@ import { db } from "../shared/database.js";
 import { bots } from "../shared/schema/index.js";
 import { eq } from "drizzle-orm";
 import type { LeadWithStats } from "./domain/lead.entity.js";
+import { getLeadAnalytics } from "./application/lead-analytics.js";
+import type { LeadAnalytics } from "./application/lead-analytics.js";
 
 const repo = new LeadDrizzleRepository();
 
@@ -99,6 +101,26 @@ export const stats = api(
     const startDate = start ? new Date(start) : undefined;
     const endDate   = end   ? new Date(end)   : undefined;
     return repo.getStats(botIds, startDate, endDate);
+  },
+);
+
+// GET /leads/analytics?botId=...&start=...&end=...
+// Comportamento dos leads: em que etapa pararam, onde não avançaram e de que
+// fonte de tráfego vieram. Toda a agregação acontece no SQL, sobre um único
+// escopo (bot + janela), para as visões fecharem entre si.
+// Precisa vir ANTES de /leads/:id na leitura do arquivo? Não — o router do
+// Encore prioriza segmentos estáticos (mesmo caso de /leads/stats).
+export const analytics = api(
+  { method: "GET", path: "/leads/analytics", expose: true, auth: true },
+  async ({ botId, start, end }: { botId?: string; start?: string; end?: string }): Promise<LeadAnalytics> => {
+    const { userID: userId } = getAuthData()!;
+    const userBotIds = await repo.getUserBotIds(userId);
+    if (botId && !userBotIds.includes(botId)) throw APIError.notFound("bot not found");
+    const botIds = botId ? [botId] : userBotIds;
+
+    const startDate = start ? new Date(start) : undefined;
+    const endDate   = end   ? new Date(end)   : undefined;
+    return getLeadAnalytics(botIds, startDate, endDate);
   },
 );
 
