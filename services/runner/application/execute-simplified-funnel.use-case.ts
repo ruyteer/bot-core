@@ -383,20 +383,20 @@ export class ExecuteSimplifiedFunnelUseCase {
     const refKey = bumpsSig ? `${funnel.id}:plan:${planId}:bumps:${bumpsSig}` : `${funnel.id}:plan:${planId}`;
     const items = [toDeliveryItem(plan), ...selected.map(toDeliveryItem)];
 
-    const { paymentId, reused } = await this.generatePix({
+    const { paymentId } = await this.generatePix({
       bot, lead, chatId, tg, payCfg, amount: totalAmount, productName: String(plan.name || "Plano"),
       ctx: { kind: "plan", funnelId: funnel.id, planId, items },
       refKey,
     });
 
-    // Agenda downsells (uma vez) p/ esse PIX, se ainda não foi reaproveitado.
-    if (paymentId && !reused) {
+    // Agenda downsells (uma vez) p/ esse PIX.
+    if (paymentId) {
       await this.scheduleDownsells(bot.id, lead.id, funnel.id, planId, paymentId, downs)
         .catch((e) => console.error("[simplified] scheduleDownsells:", e));
     }
   }
 
-  // ── Geração de PIX (dedup + persistência + envio) ──
+  // ── Geração de PIX (persistência + envio) ──
   private async generatePix(opts: {
     bot: typeof bots.$inferSelect;
     lead: typeof leads.$inferSelect;
@@ -407,17 +407,11 @@ export class ExecuteSimplifiedFunnelUseCase {
     productName: string;
     ctx: SimplifiedPaymentCtx;
     refKey: string;
-  }): Promise<{ paymentId: string | null; reused: boolean }> {
+  }): Promise<{ paymentId: string | null }> {
     const { bot, lead, chatId, tg, payCfg, amount, productName, ctx, refKey } = opts;
     // amount chega em REAIS (preços do funil simplificado); gateway e tabela
     // payments trabalham em centavos. Display (fmtBRL) continua em reais.
     const amountCents = Math.round(amount * 100);
-    // Dedup: reaproveita PIX pendente recente do mesmo (bot, lead, valor, ref).
-    const existing = await payRepo.findReusablePending(bot.id, lead.id, amountCents, refKey);
-    if (existing?.pixCode) {
-      await this.sendPixMessages(tg, chatId, existing.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
-      return { paymentId: existing.id, reused: true };
-    }
 
     // O funil não escolhe mais gateway: usa a ordem de fallback configurada no bot.
     const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
@@ -433,11 +427,11 @@ export class ExecuteSimplifiedFunnelUseCase {
     } catch (err) {
       console.error("[simplified] createPix falhou em toda a cadeia:", err);
       await tg.sendMessage({ chatId, text: "⚠️ Erro ao gerar PIX. Tente novamente.", protectContent: bot.protectContent });
-      return { paymentId: null, reused: false };
+      return { paymentId: null };
     }
     if (!result) {
       await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent });
-      return { paymentId: null, reused: false };
+      return { paymentId: null };
     }
     const { gateway: gw, pix } = result;
 
@@ -459,7 +453,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     });
 
     await this.sendPixMessages(tg, chatId, pix.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
-    return { paymentId: created.id, reused: false };
+    return { paymentId: created.id };
   }
 
   // ── Envio das mensagens do PIX (QR + copia-e-cola), respeitando o payment config ──

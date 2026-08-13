@@ -57,25 +57,26 @@ describe("createPix", () => {
 });
 
 // ── SyncPay: registro do webhook na conta ───────────────────────────────────
-// A SyncPay ignora o webhook_url do cash-in: sem POST /webhooks (evento cashin)
-// registrado na conta, a confirmação de venda nunca chega.
-describe("syncpay — registro automático do webhook cashin", () => {
+// A SyncPay ignora o webhook_url do cash-in: sem POST /webhooks registrado na
+// conta, a confirmação de venda nunca chega. O evento registrado é "all":
+// registrar só "cashin" comprovadamente não entrega a confirmação de pagamento.
+describe("syncpay — registro automático do webhook", () => {
   it("primeiro PIX registra o webhook; o segundo usa o cache e não repete", async () => {
     __resetSyncpayWebhookCacheForTests();
     await createPix("syncpay", "client_a", "secret", 1990, "Produto", "https://core/payments/webhook/syncpay");
 
     const posts = getOtherCalls().filter((c) =>
-      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "cashin");
+      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "all");
     expect(posts).toHaveLength(1);
     expect(posts[0].body).toMatchObject({
       url: "https://core/payments/webhook/syncpay",
-      event: "cashin",
+      event: "all",
       trigger_all_products: true,
     });
 
     await createPix("syncpay", "client_a", "secret", 500, "Outro", "https://core/payments/webhook/syncpay");
     const postsAfter = getOtherCalls().filter((c) =>
-      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "cashin");
+      c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "all");
     expect(postsAfter).toHaveLength(1); // cache — não registra de novo
   });
 
@@ -219,14 +220,6 @@ describe("PaymentDrizzleRepository", () => {
     await payRepo.markProcessed("e1", "buckpay", "paid");
     expect(await payRepo.isProcessed("e1", "buckpay")).toBe(true);
     await payRepo.markProcessed("e1", "buckpay", "paid"); // não duplica (onConflictDoNothing)
-  });
-
-  it("findReusablePending acha pendente recente do mesmo ref/valor", async () => {
-    const p = await seedPayment("ext-reuse");
-    const found = await payRepo.findReusablePending(p.botId, p.leadId!, 1990, "ref1");
-    expect(found?.id).toBe(p.id);
-    // valor diferente não casa
-    expect(await payRepo.findReusablePending(p.botId, p.leadId!, 999, "ref1")).toBeNull();
   });
 });
 
