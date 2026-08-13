@@ -95,10 +95,19 @@ async function syncpayToken(clientId: string, clientSecret: string): Promise<str
 }
 
 // A SyncPay IGNORA o campo webhook_url do cash-in: a doc diz que webhooks são
-// enviados SOMENTE a partir do cadastro na conta (POST /api/partner/v1/webhooks,
-// evento "cashin"). Sem esse cadastro, o PIX gera mas a confirmação de venda
-// nunca chega. Registramos o webhook na primeira cobrança de cada conta
-// (cache por processo; falha não bloqueia o PIX — tenta de novo na próxima).
+// enviados SOMENTE a partir do cadastro na conta (POST /api/partner/v1/webhooks).
+// Sem esse cadastro, o PIX gera mas a confirmação de venda nunca chega.
+// Registramos o webhook na primeira cobrança de cada conta (cache por
+// processo — mas SÓ em caso de sucesso; uma falha não é cacheada como se
+// tivesse funcionado, e tenta de novo no próximo PIX do mesmo processo).
+//
+// Evidência de produção (3 semanas, 17 webhooks recebidos): registrando
+// apenas o evento "cashin" a conta manda webhooks de "pending" e
+// "WAITING_FOR_APPROVAL", mas NUNCA um evento de pagamento confirmado —
+// "cashin" sozinho não cobre a confirmação de venda. Como não dá pra testar
+// contra a API real daqui, passamos a registrar "all" em vez de "cashin" pra
+// garantir que capturamos a confirmação, seja qual for o nome exato que a
+// SyncPay usa pra esse evento.
 const syncpayWebhookEnsured = new Set<string>();
 export function __resetSyncpayWebhookCacheForTests(): void { syncpayWebhookEnsured.clear(); }
 
@@ -113,29 +122,44 @@ async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl:
       Array.isArray(listData) ? listData as Array<Record<string, unknown>>
       : Array.isArray((listData as { data?: unknown })?.data) ? (listData as { data: Array<Record<string, unknown>> }).data
       : [];
-    const exists = rows.some((w) =>
-      String(w.url ?? "") === webhookUrl && ["cashin", "all"].includes(String(w.event ?? "")));
+    // Exige "all" especificamente: uma conta com só "cashin" registrado (do
+    // código antigo, ou de uma tentativa anterior) NÃO conta como "resolvido"
+    // — é exatamente a configuração que causava o bug de vendas nunca aprovadas.
+    const exists = rows.some((w) => String(w.url ?? "") === webhookUrl && String(w.event ?? "") === "all");
 
     if (!exists) {
       const createRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
         method:  "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          title: "OrionBot — confirmação de venda (cashin)",
+          title: "OrionBot — confirmação de venda (todos os eventos)",
           url:   webhookUrl,
-          event: "cashin",
+          event: "all",
           trigger_all_products: true,
         }),
       });
+      const responseBody = await createRes.text().catch(() => "");
       if (!createRes.ok) {
-        console.error("[syncpay] registro do webhook falhou:", createRes.status, await createRes.text().catch(() => ""));
-        return; // sem cache → nova tentativa no próximo PIX
+        // Alto-falante: sem esse cadastro NENHUMA venda deste gateway é
+        // aprovada, e isso não derruba nada — precisa aparecer bem alto nos
+        // logs do Railway pra diagnóstico. Sem cache → tenta de novo no
+        // próximo PIX deste mesmo processo (não fica preso num estado de
+        // "falhou pra sempre" até o processo reiniciar).
+        console.error("[syncpay] registro do webhook FALHOU — vendas deste gateway não serão aprovadas até isso ser corrigido", {
+          clientId, webhookUrl, event: "all", status: createRes.status, responseBody,
+        });
+        return;
       }
-      console.log(`[syncpay] webhook cashin registrado: ${webhookUrl}`);
+      console.log("[syncpay] webhook registrado com sucesso", {
+        clientId, webhookUrl, event: "all", status: createRes.status, responseBody,
+      });
     }
     syncpayWebhookEnsured.add(clientId);
   } catch (err) {
-    console.error("[syncpay] ensureWebhook falhou:", err);
+    // Exceção (rede, parse, etc.) — também não cacheia, também retryable.
+    console.error("[syncpay] ensureWebhook falhou com exceção — nova tentativa no próximo PIX", {
+      clientId, webhookUrl, err,
+    });
   }
 }
 
@@ -346,87 +370,154 @@ export async function createPix(
 // ── Webhook normalizer — each gateway has different payload shapes ─────────────
 
 export interface NormalizedWebhookEvent {
+  // Candidato primário (compat: usado em isProcessed/markProcessed/logs). Para
+  // syncpay/nexuspag é só `externalIdCandidates[0]` — o lookup de verdade usa
+  // a lista inteira (ver processWebhookEvent em webhooks.ts).
   externalId: string;
+  // TODOS os ids plausíveis extraídos do payload, na ordem de prioridade.
+  // Existe porque syncpay/nexuspag não usam de forma confiável o mesmo campo
+  // entre a criação do PIX e o webhook de confirmação — apostar em UM campo é
+  // o que causava vendas nunca aprovadas nesses dois gateways. Opcional
+  // (defaulta pra `[externalId]`) pra não quebrar quem monta o evento na mão
+  // (ex.: testes) sem essa lista.
+  externalIdCandidates?: string[];
   provider:   Provider;
   status:     "paid" | "pending" | "cancelled" | "expired" | "unknown";
   amount:     number | null;
   event:      string;
 }
 
+// Junta candidatos de identificador a partir de vários campos possíveis do
+// payload, na ordem de prioridade dada, descartando vazios/duplicados.
+export function collectCandidates(...values: unknown[]): string[] {
+  const out: string[] = [];
+  for (const v of values) {
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim();
+    if (s && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+// Statuses de PAGO conhecidos da SyncPay — match EXATO, nunca substring: um
+// `.includes("approv")` classificaria "WAITING_FOR_APPROVAL" (status de
+// análise manual, NÃO pago) como aprovada. Bug real visto em produção: 17
+// webhooks recebidos em 3 semanas, só "pending" e "WAITING_FOR_APPROVAL",
+// nenhum pago — se algum dia chegar um "paid"/"completed" real, precisa cair
+// aqui, não em "approv" por acidente.
+const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "approved", "success", "confirmed"]);
+
 export function normalizeSyncpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
-  // O webhook novo aninha a transação em `data` (status "completed" = pago); o
-  // padrão OLD (do campo webhook_url) pode vir plano. Lemos os dois.
+  // O webhook novo aninha a transação em `data`; o padrão OLD (do campo
+  // webhook_url) pode vir plano. Lemos os dois.
   const data = (body.data && typeof body.data === "object" ? body.data : body) as Record<string, unknown>;
-  const identifier = (data.id ?? data.identifier ?? body.identifier ?? body.transaction_id) as string | undefined;
-  const statusRaw  = String((data.status ?? body.status ?? body.event) ?? "").toLowerCase();
-  const isPaid     = statusRaw.includes("paid") || statusRaw.includes("approved") || statusRaw.includes("success") || statusRaw.includes("complet");
-  const isCancelled = statusRaw.includes("cancel") || statusRaw.includes("refund");
-  const isExpired  = statusRaw.includes("expir");
-  const status     = isPaid ? "paid" : isCancelled ? "cancelled" : isExpired ? "expired" : "pending";
+  // Nenhum dos dois formatos de payload observados em produção usa
+  // `identifier` — o campo que a criação do PIX grava em payments.external_id
+  // (resposta do cash-in, ver syncpayCashIn acima). SQL em produção confirmou:
+  // data.id bate só 1x em 17; data.idtransaction e data.externalreference
+  // NUNCA batem. Em vez de escolher um campo, tentamos todos contra o banco
+  // (processWebhookEvent -> findByAnyExternalId).
+  const candidates = collectCandidates(
+    data.identifier, body.identifier,
+    data.id, body.id,
+    data.idtransaction, body.idtransaction,
+    data.externalreference, body.externalreference,
+    data.end_to_end, body.end_to_end,
+    body.transaction_id,
+  );
+  const statusRaw    = String((data.status ?? body.status ?? body.event) ?? "").toLowerCase().trim();
+  const isPaid        = SYNCPAY_PAID_STATUSES.has(statusRaw);
+  const isCancelled   = statusRaw.includes("cancel") || statusRaw.includes("refund");
+  const isExpired     = statusRaw.includes("expir");
+  const status        = isPaid ? "paid" : isCancelled ? "cancelled" : isExpired ? "expired" : "pending";
   // amount/final_amount vêm em REAIS.
-  const amountRaw  = data.final_amount ?? data.amount ?? body.amount;
+  const amountRaw     = data.final_amount ?? data.amount ?? body.amount;
   return {
-    externalId: identifier ?? "",
-    provider:   "syncpay",
+    externalId:           candidates[0] ?? "",
+    externalIdCandidates: candidates,
+    provider:             "syncpay",
     status,
-    amount:     typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
-    event:      String((data.status ?? body.event) ?? ""),
+    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    event:                String((data.status ?? body.event) ?? ""),
   };
 }
 
 export function normalizeBuckpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   // O webhook (evento transaction-processed) traz a transação aninhada em `data`,
   // mesmo shape da resposta de criação; mantém fallback p/ payload plano por segurança.
-  const data = (body.data && typeof body.data === "object" ? body.data : body) as Record<string, unknown>;
-  const id        = String(data.id ?? data.transaction_id ?? data.external_id ?? "");
-  const statusRaw = String(data.status ?? body.event ?? "");
-  const isPaid    = statusRaw === "paid" || statusRaw === "approved" || statusRaw === "completed";
-  const status    = isPaid ? "paid" : statusRaw === "cancelled" ? "cancelled" : statusRaw === "expired" ? "expired" : "pending";
+  // BuckPay funciona hoje — mesma ordem de candidatos de antes, só migrado pra
+  // lista (candidates[0] == o `id` que o código antigo calculava).
+  const data       = (body.data && typeof body.data === "object" ? body.data : body) as Record<string, unknown>;
+  const candidates = collectCandidates(data.id, data.transaction_id, data.external_id);
+  const statusRaw  = String(data.status ?? body.event ?? "");
+  const isPaid     = statusRaw === "paid" || statusRaw === "approved" || statusRaw === "completed";
+  const status     = isPaid ? "paid" : statusRaw === "cancelled" ? "cancelled" : statusRaw === "expired" ? "expired" : "pending";
   // total_amount já vem em centavos (inteiro).
-  const amountRaw = data.total_amount ?? data.amount;
+  const amountRaw  = data.total_amount ?? data.amount;
   return {
-    externalId: id,
-    provider:   "buckpay",
+    externalId:           candidates[0] ?? "",
+    externalIdCandidates: candidates,
+    provider:             "buckpay",
     status,
-    amount:     typeof amountRaw === "number" ? Math.round(amountRaw) : null,
-    event:      String(body.event ?? statusRaw),
+    amount:               typeof amountRaw === "number" ? Math.round(amountRaw) : null,
+    event:                String(body.event ?? statusRaw),
   };
 }
 
+// Statuses/eventos de PAGO conhecidos da NexusPag — match EXATO (mesmo motivo
+// do syncpay). "payment.confirmed" é o evento confirmado em produção; o campo
+// `status` pode faltar em alguma variante de payload, então checamos os dois
+// (status E event) — qualquer um bater já é suficiente.
+const NEXUSPAG_PAID_STATUSES = new Set(["paid", "approved", "completed", "complete", "confirmed", "success"]);
+const NEXUSPAG_PAID_EVENTS   = new Set(["payment.confirmed", "payment.paid", "payment.approved", "transaction.paid"]);
+
 export function normalizeNexuspagWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
-  // A criação devolve a transação em `transaction`; o webhook pode vir aninhado
-  // assim ou plano — cobrimos os dois.
+  // A criação devolve a transação em `transaction`, mas o webhook REAL chega
+  // PLANO (sem wrapper) — cobrimos os dois. O payload plano não tem `id`; o
+  // campo confirmado em produção que bate com payments.external_id (gravado
+  // como String(tx.id) da resposta de criação) é `transaction_id`. O
+  // `external_id` do payload é um id INTERNO da NexusPag, diferente do nosso,
+  // e NUNCA bate — por isso, de novo, tentamos todos os candidatos.
   const tx = (body.transaction && typeof body.transaction === "object" ? body.transaction : body) as Record<string, unknown>;
-  const id        = String(tx.id ?? tx.txid ?? body.id ?? body.transaction_id ?? "");
-  const statusRaw = String((tx.status ?? body.status) ?? "").toLowerCase();
-  const isPaid    = statusRaw.includes("paid") || statusRaw.includes("approved") || statusRaw.includes("complet");
+  const candidates = collectCandidates(
+    tx.transaction_id, body.transaction_id,
+    tx.id, body.id,
+    tx.external_id, body.external_id,
+    tx.txid, body.txid,
+  );
+  const statusRaw = String((tx.status ?? body.status) ?? "").toLowerCase().trim();
+  const eventRaw  = String((tx.event ?? body.event) ?? "").toLowerCase().trim();
+  const isPaid    = NEXUSPAG_PAID_STATUSES.has(statusRaw) || NEXUSPAG_PAID_EVENTS.has(eventRaw);
   const status    = isPaid ? "paid" : statusRaw.includes("cancel") ? "cancelled" : statusRaw.includes("expir") ? "expired" : "pending";
   // amount em REAIS.
   const amountRaw = tx.amount ?? tx.net_amount ?? body.amount;
   return {
-    externalId: id,
-    provider:   "nexuspag",
+    externalId:           candidates[0] ?? "",
+    externalIdCandidates: candidates,
+    provider:             "nexuspag",
     status,
-    amount:     typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
-    event:      statusRaw,
+    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    event:                eventRaw || statusRaw,
   };
 }
 
 export function normalizeWiinpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   const data = (body.data && typeof body.data === "object" ? body.data : body) as Record<string, unknown>;
   // A criação usa `paymentId` como id (resposta aninhada em data) — o webhook
-  // deve seguir o mesmo shape.
-  const id        = String(data.paymentId ?? data.id ?? data.charge_id ?? body.id ?? "");
+  // deve seguir o mesmo shape. WiinPay funciona hoje — mesma ordem de
+  // candidatos de antes, só migrado pra lista.
+  const candidates = collectCandidates(data.paymentId, data.id, data.charge_id, body.id);
   const statusRaw = String((data.status ?? body.status ?? body.event) ?? "").toLowerCase();
   const isPaid    = statusRaw.includes("paid") || statusRaw.includes("approved") || statusRaw.includes("complet");
   const status    = isPaid ? "paid" : statusRaw.includes("cancel") ? "cancelled" : statusRaw.includes("expir") ? "expired" : "pending";
   // WiinPay usa `value` (REAIS), não `amount`.
   const amountRaw = data.value ?? data.amount ?? body.value;
   return {
-    externalId: id,
-    provider:   "wiinpay",
+    externalId:           candidates[0] ?? "",
+    externalIdCandidates: candidates,
+    provider:             "wiinpay",
     status,
-    amount:     typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
-    event:      statusRaw,
+    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    event:                statusRaw,
   };
 }
