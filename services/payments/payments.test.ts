@@ -126,12 +126,12 @@ describe("split por provider", () => {
     } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
   });
 
-  it("buckpay: basis points arredonda pra cima (600c → 667 bps)", async () => {
+  it("buckpay: split em valor fixo de 40 centavos", async () => {
     process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL = "x@y.com";
     try {
       await createPix("buckpay", "c", "s", 600, "P", "https://wh");
       const call = getOtherCalls().find((x) => x.url.includes("realtechdev"));
-      expect((call!.body!.splits as any)[0].percentage_bps).toBe(667); // ceil(40/600*10000)
+      expect((call!.body!.splits as any)[0].amount_cents).toBe(40);
     } finally { delete process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL; }
   });
 

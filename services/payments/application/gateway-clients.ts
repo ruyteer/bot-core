@@ -52,28 +52,18 @@ function syncpaySplitPercentage(amountCents: number): number {
   return Math.max(1, Math.min(99, p));
 }
 
-// BuckPay: split em basis points (1 bp = 0,01%), min 1 / max 9000, calculado
-// sobre o líquido. Convertemos os 40c fixos p/ bps sobre o valor bruto (não
-// sabemos a taxa no momento da criação) — aproximado, arredondando pra cima.
-function buckpaySplitBps(amountCents: number): number {
-  const bps = Math.ceil((PLATFORM_SPLIT_CENTS / amountCents) * 10000);
-  return Math.max(1, Math.min(9000, bps));
-}
-
 // Fonte da verdade para "quanto a plataforma efetivamente retém, em centavos,
 // nesse provider, pra esse valor bruto" — reusa os MESMOS helpers usados pra
-// montar o split enviado ao gateway (syncpaySplitPercentage/buckpaySplitBps/
-// PLATFORM_SPLIT_CENTS), pra nunca divergir do que é de fato enviado.
-// SyncPay/BuckPay enviam percentual/bps (não um valor fixo em centavos), então
-// aqui reconstruímos o valor retido aplicando esse percentual/bps de volta
-// sobre o amountCents. NexusPag/WiinPay enviam um valor fixo em reais.
+// montar o split enviado ao gateway (syncpaySplitPercentage/PLATFORM_SPLIT_CENTS),
+// pra nunca divergir do que é de fato enviado.
+// SyncPay só aceita percentual, então aqui reconstruímos o valor retido
+// aplicando esse percentual de volta sobre o amountCents. BuckPay/NexusPag/
+// WiinPay enviam um valor fixo em centavos/reais.
 export function platformSplitCents(provider: Provider, amountCents: number): number {
   if (amountCents <= 0) return 0;
   switch (provider) {
     case "syncpay":
       return Math.round((amountCents * syncpaySplitPercentage(amountCents)) / 100);
-    case "buckpay":
-      return Math.round((amountCents * buckpaySplitBps(amountCents)) / 10000);
     default:
       return Math.min(PLATFORM_SPLIT_CENTS, amountCents);
   }
@@ -214,9 +204,12 @@ export async function buckpayCashIn(
     postbackUrl:    webhookUrl,
   };
   if (splitReceiverEmail) {
-    // Split por e-mail + basis points (percentual). O recebedor precisa estar
-    // cadastrado na Buck. Calculado sobre o líquido.
-    body.splits = [{ email: splitReceiverEmail, percentage_bps: buckpaySplitBps(amountCents) }];
+    // Split por e-mail + valor fixo em centavos (`amount_cents`, min. 1 centavo)
+    // — a Buck passou a suportar valor fixo além do percentual em bps, o que
+    // elimina a aproximação que antes convertia os 40c fixos pra um percentual
+    // (bug: não bate exato pra cada ticket). O recebedor precisa estar
+    // cadastrado na Buck.
+    body.splits = [{ email: splitReceiverEmail, amount_cents: PLATFORM_SPLIT_CENTS }];
   }
   const res = await fetch(`${BUCKPAY_BASE_URL}/v1/transactions`, {
     method:  "POST",
@@ -399,13 +392,17 @@ export function collectCandidates(...values: unknown[]): string[] {
   return out;
 }
 
-// Statuses de PAGO conhecidos da SyncPay — match EXATO, nunca substring: um
-// `.includes("approv")` classificaria "WAITING_FOR_APPROVAL" (status de
-// análise manual, NÃO pago) como aprovada. Bug real visto em produção: 17
-// webhooks recebidos em 3 semanas, só "pending" e "WAITING_FOR_APPROVAL",
-// nenhum pago — se algum dia chegar um "paid"/"completed" real, precisa cair
-// aqui, não em "approv" por acidente.
-const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "approved", "success", "confirmed"]);
+// Statuses de PAGO conhecidos da SyncPay — match EXATO, nunca substring (ver
+// abaixo). "waiting_for_approval" está incluído de propósito: consulta em
+// produção (2026-08-13, payment_webhook_logs) mostrou que as transações desta
+// conta SyncPay nunca saem desse status para um "paid"/"completed" — a doc
+// oficial da SyncPay nem lista "WAITING_FOR_APPROVAL" entre os status do
+// endpoint de consulta (só pending/completed/failed/refunded/med), então é um
+// evento só-webhook que, nessa conta, é o sinal final de venda aprovada.
+// Decisão do usuário (2026-08-13): tratar como pago. Se a SyncPay um dia
+// começar a mandar um "paid"/"completed" real após o waiting_for_approval,
+// isso já cai aqui do mesmo jeito — não precisa de match por substring.
+const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "approved", "success", "confirmed", "waiting_for_approval"]);
 
 export function normalizeSyncpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   // O webhook novo aninha a transação em `data`; o padrão OLD (do campo
