@@ -81,7 +81,18 @@ export async function enrollRemarketingTriggers(): Promise<number> {
       campaignId: camp.id, leadId: p.leadId, botId: p.botId,
       nextMessageIndex: 0, nextSendAt: now, status: "active",
     }));
-    if (rows.length) { await db.insert(remarketingLeadState).values(rows); enrolled += rows.length; }
+    // onConflictDoNothing é a rede de segurança contra a corrida entre replicas do
+    // runner (cada uma roda seu próprio setInterval sem lock distribuído — ver
+    // runner.ts): se duas replicas fizerem o SELECT de `existing` antes de qualquer
+    // uma inserir, a constraint única em (campaign_id, lead_id) garante que só a
+    // primeira INSERT vinga e a segunda é ignorada, em vez de criar uma linha
+    // duplicada que seria processada (e enviada) duas vezes.
+    if (rows.length) {
+      const inserted = await db.insert(remarketingLeadState).values(rows)
+        .onConflictDoNothing({ target: [remarketingLeadState.campaignId, remarketingLeadState.leadId] })
+        .returning({ id: remarketingLeadState.id });
+      enrolled += inserted.length;
+    }
   }
   return enrolled;
 }
@@ -107,6 +118,17 @@ export async function processDueRemarketing(): Promise<number> {
 
   for (const st of claimed) {
     try {
+      // Toque otimista (CAS em status+updatedAt): se este lote demorar mais que os
+      // 10min do resgate de travados acima (ex.: vários envios lentos/timeout em
+      // sequência), outra réplica pode ter recuperado ESTA linha (status voltou p/
+      // "active") e reclamado de novo antes de chegarmos aqui. Nesse caso o UPDATE
+      // abaixo não afeta nenhuma linha (status/updatedAt não batem mais) e pulamos
+      // o envio em vez de duplicar — a outra réplica agora é a dona da linha.
+      const touched = await db.update(remarketingLeadState).set({ updatedAt: now })
+        .where(and(eq(remarketingLeadState.id, st.id), eq(remarketingLeadState.status, "processing"), eq(remarketingLeadState.updatedAt, st.updatedAt)))
+        .returning({ id: remarketingLeadState.id });
+      if (!touched.length) continue;
+
       const [camp] = await db.select().from(remarketingCampaigns).where(eq(remarketingCampaigns.id, st.campaignId));
       if (!camp || !camp.isActive) { await db.update(remarketingLeadState).set({ status: "paused", pauseReason: "campaign_inactive", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
       if (camp.stopOnPurchase && await hasPaid(st.leadId)) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "purchased", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }

@@ -355,6 +355,13 @@ export const enroll = api(
 
     if (toEnroll.length > 0) {
       const now = new Date();
+      // Upsert: leads nunca inscritos viram um INSERT normal; leads com estado
+      // terminal (completed/stopped/blocked/error) já têm uma linha para este
+      // (campaign_id, lead_id) e são reinscritos via UPDATE dessa mesma linha,
+      // reiniciando a sequência do zero — nunca um segundo INSERT (constraint
+      // única em campaign_id+lead_id). A cláusula WHERE é uma trava extra contra
+      // a corrida: se a linha virou active/paused entre o SELECT acima e este
+      // INSERT, o conflito não atualiza nada (não reinicia um lead em andamento).
       await db.insert(remarketingLeadState).values(
         toEnroll.map((l) => ({
           leadId:     l.id,
@@ -363,7 +370,19 @@ export const enroll = api(
           status:     "active" as const,
           nextSendAt: now,
         }))
-      );
+      ).onConflictDoUpdate({
+        target: [remarketingLeadState.campaignId, remarketingLeadState.leadId],
+        set: {
+          botId:             sql`excluded.bot_id`,
+          status:            "active",
+          nextSendAt:        sql`excluded.next_send_at`,
+          nextMessageIndex:  0,
+          cyclesCompleted:   0,
+          consecutiveErrors: 0,
+          updatedAt:         now,
+        },
+        where: sql`${remarketingLeadState.status} NOT IN ('active', 'paused')`,
+      });
     }
 
     return { enrolled: toEnroll.length, total: eligibleLeads.length };

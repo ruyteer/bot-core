@@ -192,6 +192,23 @@ const STATEMENTS: string[] = [
   // 0010_kwai_click_id.sql
   `ALTER TABLE "leads" ADD COLUMN IF NOT EXISTS "kwai_click_id" text`,
   `ALTER TABLE "tracking_clicks" ADD COLUMN IF NOT EXISTS "kwai_click_id" text`,
+
+  // 0011_remarketing_lead_state_unique.sql — corrige remarketing duplicado:
+  // remove duplicatas existentes por (campaign_id, lead_id) mantendo a linha mais
+  // relevante (updated_at mais recente, depois mais avançada no ciclo, depois mais
+  // antiga criada como desempate) e cria a constraint única que impede recorrência.
+  `WITH ranked AS (
+     SELECT "id", ROW_NUMBER() OVER (
+       PARTITION BY "campaign_id", "lead_id"
+       ORDER BY "updated_at" DESC, "cycles_completed" DESC, "next_message_index" DESC, "created_at" DESC, "id" DESC
+     ) AS rn
+     FROM "remarketing_lead_state"
+   )
+   DELETE FROM "remarketing_lead_state" WHERE "id" IN (SELECT "id" FROM ranked WHERE rn > 1)`,
+  `DO $$ BEGIN
+     ALTER TABLE "remarketing_lead_state" ADD CONSTRAINT "remarketing_lead_state_campaign_id_lead_id_key"
+       UNIQUE ("campaign_id", "lead_id");
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
 ];
 
 export async function ensureSchema(): Promise<void> {
