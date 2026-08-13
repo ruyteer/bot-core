@@ -43,7 +43,10 @@ describe("offer node — apresentação e compra", () => {
     await useCase.execute({ botId: bot.id, update: startUpdate(700) });
     const presented = getTelegramCalls().find((c) => c.body.reply_markup);
     const kb = (presented!.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
-    expect(kb[0][0].callback_data).toBe("offer:0");
+    // callback_data agora carrega a identidade do nó (o:<nodeId8>:<i>), pra um
+    // teclado antigo lá em cima da conversa não conseguir mexer no nó atual.
+    // O formato legado "offer:0" continua sendo aceito na entrada.
+    expect(kb[0][0].callback_data).toMatch(/^o:[a-z0-9]{1,8}:0$/);
 
     const db = await testDb();
     const delays = await db.select().from(scheduledDelays);
