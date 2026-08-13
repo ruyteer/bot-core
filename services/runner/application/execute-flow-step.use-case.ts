@@ -85,6 +85,151 @@ function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Rec
   return out;
 }
 
+// Handle de um botão. O frontend usa `btn.callback || btn.text || btn_<i>` no nó
+// `buttons` dedicado (ButtonsNode) e `btn.callback || btn.text ||
+// btn_<blockIdx>_<btnIdx>` nos blocos de botões dentro de um nó `message`
+// (MessageNode) — replicamos os dois para casar com node_connections.source_handle.
+function buttonHandleId(btn: Record<string, unknown>, fallback: string): string {
+  const callback = typeof btn.callback === "string" ? btn.callback : "";
+  const text     = typeof btn.text === "string" ? btn.text : "";
+  return callback || text || fallback;
+}
+
+// `callback_data` do Telegram tem limite de 1..64 BYTES — e o handleId pode ser o
+// TEXTO do botão (17 emojis já estouram). Mandar o handleId cru fazia o
+// sendMessage inteiro falhar (BUTTON_DATA_INVALID) e o texto do nó nem saía.
+// Vai um id CURTO e estável por POSIÇÃO (`btn:<i>` no nó `buttons`,
+// `btn:<blockIdx>:<btnIdx>` nos blocos de um nó `message`), resolvido de volta
+// para o handleId no servidor quando o clique chega — mesma ideia do `offer:<i>`.
+function buttonCallbackId(blockIdx: number | null, btnIdx: number): string {
+  return blockIdx === null ? `btn:${btnIdx}` : `btn:${blockIdx}:${btnIdx}`;
+}
+
+// Handles candidatos para um `callback_data` recebido, em ordem de prioridade.
+//   • `btn:<i>` / `btn:<blockIdx>:<btnIdx>` (formato NOVO) → resolve pelo
+//     conteúdo ATUAL do nó; editar o texto do botão depois de desenhar a aresta
+//     não quebra o casamento, porque a posição não muda.
+//   • qualquer outro valor → ele próprio, que é o formato ANTIGO (`callback_data`
+//     = `btn.callback`/`btn.value`): teclados que já estão no Telegram desde
+//     antes do deploy continuam funcionando.
+// `known` = o clique é de um botão DESTE nó (posição resolvida no conteúdo).
+function resolveButtonCallback(
+  content:      Record<string, unknown>,
+  callbackData: string,
+): { handles: string[]; known: boolean } {
+  const handles: string[] = [];
+  const add = (h: unknown): void => {
+    if (typeof h === "string" && h && !handles.includes(h)) handles.push(h);
+  };
+
+  let known = false;
+  if (callbackData.startsWith("btn:")) {
+    const parts = callbackData.slice("btn:".length).split(":");
+    const idx   = parts.map((p) => (/^\d+$/.test(p) ? parseInt(p, 10) : -1));
+    if (idx.length <= 2 && idx.every((n) => n >= 0)) {
+      let btn: Record<string, unknown> | undefined;
+      let fallback = "";
+      if (idx.length === 1) {
+        const btns = content.buttons as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(btns)) { btn = btns[idx[0]]; fallback = `btn_${idx[0]}`; }
+      } else {
+        const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+        const block  = Array.isArray(blocks) ? blocks[idx[0]] : undefined;
+        const btns   = block?.buttons as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(btns)) { btn = btns[idx[1]]; fallback = `btn_${idx[0]}_${idx[1]}`; }
+      }
+      if (btn && typeof btn === "object") {
+        known = true;
+        add(buttonHandleId(btn, fallback));
+        add(btn.callback); // aresta desenhada antes de o texto virar o handle
+        add(btn.value);    // formato pré-histórico do nó `buttons`
+      }
+    }
+  }
+  add(callbackData);
+  return { handles, known };
+}
+
+// Coleta os botões CLICÁVEIS (os que ganham conector de FUNIL no editor) de um
+// nó, com o handleId EXATO que o frontend usa. Cobre o nó `buttons` dedicado
+// (content.buttons) e blocos de botões dentro de um nó `message` (blocks[].buttons).
+function collectNodeButtons(content: Record<string, unknown>): Array<{ button: Record<string, unknown>; handleId: string }> {
+  const out: Array<{ button: Record<string, unknown>; handleId: string }> = [];
+  const push = (btn: Record<string, unknown>, fallback: string): void => {
+    if (!btn || typeof btn !== "object") return;
+    // `url` abre link e não volta como callback. `action: "offer"` é legado (o
+    // editor atual só oferece Funil/Link): o conector dele é `<handle>__paid|
+    // __pending|__no_action` e a compra só dispara por `offer:<i>` — não há
+    // aresta `<handle>` para casar, então ele NÃO pode segurar o nó.
+    if (btn.action === "url" || btn.action === "offer") return;
+    out.push({ button: btn, handleId: buttonHandleId(btn, fallback) });
+  };
+
+  const direct = content.buttons as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(direct)) direct.forEach((btn, i) => push(btn, `btn_${i}`));
+
+  const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(blocks)) {
+    blocks.forEach((block, blockIdx) => {
+      if (block.type !== "buttons") return;
+      const btns = block.buttons as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(btns)) return;
+      btns.forEach((btn, btnIdx) => push(btn, `btn_${blockIdx}_${btnIdx}`));
+    });
+  }
+  return out;
+}
+
+// Teclado inline dos blocos de botões de um nó `message`. Botões de link viram
+// linha `url`; os demais mandam o id posicional curto como `callback_data`.
+// Botões `action: "offer"` (legado) ficam de FORA: nunca houve caminho de compra
+// para eles aqui — desenhá-los daria um botão morto. Como antes desta correção
+// nenhum teclado saía nesses nós, o lead não perde nada que já recebia.
+function blockButtonsKeyboard(
+  content: Record<string, unknown>,
+  vars:    Map<string, string>,
+): Array<Array<Record<string, unknown>>> {
+  const rows: Array<Array<Record<string, unknown>>> = [];
+  const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+  if (!Array.isArray(blocks)) return rows;
+
+  blocks.forEach((block, blockIdx) => {
+    if (block.type !== "buttons") return;
+    const btns = block.buttons as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(btns)) return;
+    btns.forEach((btn, btnIdx) => {
+      const rawLabel = (btn.text ?? btn.label ?? "") as string;
+      const label = typeof rawLabel === "string" && rawLabel ? interpolate(rawLabel, vars) : "";
+      if (!label) return;
+      const url = typeof btn.url === "string" ? btn.url : "";
+      if (btn.action === "url" || url) {
+        if (url) rows.push([{ text: label, url }]);
+        return;
+      }
+      if (btn.action === "offer") return; // legado sem caminho de compra aqui
+      rows.push([{ text: label, callback_data: buttonCallbackId(blockIdx, btnIdx) }]);
+    });
+  });
+  return rows;
+}
+
+// Tempo (em segundos) do timeout "sem clique" de um nó com botões. Fica em
+// `content.no_click_timeout_seconds` (nó `buttons`) ou no bloco de botões
+// (`blocks[].no_click_timeout_seconds`, nó `message`). Ausente/<=0 → sem timeout.
+function noClickTimeoutSeconds(content: Record<string, unknown>): number {
+  const direct = content.no_click_timeout_seconds;
+  if (typeof direct === "number" && direct > 0) return direct;
+  const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(blocks)) {
+    for (const block of blocks) {
+      if (block.type !== "buttons") continue;
+      const v = block.no_click_timeout_seconds;
+      if (typeof v === "number" && v > 0) return v;
+    }
+  }
+  return 0;
+}
+
 // `sale_type` de uma compra no flow. O tipo vive no NÓ (`content.offer_kind`,
 // gravado pelo FunnelEditor: "upsell" | "downsell"; ausente/"main" = oferta
 // principal). Ofertas embutidas num nó `message` não têm kind → "offer".
@@ -211,12 +356,40 @@ async function saveInbound(leadId: string, botId: string, content: Record<string
   await db.insert(leadMessages).values({ leadId, botId, direction: "inbound", content });
 }
 
+// Próximo nó a partir de uma saída do nó atual.
+//
+// COM `sourceHandle`: casa a aresta por igualdade EXATA (é o contrato dos
+// conectores nomeados: `<handle>__paid`, "true"/"false", "no_response", ...).
+//
+// SEM `sourceHandle` (avanço genérico, "caiu do nó pra baixo"): usa SÓ a aresta
+// da saída genérica — `source_handle IS NULL`. Antes a consulta ignorava a
+// coluna e pegava uma aresta QUALQUER (sem ORDER BY), então um nó de mensagem
+// com blocos de botões/oferta era despachado por um conector de botão ao acaso
+// e o lead pulava para o ramo errado. Nenhum nó depende do comportamento antigo:
+// a saída genérica do editor (handle inferior do FlowNodeShell) é sempre salva
+// com handle NULL, e todo handle nomeado tem semântica própria (botão, oferta,
+// condição, random, wait_response) que jamais deve ser tomada "de graça".
+// `ORDER BY created_at, id` só para ser determinístico se houver duplicatas.
 async function nextNode(funnelId: string, sourceNodeId: string, sourceHandle?: string): Promise<string | null> {
+  const base = and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, sourceNodeId));
   const conditions = sourceHandle
-    ? and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, sourceNodeId), eq(nodeConnections.sourceHandle, sourceHandle))
-    : and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, sourceNodeId));
-  const [conn] = await db.select().from(nodeConnections).where(conditions).limit(1);
+    ? and(base, eq(nodeConnections.sourceHandle, sourceHandle))
+    : and(base, isNull(nodeConnections.sourceHandle));
+  const [conn] = await db.select().from(nodeConnections)
+    .where(conditions)
+    .orderBy(nodeConnections.createdAt, nodeConnections.id)
+    .limit(1);
   return conn?.targetNodeId ?? null;
+}
+
+// Handles de saída do nó que TÊM aresta desenhada (a saída genérica, cujo
+// `source_handle` é NULL, fica de fora de propósito). Serve para decidir se um nó
+// com botões pode mesmo segurar o lead ou se ele viraria um beco sem saída.
+async function connectedHandles(funnelId: string, nodeId: string): Promise<Set<string>> {
+  const rows = await db.select({ handle: nodeConnections.sourceHandle })
+    .from(nodeConnections)
+    .where(and(eq(nodeConnections.funnelId, funnelId), eq(nodeConnections.sourceNodeId, nodeId)));
+  return new Set(rows.map((r) => r.handle).filter((h): h is string => typeof h === "string" && h.length > 0));
 }
 
 async function advanceProgress(progressId: string, nodeId: string | null, status: string): Promise<void> {
@@ -376,6 +549,14 @@ export class ExecuteFlowStepUseCase {
 
       // Create or replace progress
       if (prog) {
+        // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
+        // (o "sem clique" do nó onde o lead estava, o __no_action de uma oferta,
+        // um nó `delay`) ficaria órfão e depois arrancaria o lead do funil
+        // recomeçado. Cancela antes de reposicionar no trigger.
+        await db.delete(scheduledDelays).where(and(
+          eq(scheduledDelays.progressId, prog.id),
+          eq(scheduledDelays.status, "pending"),
+        ));
         await db.update(leadProgress)
           .set({ funnelId: activeFunnel.id, currentNodeId: triggerNode.id, status: "active", updatedAt: new Date() })
           .where(eq(leadProgress.id, prog.id));
@@ -416,9 +597,37 @@ export class ExecuteFlowStepUseCase {
         return;
       }
 
-      if (currentNode?.type === "buttons") {
-        const nextId = await nextNode(prog.funnelId, currentNode.id, callbackData);
+      // Clique num botão de funil. Vale para o nó `buttons` dedicado E para
+      // blocos de botões dentro de um nó `message`.
+      const nodeContent = (currentNode?.content ?? {}) as Record<string, unknown>;
+      const nodeButtons = currentNode ? collectNodeButtons(nodeContent) : [];
+      if (currentNode && (currentNode.type === "buttons" || nodeButtons.length > 0)) {
+        // `callback_data` novo é o id posicional curto; o antigo era o próprio
+        // handle. Tentamos os candidatos na ordem (novo → legado).
+        const { handles, known } = resolveButtonCallback(nodeContent, callbackData);
+        let nextId: string | null = null;
+        for (const handle of handles) {
+          nextId = await nextNode(prog.funnelId, currentNode.id, handle);
+          if (nextId) break;
+        }
+
+        // Botão sem aresta num nó de MENSAGEM (handle órfão: o texto do botão foi
+        // editado depois de a aresta ser desenhada). Antes desta feature o nó nem
+        // parava — ia embora pela saída genérica; mantemos essa saída para o
+        // clique não virar beco sem saída. Só quando o clique é comprovadamente
+        // DESTE nó, para um toque em teclado velho não empurrar o lead adiante.
+        const ownsClick = known || nodeButtons.some((b) => b.handleId === callbackData);
+        if (!nextId && currentNode.type === "message" && ownsClick) {
+          nextId = await nextNode(prog.funnelId, currentNode.id);
+        }
+
         if (nextId) {
+          // Só agora cancela o timeout "sem clique" pendente: se o clique não
+          // levou a lugar nenhum, o único escape do lead continua armado.
+          await db.delete(scheduledDelays).where(and(
+            eq(scheduledDelays.progressId, prog.id),
+            eq(scheduledDelays.status, "pending"),
+          ));
           await advanceProgress(prog.id, nextId, "active");
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
         }
@@ -578,6 +787,13 @@ export class ExecuteFlowStepUseCase {
     protect:    boolean,
     vars:       Map<string, string>,
   ): Promise<void> {
+    // Guarda conservadora contra delay ÓRFÃO: o progresso pode ter sido apagado
+    // ou ter mudado de funil (o lead deu /start e caiu noutro funil ativo) entre
+    // o agendamento e o vencimento. Só o FUNIL é verificado — o nó atual não
+    // serve de referência porque o nó `delay` grava `current_node_id = NULL` de
+    // propósito enquanto espera, e é justamente ele que retoma por aqui.
+    const [progress] = await db.select().from(leadProgress).where(eq(leadProgress.id, progressId));
+    if (!progress || progress.funnelId !== funnelId) return;
     await this.runNode(funnelId, nodeId, progressId, leadId, botId, chatId, tg, protect, vars, null);
   }
 
@@ -618,6 +834,29 @@ export class ExecuteFlowStepUseCase {
           await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
           return;
         }
+        // Bloco de BOTÕES dentro do nó de mensagem: o teclado inline já foi
+        // enviado por executeMessageNode; agora o nó se comporta como o nó
+        // `buttons` dedicado — PARA aqui e espera o clique (antes caía no avanço
+        // genérico e o lead era despachado por um conector de botão ao acaso).
+        //
+        // MAS só para se houver por onde SAIR: pelo menos um botão com aresta, ou
+        // o escape "sem clique" (tempo configurado + aresta no handle `no_click`).
+        // Funis salvos ANTES desta correção têm blocos de botões cujos handles
+        // nunca foram ligados (os botões simplesmente não funcionavam) e só a
+        // aresta genérica embaixo — parar neles seria um beco sem saída
+        // permanente. Sem saída de botão, seguimos pelo avanço genérico, exatamente
+        // como antes.
+        const msgButtons = collectNodeButtons(c);
+        if (msgButtons.length > 0) {
+          const wiredHandles = await connectedHandles(funnelId, node.id);
+          const anyButtonWired = msgButtons.some(({ handleId }) => wiredHandles.has(handleId));
+          const noClickEscape  = noClickTimeoutSeconds(c) > 0 && wiredHandles.has("no_click");
+          if (anyButtonWired || noClickEscape) {
+            await advanceProgress(progressId, node.id, "active");
+            await this.scheduleNoClickTimeout(funnelId, node, progressId, leadId, botId);
+            return;
+          }
+        }
         break;
       }
 
@@ -648,6 +887,8 @@ export class ExecuteFlowStepUseCase {
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         // Stay on this node waiting for callback
         await advanceProgress(progressId, node.id, "active");
+        // Se o lead não clicar em nada, dispara o ramo `no_click` (opcional).
+        await this.scheduleNoClickTimeout(funnelId, node, progressId, leadId, botId);
         return;
 
       case "input":
@@ -806,7 +1047,33 @@ export class ExecuteFlowStepUseCase {
     const blocks = (c.blocks as Array<Record<string, unknown>>) ?? [];
 
     if (blocks.length > 0) {
-      for (const block of blocks) {
+      // Blocos de BOTÕES (rodapé): o teclado inline é montado uma vez e vai
+      // ANEXADO à última mensagem de texto do nó (é assim que o editor mostra:
+      // os botões embaixo da mensagem). Sem nenhum bloco de texto, sai numa
+      // mensagem própria depois dos demais blocos. Antes o bloco `buttons`
+      // simplesmente não era tratado — nenhum teclado era enviado.
+      const keyboard = blockButtonsKeyboard(c, vars);
+      // Índice do último bloco que sai por sendMessage (é onde o teclado gruda).
+      const isTextSend = (b: Record<string, unknown>): boolean => {
+        const t = (b.message ?? b.content ?? b.text) as string | undefined;
+        if (typeof t !== "string" || !t) return false;
+        if (b.type === "text") return true;
+        const hasUrl = typeof b.url === "string" && b.url;
+        const isMedia = b.type === "media" || b.type === "image" || b.type === "video"
+                     || b.type === "document" || b.type === "audio";
+        return !(isMedia && hasUrl); // cai no fallback textual
+      };
+      let lastTextIdx = -1;
+      if (keyboard.length > 0) {
+        blocks.forEach((b, i) => { if (b.type !== "buttons" && isTextSend(b)) lastTextIdx = i; });
+      }
+
+      for (let blockIdx = 0; blockIdx < blocks.length; blockIdx++) {
+        const block = blocks[blockIdx];
+        if (block.type === "buttons") continue; // já virou teclado inline
+        const attach = keyboard.length > 0 && blockIdx === lastTextIdx
+          ? { inline_keyboard: keyboard }
+          : undefined;
         const url       = block.url as string | undefined;
         const text      = (block.message ?? block.content ?? block.text) as string | undefined;
         const caption   = typeof block.caption === "string" ? escapeHtml(interpolate(block.caption, vars)) : undefined;
@@ -817,7 +1084,7 @@ export class ExecuteFlowStepUseCase {
         await simulateAction(tg, chatId, !!block.simulate_typing, !!block.simulate_recording, text);
 
         if (block.type === "text" && text) {
-          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect, replyMarkup: attach });
         } else if ((block.type === "media" || block.type === "image" || block.type === "video" || block.type === "document") && url) {
           if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
           else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
@@ -825,8 +1092,17 @@ export class ExecuteFlowStepUseCase {
         } else if (block.type === "audio" && url) {
           await tg.sendAudio(chatId, url, caption, protect);
         } else if (text) {
-          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect });
+          await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect, replyMarkup: attach });
         }
+      }
+
+      // Nenhum bloco de texto para carregar o teclado → mensagem própria.
+      if (keyboard.length > 0 && lastTextIdx === -1) {
+        const rawTail = (c.message ?? c.text) as string | undefined;
+        const tail = typeof rawTail === "string" && rawTail
+          ? escapeHtml(interpolate(rawTail, vars))
+          : "Escolha uma opção:";
+        await tg.sendMessage({ chatId, text: tail, protectContent: protect, replyMarkup: { inline_keyboard: keyboard } });
       }
     } else {
       const text = (c.message ?? c.text) as string | undefined;
@@ -902,10 +1178,14 @@ export class ExecuteFlowStepUseCase {
     const raw     = (c.message ?? c.text) as string | undefined;
     const text    = typeof raw === "string" && raw ? escapeHtml(interpolate(raw, vars)) : "Escolha uma opção:";
     const buttons = (c.buttons as Array<Record<string, unknown>>) ?? [];
-    const keyboard = buttons.map((b) => {
+    const keyboard = buttons.map((b, i) => {
       const label = (b.text ?? b.label ?? "") as string;
       if (typeof b.url === "string" && b.url) return [{ text: label, url: b.url }];
-      return [{ text: label, callback_data: (b.callback ?? b.value ?? "") as string }];
+      // callback_data = id posicional curto (`btn:<i>`), resolvido no retorno para
+      // o handleId do editor (`callback || text || btn_<i>`). Com `callback`
+      // preenchido o destino é exatamente o de antes; sem ele, o botão deixa de
+      // mandar string vazia (que o Telegram rejeita) e passa a casar com a aresta.
+      return [{ text: label, callback_data: buttonCallbackId(null, i) }];
     });
     await tg.sendMessage({
       chatId,
@@ -962,9 +1242,14 @@ export class ExecuteFlowStepUseCase {
   }
 
   // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
-  // Usa `unpaid_timeout` (minutos, default 5, mín. 60s) do conteúdo do nó. Agenda
-  // um delay por oferta cujo handle (`<handleId>__no_action|__pending`) tenha
-  // conexão. Para __pending, só a oferta `onlyHandleId` (a que o lead clicou).
+  // Tempo (minutos, mín. 60s):
+  //   __no_action → `no_action_timeout` → `unpaid_timeout` → 5 (default antigo)
+  //   __pending   → `unpaid_timeout` → 5
+  // O campo dedicado `no_action_timeout` existe porque "Sem ação" era pilotado
+  // pelo campo "Tempo para não pago" — dois ramos com semânticas diferentes
+  // presos ao mesmo número. Sem o campo novo, nada muda.
+  // Agenda um delay por oferta cujo handle (`<handleId>__no_action|__pending`)
+  // tenha conexão. Para __pending, só a oferta `onlyHandleId` (a que o lead clicou).
   private async scheduleOfferTimeouts(
     funnelId:     string,
     node:         typeof funnelNodes.$inferSelect,
@@ -974,9 +1259,12 @@ export class ExecuteFlowStepUseCase {
     suffix:       "__no_action" | "__pending",
     onlyHandleId?: string,
   ): Promise<void> {
-    const content = node.content as Record<string, unknown> & { unpaid_timeout?: number };
+    const content = node.content as Record<string, unknown> & { unpaid_timeout?: number; no_action_timeout?: number };
     const offersList = collectNodeOffers(content);
-    const timeoutMin = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+    const unpaidMin  = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+    const timeoutMin = suffix === "__no_action" && typeof content.no_action_timeout === "number" && content.no_action_timeout > 0
+      ? content.no_action_timeout
+      : unpaidMin;
     const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
 
     for (const { handleId } of offersList) {
@@ -987,6 +1275,31 @@ export class ExecuteFlowStepUseCase {
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
       });
     }
+  }
+
+  // ── Agenda o timeout "sem clique" de um nó com botões ────────────────────────
+  // Espelha o `no_response` do wait_response: só agenda quando o usuário
+  // configurou um tempo (`no_click_timeout_seconds` > 0) E ligou o handle
+  // `no_click` a um próximo nó. Faltando qualquer um dos dois, NÃO agenda nada —
+  // o nó espera indefinidamente, exatamente como antes. Cancelado quando o lead
+  // clica (handler de callback / handleOfferPurchase).
+  private async scheduleNoClickTimeout(
+    funnelId:   string,
+    node:       typeof funnelNodes.$inferSelect,
+    progressId: string,
+    leadId:     string,
+    botId:      string,
+  ): Promise<void> {
+    const seconds = noClickTimeoutSeconds(node.content as Record<string, unknown>);
+    if (seconds <= 0) return;
+    const target = await nextNode(funnelId, node.id, "no_click");
+    if (!target) return;
+    await db.insert(scheduledDelays).values({
+      botId, leadId, funnelId, progressId,
+      nextNodeId: target,
+      executeAt:  new Date(Date.now() + seconds * 1000),
+      status:     "pending",
+    });
   }
 
   // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
