@@ -81,7 +81,18 @@ export async function enrollRemarketingTriggers(): Promise<number> {
       campaignId: camp.id, leadId: p.leadId, botId: p.botId,
       nextMessageIndex: 0, nextSendAt: now, status: "active",
     }));
-    if (rows.length) { await db.insert(remarketingLeadState).values(rows); enrolled += rows.length; }
+    // onConflictDoNothing é a rede de segurança contra a corrida entre replicas do
+    // runner (cada uma roda seu próprio setInterval sem lock distribuído — ver
+    // runner.ts): se duas replicas fizerem o SELECT de `existing` antes de qualquer
+    // uma inserir, a constraint única em (campaign_id, lead_id) garante que só a
+    // primeira INSERT vinga e a segunda é ignorada, em vez de criar uma linha
+    // duplicada que seria processada (e enviada) duas vezes.
+    if (rows.length) {
+      const inserted = await db.insert(remarketingLeadState).values(rows)
+        .onConflictDoNothing({ target: [remarketingLeadState.campaignId, remarketingLeadState.leadId] })
+        .returning({ id: remarketingLeadState.id });
+      enrolled += inserted.length;
+    }
   }
   return enrolled;
 }
@@ -107,6 +118,17 @@ export async function processDueRemarketing(): Promise<number> {
 
   for (const st of claimed) {
     try {
+      // Toque otimista (CAS em status+updatedAt): se este lote demorar mais que os
+      // 10min do resgate de travados acima (ex.: vários envios lentos/timeout em
+      // sequência), outra réplica pode ter recuperado ESTA linha (status voltou p/
+      // "active") e reclamado de novo antes de chegarmos aqui. Nesse caso o UPDATE
+      // abaixo não afeta nenhuma linha (status/updatedAt não batem mais) e pulamos
+      // o envio em vez de duplicar — a outra réplica agora é a dona da linha.
+      const touched = await db.update(remarketingLeadState).set({ updatedAt: now })
+        .where(and(eq(remarketingLeadState.id, st.id), eq(remarketingLeadState.status, "processing"), eq(remarketingLeadState.updatedAt, st.updatedAt)))
+        .returning({ id: remarketingLeadState.id });
+      if (!touched.length) continue;
+
       const [camp] = await db.select().from(remarketingCampaigns).where(eq(remarketingCampaigns.id, st.campaignId));
       if (!camp || !camp.isActive) { await db.update(remarketingLeadState).set({ status: "paused", pauseReason: "campaign_inactive", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
       if (camp.stopOnPurchase && await hasPaid(st.leadId)) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "purchased", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
@@ -125,8 +147,13 @@ export async function processDueRemarketing(): Promise<number> {
       // Grupo/canal (id negativo) nunca é alvo de remarketing.
       if (lead.telegramChatId <= 0n) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "not_a_user", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
-      if (!botCache.has(camp.botId)) { const [b] = await db.select().from(bots).where(eq(bots.id, camp.botId)); botCache.set(camp.botId, b); }
-      const bot = botCache.get(camp.botId);
+      // Envia SEMPRE pelo bot do estado, não pelo bot principal da campanha:
+      // uma campanha com vários `bot_ids` inscreve o lead de cada bot, e usar
+      // camp.botId fazia a mesma pessoa receber a mesma mensagem duas vezes
+      // pelo mesmo bot (uma por linha de estado).
+      const sendBotId = st.botId || camp.botId;
+      if (!botCache.has(sendBotId)) { const [b] = await db.select().from(bots).where(eq(bots.id, sendBotId)); botCache.set(sendBotId, b); }
+      const bot = botCache.get(sendBotId);
       if (!bot) { await db.update(remarketingLeadState).set({ status: "error", pauseReason: "bot_missing", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
       const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
@@ -137,7 +164,9 @@ export async function processDueRemarketing(): Promise<number> {
       const kb: Array<Array<Record<string, unknown>>> = buttons.filter((b) => b?.text && b?.url).map((b) => [{ text: String(b.text), url: String(b.url) }]);
       // Oferta anexada → botão de compra (bcast_buy), tratado pelo runner.
       if (msg.offerId) {
-        const [off] = await db.select().from(funnelOffers).where(and(eq(funnelOffers.id, msg.offerId), eq(funnelOffers.botId, camp.botId)));
+        // Oferta é escopada por bot: precisa ser a do bot que está enviando,
+        // senão o callback bcast_buy cairia num bot que não conhece a oferta.
+        const [off] = await db.select().from(funnelOffers).where(and(eq(funnelOffers.id, msg.offerId), eq(funnelOffers.botId, sendBotId)));
         if (off) kb.push([{ text: `🛒 ${off.name} — ${(Number(off.price) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}`, callback_data: `bcast_buy_${off.id}` }]);
       }
       const replyMarkup = kb.length ? { inline_keyboard: kb } : undefined;
@@ -168,7 +197,8 @@ export async function processDueRemarketing(): Promise<number> {
         pauseReason: maxedOut ? "max_cycles" : null, status: maxedOut ? "completed" : "active", updatedAt: now,
       }).where(eq(remarketingLeadState.id, st.id));
 
-      if (sentOk) await db.update(remarketingCampaigns).set({ totalMessagesSent: (camp.totalMessagesSent || 0) + 1, updatedAt: now }).where(eq(remarketingCampaigns.id, camp.id));
+      // totalMessagesSent não é mais mantido aqui: o valor é derivado de remarketing_lead_state.total_sent
+      // na API (evita o read-modify-write concorrente entre réplicas que perdia incrementos).
       processed++;
     } catch (e) {
       console.error("[remarketing] estado falhou:", st.id, e);

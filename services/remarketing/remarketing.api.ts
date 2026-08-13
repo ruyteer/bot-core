@@ -44,6 +44,7 @@ function toCampaignResponse(
   c: typeof remarketingCampaigns.$inferSelect,
   messageCount = 0,
   stats = { active: 0, paused: 0, completed: 0 },
+  counters?: { totalEnrolled: number; totalMessagesSent: number },
 ): CampaignResponse {
   return {
     id:               c.id,
@@ -59,12 +60,36 @@ function toCampaignResponse(
     stopOnReply:      c.stopOnReply,
     maxCycles:        c.maxCycles,
     isActive:         c.isActive,
-    totalEnrolled:    c.totalEnrolled,
-    totalMessagesSent: c.totalMessagesSent,
+    // Derivados de remarketing_lead_state (fonte de verdade) — as colunas na tabela
+    // de campanhas ficam desatualizadas por concorrência entre réplicas.
+    totalEnrolled:    counters?.totalEnrolled ?? c.totalEnrolled,
+    totalMessagesSent: counters?.totalMessagesSent ?? c.totalMessagesSent,
     messageCount,
     leadStateStats:   stats,
     createdAt:        c.createdAt.toISOString(),
   };
+}
+
+// Deriva enrolled/messagesSent a partir de remarketing_lead_state para um conjunto de campanhas,
+// em uma única query agregada (evita N+1). remarketing_lead_state é a fonte de verdade:
+// as colunas totalEnrolled/totalMessagesSent em remarketing_campaigns podem ficar desatualizadas.
+async function getCampaignCounters(campaignIds: string[]): Promise<Map<string, { totalEnrolled: number; totalMessagesSent: number }>> {
+  const map = new Map<string, { totalEnrolled: number; totalMessagesSent: number }>();
+  if (campaignIds.length === 0) return map;
+
+  const rows = await db.select({
+    campaignId:        remarketingLeadState.campaignId,
+    totalEnrolled:      sql<number>`count(*)::int`,
+    totalMessagesSent: sql<number>`coalesce(sum(${remarketingLeadState.totalSent}), 0)::int`,
+  })
+    .from(remarketingLeadState)
+    .where(inArray(remarketingLeadState.campaignId, campaignIds))
+    .groupBy(remarketingLeadState.campaignId);
+
+  for (const r of rows) {
+    map.set(r.campaignId, { totalEnrolled: r.totalEnrolled, totalMessagesSent: r.totalMessagesSent });
+  }
+  return map;
 }
 
 function toMessageResponse(m: typeof remarketingMessages.$inferSelect): MessageResponse {
@@ -118,13 +143,14 @@ export const list = api(
     if (campaigns.length === 0) return { campaigns: [] };
 
     const ids = campaigns.map((c) => c.id);
-    const [msgCounts, statRows] = await Promise.all([
+    const [msgCounts, statRows, countersMap] = await Promise.all([
       db.select({ campaignId: remarketingMessages.campaignId, count: sql<number>`count(*)::int` })
         .from(remarketingMessages).where(inArray(remarketingMessages.campaignId, ids))
         .groupBy(remarketingMessages.campaignId),
       db.select({ campaignId: remarketingLeadState.campaignId, status: remarketingLeadState.status, count: sql<number>`count(*)::int` })
         .from(remarketingLeadState).where(inArray(remarketingLeadState.campaignId, ids))
         .groupBy(remarketingLeadState.campaignId, remarketingLeadState.status),
+      getCampaignCounters(ids),
     ]);
 
     const msgMap = new Map(msgCounts.map((r) => [r.campaignId, r.count]));
@@ -139,7 +165,7 @@ export const list = api(
 
     return {
       campaigns: campaigns.map((c) =>
-        toCampaignResponse(c, msgMap.get(c.id) ?? 0, statsMap.get(c.id) ?? { active: 0, paused: 0, completed: 0 })
+        toCampaignResponse(c, msgMap.get(c.id) ?? 0, statsMap.get(c.id) ?? { active: 0, paused: 0, completed: 0 }, countersMap.get(c.id))
       ),
     };
   },
@@ -152,7 +178,8 @@ export const get = api(
     const { userID: userId } = getAuthData()!;
     const c = await assertCampaignOwnership(id, userId);
     const messages = await db.select().from(remarketingMessages).where(eq(remarketingMessages.campaignId, id)).orderBy(remarketingMessages.orderIndex);
-    return { ...toCampaignResponse(c, messages.length), messages: messages.map(toMessageResponse) };
+    const counters = (await getCampaignCounters([id])).get(id);
+    return { ...toCampaignResponse(c, messages.length, undefined, counters), messages: messages.map(toMessageResponse) };
   },
 );
 
@@ -233,7 +260,8 @@ export const update = api(
     const [updated] = await db.update(remarketingCampaigns).set(patch).where(eq(remarketingCampaigns.id, id)).returning();
     scanSourceAsync("remarketing", id);
     const msgCount = await db.select({ count: sql<number>`count(*)::int` }).from(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
-    return toCampaignResponse(updated, msgCount[0]?.count ?? 0);
+    const counters = (await getCampaignCounters([id])).get(id);
+    return toCampaignResponse(updated, msgCount[0]?.count ?? 0, undefined, counters);
   },
 );
 
@@ -355,6 +383,13 @@ export const enroll = api(
 
     if (toEnroll.length > 0) {
       const now = new Date();
+      // Upsert: leads nunca inscritos viram um INSERT normal; leads com estado
+      // terminal (completed/stopped/blocked/error) já têm uma linha para este
+      // (campaign_id, lead_id) e são reinscritos via UPDATE dessa mesma linha,
+      // reiniciando a sequência do zero — nunca um segundo INSERT (constraint
+      // única em campaign_id+lead_id). A cláusula WHERE é uma trava extra contra
+      // a corrida: se a linha virou active/paused entre o SELECT acima e este
+      // INSERT, o conflito não atualiza nada (não reinicia um lead em andamento).
       await db.insert(remarketingLeadState).values(
         toEnroll.map((l) => ({
           leadId:     l.id,
@@ -363,7 +398,19 @@ export const enroll = api(
           status:     "active" as const,
           nextSendAt: now,
         }))
-      );
+      ).onConflictDoUpdate({
+        target: [remarketingLeadState.campaignId, remarketingLeadState.leadId],
+        set: {
+          botId:             sql`excluded.bot_id`,
+          status:            "active",
+          nextSendAt:        sql`excluded.next_send_at`,
+          nextMessageIndex:  0,
+          cyclesCompleted:   0,
+          consecutiveErrors: 0,
+          updatedAt:         now,
+        },
+        where: sql`${remarketingLeadState.status} NOT IN ('active', 'paused')`,
+      });
     }
 
     return { enrolled: toEnroll.length, total: eligibleLeads.length };

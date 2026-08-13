@@ -411,7 +411,10 @@ export const remarketingLeadState = pgTable("remarketing_lead_state", {
   pauseReason:        text("pause_reason"),
   createdAt:          timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:          timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Impede duas linhas de estado para o mesmo lead na mesma campanha (evita envios duplicados).
+  unique("remarketing_lead_state_campaign_id_lead_id_key").on(t.campaignId, t.leadId),
+]);
 
 // ─── TRACKING ─────────────────────────────────────────────────────────────────
 
