@@ -17,21 +17,24 @@ function replaceVars(text: string, lead: { firstName?: string | null; lastName?:
 // ── Recorrência (porte fiel do backend antigo: wall-clock em timezone IANA) ─────
 type RecurrenceFreq = "daily" | "weekly" | "monthly";
 interface RecurrenceRule { freq: RecurrenceFreq; weekdays?: number[]; day_of_month?: number; time: string; tz?: string }
-const DEFAULT_TZ = "America/Sao_Paulo";
+export const DEFAULT_TZ = "America/Sao_Paulo";
 
-function partsInTz(date: Date, tz: string) {
+export function partsInTz(date: Date, tz: string) {
   const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "short" });
   const map: Record<string, string> = {};
   for (const p of dtf.formatToParts(date)) if (p.type !== "literal") map[p.type] = p.value;
   const wd: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
   return { y: +map.year, mo: +map.month - 1, d: +map.day, h: +map.hour % 24, mi: +map.minute, s: +map.second, wd: wd[map.weekday] ?? 0 };
 }
-function zonedWallTimeToUtc(y: number, mo: number, d: number, h: number, mi: number, tz: string): Date {
-  let guess = Date.UTC(y, mo, d, h, mi, 0, 0);
+// `s` (segundos) é opcional e só usado pelo parser de ingestão em broadcasts.api.ts —
+// chamadas existentes de recorrência abaixo não passam esse argumento (default 0), então o
+// cálculo de próxima ocorrência permanece inalterado.
+export function zonedWallTimeToUtc(y: number, mo: number, d: number, h: number, mi: number, tz: string, s: number = 0): Date {
+  let guess = Date.UTC(y, mo, d, h, mi, s, 0);
   for (let i = 0; i < 2; i++) {
     const p = partsInTz(new Date(guess), tz);
     const localAsUtc = Date.UTC(p.y, p.mo, p.d, p.h, p.mi, p.s);
-    guess = Date.UTC(y, mo, d, h, mi, 0, 0) - (localAsUtc - guess);
+    guess = Date.UTC(y, mo, d, h, mi, s, 0) - (localAsUtc - guess);
   }
   return new Date(guess);
 }
