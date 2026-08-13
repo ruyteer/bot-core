@@ -197,7 +197,8 @@ export async function processDueRemarketing(): Promise<number> {
         pauseReason: maxedOut ? "max_cycles" : null, status: maxedOut ? "completed" : "active", updatedAt: now,
       }).where(eq(remarketingLeadState.id, st.id));
 
-      if (sentOk) await db.update(remarketingCampaigns).set({ totalMessagesSent: (camp.totalMessagesSent || 0) + 1, updatedAt: now }).where(eq(remarketingCampaigns.id, camp.id));
+      // totalMessagesSent não é mais mantido aqui: o valor é derivado de remarketing_lead_state.total_sent
+      // na API (evita o read-modify-write concorrente entre réplicas que perdia incrementos).
       processed++;
     } catch (e) {
       console.error("[remarketing] estado falhou:", st.id, e);
