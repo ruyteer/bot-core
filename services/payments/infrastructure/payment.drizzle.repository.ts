@@ -159,6 +159,24 @@ export class PaymentDrizzleRepository {
     return row ? this.toPayment(row) : null;
   }
 
+  // Alguns gateways (syncpay/nexuspag) não usam de forma confiável o mesmo
+  // campo de id entre a criação do PIX (o que gravamos em payments.external_id)
+  // e o webhook de confirmação — o payload chega com vários candidatos
+  // plausíveis (ver application/gateway-clients.ts normalizeXWebhook) e só um
+  // deles (às vezes nenhum, às vezes o "errado" primeiro) bate com o que foi
+  // gravado. Em vez de escolher um candidato e falhar, tentamos TODOS de uma
+  // vez com IN — mais barato que um loop de findByExternalId e evita o bug de
+  // "achei o webhook mas usei o campo errado" que nunca aprovava a venda.
+  async findByAnyExternalId(candidates: string[], provider: string): Promise<Payment | null> {
+    const ids = candidates.filter((c) => c && c.trim());
+    if (ids.length === 0) return null;
+    const [row] = await db.select().from(payments)
+      .where(and(inArray(payments.externalId, ids), sql`${payments.gatewayId} IN (
+        SELECT id FROM payment_gateways WHERE provider = ${provider}
+      )`));
+    return row ? this.toPayment(row) : null;
+  }
+
   async markPaid(id: string, finalAmount?: number): Promise<void> {
     await db.update(payments).set({
       status:      "paid",

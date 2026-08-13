@@ -59,42 +59,54 @@ async function creditPlatformRevenue(payment: Payment, provider: Provider): Prom
 // ── Shared handler ────────────────────────────────────────────────────────────
 
 export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<void> {
+  // Candidatos = TODOS os ids plausíveis extraídos do payload (normalizeXWebhook).
+  // Para buckpay/wiinpay isso é só [externalId] de sempre; para syncpay/nexuspag
+  // pode ter vários, porque o campo que bate com payments.external_id varia
+  // entre criação e webhook (ver gateway-clients.ts). primaryId é o candidato
+  // #1, usado só pra idempotência/log — o match de verdade tenta todos.
+  const candidates = event.externalIdCandidates && event.externalIdCandidates.length > 0
+    ? event.externalIdCandidates
+    : (event.externalId ? [event.externalId] : []);
+  const primaryId = event.externalId || candidates[0] || "";
+
   // Um `return` mudo aqui era o pior lugar possível para não deixar rastro: é
   // exatamente o caso em que o payload do provedor não bate com o que o
   // normalizador espera, e o único jeito de descobrir a forma real é vendo o
   // corpo que ele mandou. Sem log, "o provedor nunca chamou" e "chamou e não
   // entendemos" ficam indistinguíveis — e é a primeira pergunta de qualquer
   // investigação de venda não confirmada. Registra e só então desiste.
-  if (!event.externalId) {
+  if (candidates.length === 0) {
     await payRepo.logWebhook({
       provider:     event.provider,
       event:        event.event,
       payload:      rawPayload,
       status:       event.status,
       sourceIp,
-      errorMessage: "sem identificador: o normalizador não achou o id da transação neste payload",
+      errorMessage: "sem identificador: o normalizador não achou nenhum id de transação neste payload",
     });
     return;
   }
 
   // Idempotency — skip if already processed with same status
-  const already = await payRepo.isProcessed(event.externalId, event.provider);
+  const already = await payRepo.isProcessed(primaryId, event.provider);
   if (already) return;
 
-  const payment = await payRepo.findByExternalId(event.externalId, event.provider);
+  const payment = await payRepo.findByAnyExternalId(candidates, event.provider);
 
   await payRepo.logWebhook({
     provider:          event.provider,
-    externalId:        event.externalId,
+    externalId:        primaryId,
     event:             event.event,
     payload:           rawPayload,
     status:            event.status,
     sourceIp,
     matchedPaymentId:  payment?.id,
-    // Id extraído mas sem pagamento correspondente: quase sempre significa que
-    // gravamos um id na criação e o provedor devolve outro no webhook.
+    // Nenhum candidato bateu: quase sempre significa que gravamos um id na
+    // criação e o provedor devolve outro(s) no webhook. Lista os candidatos
+    // tentados — é assim que confirmamos em produção se o fix pegou todos os
+    // casos ou se falta mais um campo pra cobrir.
     ...(payment ? {} : {
-      errorMessage: `id "${event.externalId}" não corresponde a nenhum pagamento de ${event.provider}`,
+      errorMessage: `id "${primaryId}" não corresponde a nenhum pagamento de ${event.provider} (candidatos tentados: [${candidates.join(", ")}])`,
     }),
   });
 
@@ -133,7 +145,7 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
     }
   }
 
-  await payRepo.markProcessed(event.externalId, event.provider, event.status);
+  await payRepo.markProcessed(primaryId, event.provider, event.status);
 }
 
 // ── Helper p/ os 4 endpoints raw (lê body JSON, responde 200, processa) ─────────
