@@ -44,6 +44,20 @@ function replacePixVariables(text: string, vars: { nome?: string; valor?: string
     .replace(/\{mensagem\}/gi, vars.mensagem || "");
 }
 
+// Placeholders suportados nos labels editáveis de order bump: {nome} e {preco}
+// ({valor} é aceito como apelido de {preco}, para bater com os templates de PIX).
+function replaceOrderBumpVars(text: string, vars: { nome?: string; preco?: string }): string {
+  if (!text) return text || "";
+  return text
+    .replace(/\{nome\}/gi, vars.nome || "")
+    .replace(/\{(preco|valor)\}/gi, vars.preco || "");
+}
+
+// Retorna o texto do campo se for uma string não-vazia (após trim), senão undefined.
+function nonEmptyStr(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() ? v : undefined;
+}
+
 // Normaliza lista de mídias (novo formato `media[]` + legado `media_url`/`media_type`).
 function readSimpleMediaList(src: Record<string, unknown> | undefined): Array<{ url: string; type: string; has_spoiler?: boolean }> {
   if (!src) return [];
@@ -319,13 +333,18 @@ export class ExecuteSimplifiedFunnelUseCase {
     if (applicable.length > 1) {
       for (const ob of applicable) {
         const shortId = String(ob.id || "").substring(0, 8);
-        keyboard.push([{ text: `➕ ${ob.name} (+${fmtBRL(Number(ob.price || 0))})`, callback_data: `sb_one_${planId}_${shortId}` }]);
+        const itemLabelTpl = nonEmptyStr(ob.button_label) || "➕ {nome} (+{preco})";
+        const itemLabel = replaceOrderBumpVars(itemLabelTpl, { nome: String(ob.name || ""), preco: fmtBRL(Number(ob.price || 0)) });
+        keyboard.push([{ text: itemLabel, callback_data: `sb_one_${planId}_${shortId}` }]);
       }
-      keyboard.push([{ text: `✅ Adicionar tudo (+${fmtBRL(bumpsTotal)})`, callback_data: `sb_yes_${planId}` }]);
+      const addAllTpl = nonEmptyStr(cfg.order_bumps_add_all_label) || "✅ Adicionar tudo (+{preco})";
+      keyboard.push([{ text: replaceOrderBumpVars(addAllTpl, { preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}` }]);
     } else {
-      keyboard.push([{ text: `✅ Adicionar (+${fmtBRL(bumpsTotal)})`, callback_data: `sb_yes_${planId}` }]);
+      const addOneTpl = nonEmptyStr(cfg.order_bumps_add_one_label) || "✅ Adicionar (+{preco})";
+      keyboard.push([{ text: replaceOrderBumpVars(addOneTpl, { nome: String(applicable[0]?.name || ""), preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}` }]);
     }
-    keyboard.push([{ text: "Não, obrigado", callback_data: `sb_no_${planId}` }]);
+    const declineLabel = nonEmptyStr(cfg.order_bumps_decline_label) || "Não, obrigado";
+    keyboard.push([{ text: declineLabel, callback_data: `sb_no_${planId}` }]);
     await tg.sendMessage({ chatId, text, replyMarkup: { inline_keyboard: keyboard }, protectContent: protect });
   }
 
