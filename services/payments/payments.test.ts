@@ -220,14 +220,6 @@ describe("PaymentDrizzleRepository", () => {
     expect(await payRepo.isProcessed("e1", "buckpay")).toBe(true);
     await payRepo.markProcessed("e1", "buckpay", "paid"); // não duplica (onConflictDoNothing)
   });
-
-  it("findReusablePending acha pendente recente do mesmo ref/valor", async () => {
-    const p = await seedPayment("ext-reuse");
-    const found = await payRepo.findReusablePending(p.botId, p.leadId!, 1990, "ref1");
-    expect(found?.id).toBe(p.id);
-    // valor diferente não casa
-    expect(await payRepo.findReusablePending(p.botId, p.leadId!, 999, "ref1")).toBeNull();
-  });
 });
 
 // ── processWebhookEvent (fluxo completo) ────────────────────────────────────

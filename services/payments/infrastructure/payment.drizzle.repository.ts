@@ -92,24 +92,6 @@ export class PaymentDrizzleRepository {
     return row ? this.toPayment(row) : null;
   }
 
-  // Dedup de PIX: reaproveita uma cobrança pendente do mesmo (bot, lead, valor,
-  // ref) gerada na última 1h — evita PIX duplicado em cliques repetidos.
-  async findReusablePending(botId: string, leadId: string, amount: number, ref: string): Promise<Payment | null> {
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-    const [row] = await db.select().from(payments)
-      .where(and(
-        eq(payments.botId, botId),
-        eq(payments.leadId, leadId),
-        eq(payments.amount, amount),
-        eq(payments.status, "pending"),
-        eq(payments.offerExternalRef, ref),
-        gte(payments.createdAt, oneHourAgo),
-      ))
-      .orderBy(sql`${payments.createdAt} DESC`)
-      .limit(1);
-    return row ? this.toPayment(row) : null;
-  }
-
   async findByBotIds(botIds: string[], startDate?: Date, endDate?: Date): Promise<PaymentWithMeta[]> {
     if (botIds.length === 0) return [];
 
