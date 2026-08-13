@@ -4,6 +4,30 @@ import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { scheduledMessages, bots, broadcastRuns } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
+import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
+
+// ─── Ingestão de datas ────────────────────────────────────────────────────────
+// Strings ISO-8601 COM offset/Z são um instante inequívoco e podem ser parseadas
+// diretamente. Strings SEM offset (ex.: "2026-08-12T15:00", vindas de um
+// <input type="datetime-local">) são ambíguas: `new Date(...)` as interpretaria no
+// fuso horário do PROCESSO NODE (em produção, UTC no Railway), não no fuso do usuário —
+// causando disparos até 3h adiantados/atrasados. Por isso, entrada sem offset é
+// interpretada explicitamente no fuso do broadcast (tz da recurrenceRule, ou
+// DEFAULT_TZ = America/Sao_Paulo), usando o mesmo helper tz-aware da recorrência.
+const HAS_OFFSET = /(Z|[+-]\d{2}:?\d{2})$/;
+
+function extractTz(recurrenceRule: unknown): string {
+  const rule = recurrenceRule as { tz?: string } | null | undefined;
+  return (rule && typeof rule.tz === "string" && rule.tz) || DEFAULT_TZ;
+}
+
+function parseScheduledAt(input: string, tz: string = DEFAULT_TZ): Date {
+  if (HAS_OFFSET.test(input)) return new Date(input);
+  const [datePart, timePart = "00:00"] = input.split("T");
+  const [y, mo, d] = datePart.split("-").map(Number);
+  const [h, mi, s] = timePart.split(":").map((n) => Number(n) || 0);
+  return zonedWallTimeToUtc(y, (mo || 1) - 1, d, h, mi, tz, s || 0);
+}
 
 // ─── Response shapes ─────────────────────────────────────────────────────────
 
@@ -149,6 +173,7 @@ export const create = api(
     const allBotIds = req.botIds ?? [req.botId];
     if (!allBotIds.every((id) => userBotIdSet.has(id))) throw APIError.permissionDenied("bot not owned");
 
+    const tz = extractTz(req.recurrenceRule);
     const [row] = await db.insert(scheduledMessages).values({
       userId,
       botId:                    req.botId,
@@ -160,12 +185,12 @@ export const create = api(
       targetType:               req.targetType ?? "leads",
       targetGroupIds:           req.targetGroupIds ?? [],
       funnelId:                 req.funnelId ?? null,
-      scheduledAt:              new Date(req.scheduledAt),
+      scheduledAt:              parseScheduledAt(req.scheduledAt, tz),
       status:                   "pending",
       recurrenceRule:           req.recurrenceRule ?? null,
       recurrenceCount:          0,
       recurrenceMaxOccurrences: req.recurrenceMaxOccurrences ?? null,
-      recurrenceEndAt:          req.recurrenceEndAt ? new Date(req.recurrenceEndAt) : null,
+      recurrenceEndAt:          req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null,
     }).returning();
 
     scanSourceAsync("broadcast", row.id);
@@ -241,16 +266,20 @@ export const update = api(
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
 
+    // tz efetivo: usa a recurrenceRule enviada no patch (se houver), senão a já persistida —
+    // garante que scheduledAt/recurrenceEndAt sejam interpretados no mesmo fuso da recorrência.
+    const tz = extractTz("recurrenceRule" in req ? req.recurrenceRule : existing[0].recurrenceRule);
+
     const patch: Partial<typeof scheduledMessages.$inferInsert> = { updatedAt: new Date() };
     if (req.message !== undefined)                patch.message = req.message;
     if (req.filterType !== undefined)             patch.filterType = req.filterType;
     if ("advancedFilters" in req)                 patch.advancedFilters = req.advancedFilters;
     if (req.targetType !== undefined)             patch.targetType = req.targetType;
     if (req.targetGroupIds !== undefined)         patch.targetGroupIds = req.targetGroupIds;
-    if (req.scheduledAt !== undefined)            patch.scheduledAt = new Date(req.scheduledAt);
+    if (req.scheduledAt !== undefined)            patch.scheduledAt = parseScheduledAt(req.scheduledAt, tz);
     if ("recurrenceRule" in req)                  patch.recurrenceRule = req.recurrenceRule;
     if ("recurrenceMaxOccurrences" in req)        patch.recurrenceMaxOccurrences = req.recurrenceMaxOccurrences;
-    if (req.recurrenceEndAt !== undefined)        patch.recurrenceEndAt = req.recurrenceEndAt ? new Date(req.recurrenceEndAt) : null;
+    if (req.recurrenceEndAt !== undefined)        patch.recurrenceEndAt = req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null;
     if (req.recurrenceCount !== undefined)        patch.recurrenceCount = req.recurrenceCount;
 
     const [updated] = await db.update(scheduledMessages).set(patch).where(eq(scheduledMessages.id, id)).returning();
