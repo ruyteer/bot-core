@@ -190,8 +190,12 @@ export class PaymentDrizzleRepository {
     event?:    string;
     payload:   unknown;
     status?:   string;
+    /** Valor em centavos extraído do payload — pro card "Valor" no admin. */
+    amount?:   number | null;
     sourceIp?: string;
     matchedPaymentId?: string;
+    /** true = webhook entendido e tratado (achou o pagamento, sem erro). */
+    processed?: boolean;
     /** Por que este webhook não virou confirmação de venda. */
     errorMessage?: string;
   }): Promise<void> {
@@ -201,8 +205,10 @@ export class PaymentDrizzleRepository {
       event:            data.event,
       payload:          data.payload as Record<string, unknown>,
       status:           data.status,
+      amount:           data.amount ?? undefined,
       sourceIp:         data.sourceIp,
       matchedPaymentId: data.matchedPaymentId,
+      processed:        data.processed ?? false,
       errorMessage:     data.errorMessage,
     });
   }

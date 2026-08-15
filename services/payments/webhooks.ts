@@ -81,6 +81,7 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       event:        event.event,
       payload:      rawPayload,
       status:       event.status,
+      amount:       event.amount,
       sourceIp,
       errorMessage: "sem identificador: o normalizador não achou nenhum id de transação neste payload",
     });
@@ -99,8 +100,13 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
     event:             event.event,
     payload:           rawPayload,
     status:            event.status,
+    amount:            event.amount,
     sourceIp,
     matchedPaymentId:  payment?.id,
+    // processed=true só quando achamos o pagamento; sem isso todo webhook
+    // ficava com processed=false pra sempre e a tela de logs nunca marcava
+    // nada como "ok" — mesmo os que confirmaram vendas com sucesso.
+    processed:         !!payment,
     // Nenhum candidato bateu: quase sempre significa que gravamos um id na
     // criação e o provedor devolve outro(s) no webhook. Lista os candidatos
     // tentados — é assim que confirmamos em produção se o fix pegou todos os

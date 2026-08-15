@@ -30,6 +30,15 @@ describe("normalizadores de webhook", () => {
     const e = normalizeSyncpayWebhook({ identifier: "id1", status: "approved", amount: 19.9 });
     expect(e).toMatchObject({ provider: "syncpay", status: "paid", amount: 1990 });
   });
+  // Evento real de produção (2026-08-14): a SyncPay confirma o PIX com
+  // status "PAID_OUT" (data aninhada em `data`), não "paid"/"completed" —
+  // sem isso reconhecido, o webhook chegava mas a venda nunca era aprovada.
+  it("syncpay: PAID_OUT (payload real, data aninhada) → paid", () => {
+    const e = normalizeSyncpayWebhook({
+      data: { id: "212c6c2b-81e8-492d-98e5-1296ed181a4a", status: "PAID_OUT", amount: 5.9 },
+    });
+    expect(e).toMatchObject({ provider: "syncpay", status: "paid", amount: 590 });
+  });
   it("nexuspag: cancelled", () => {
     expect(normalizeNexuspagWebhook({ id: "n1", status: "cancelled" }).status).toBe("cancelled");
   });
@@ -240,6 +249,19 @@ describe("processWebhookEvent", () => {
     const got = await payRepo.findById(p.id);
     expect(got!.status).toBe("paid");
     expect(published.some((e) => e.topic === "payment-paid" && (e.event as { paymentId: string }).paymentId === p.id)).toBe(true);
+  });
+
+  // Sem isso, payment_webhook_logs.processed ficava sempre false — a tela de
+  // logs nunca marcava um webhook como "ok", nem os que confirmaram a venda.
+  it("pagamento encontrado → log gravado com processed=true e amount preenchido", async () => {
+    await seed("wh-log-ok");
+    await processWebhookEvent({ externalId: "wh-log-ok", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, { any: "payload" });
+    const db = await testDb();
+    const [log] = await db.select().from(paymentWebhookLogs)
+      .where(eq(paymentWebhookLogs.externalId, "wh-log-ok"));
+    expect(log.processed).toBe(true);
+    expect(log.amount).toBe(1990);
+    expect(log.errorMessage).toBeNull();
   });
 
   it("idempotente: segundo evento não republica", async () => {

@@ -402,7 +402,11 @@ export function collectCandidates(...values: unknown[]): string[] {
 // Decisão do usuário (2026-08-13): tratar como pago. Se a SyncPay um dia
 // começar a mandar um "paid"/"completed" real após o waiting_for_approval,
 // isso já cai aqui do mesmo jeito — não precisa de match por substring.
-const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "approved", "success", "confirmed", "waiting_for_approval"]);
+// "paid_out" confirmado em produção (2026-08-14): é o evento webhook que a
+// SyncPay manda quando o PIX é de fato liquidado — sem isso no set, esses
+// webhooks chegavam (registro "all" funciona) mas caíam em "pending" e a
+// venda nunca era aprovada.
+const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "paid_out", "approved", "success", "confirmed", "waiting_for_approval"]);
 
 export function normalizeSyncpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   // O webhook novo aninha a transação em `data`; o padrão OLD (do campo
