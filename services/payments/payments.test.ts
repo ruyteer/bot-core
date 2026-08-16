@@ -225,10 +225,20 @@ describe("PaymentDrizzleRepository", () => {
   });
 
   it("idempotência: isProcessed/markProcessed", async () => {
-    expect(await payRepo.isProcessed("e1", "buckpay")).toBe(false);
+    expect(await payRepo.isProcessed("e1", "buckpay", "paid")).toBe(false);
     await payRepo.markProcessed("e1", "buckpay", "paid");
-    expect(await payRepo.isProcessed("e1", "buckpay")).toBe(true);
+    expect(await payRepo.isProcessed("e1", "buckpay", "paid")).toBe(true);
     await payRepo.markProcessed("e1", "buckpay", "paid"); // não duplica (onConflictDoNothing)
+  });
+
+  // Regressão: status faz parte da chave de idempotência — um webhook "pending"
+  // processado antes NÃO pode bloquear um "paid" processado depois pro mesmo
+  // externalId (era exatamente o bug que travava vendas da SyncPay em pendente).
+  it("idempotência é por (externalId, provider, status) — pending não bloqueia paid", async () => {
+    expect(await payRepo.isProcessed("e2", "buckpay", "pending")).toBe(false);
+    await payRepo.markProcessed("e2", "buckpay", "pending");
+    expect(await payRepo.isProcessed("e2", "buckpay", "pending")).toBe(true);
+    expect(await payRepo.isProcessed("e2", "buckpay", "paid")).toBe(false);
   });
 });
 
@@ -271,6 +281,26 @@ describe("processWebhookEvent", () => {
     await processWebhookEvent({ externalId: "wh-idem", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, {});
     expect(published.length).toBe(countAfterFirst);
     void p;
+  });
+
+  // Regressão do bug que travava vendas da SyncPay em pendente: o webhook de
+  // criação (pending/waiting_for_approval) chega ANTES do de confirmação
+  // (paid_out), mesmo externalId. O primeiro não pode "consumir" a
+  // idempotência do segundo.
+  it("pending seguido de paid (mesmo externalId) → venda é aprovada mesmo assim", async () => {
+    const p = await seed("wh-pending-then-paid");
+    await processWebhookEvent({ externalId: "wh-pending-then-paid", provider: "buckpay", status: "pending", amount: null, event: "pending" }, {});
+    expect((await payRepo.findById(p.id))!.status).toBe("pending");
+
+    await processWebhookEvent({ externalId: "wh-pending-then-paid", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, {});
+    const got = await payRepo.findById(p.id);
+    expect(got!.status).toBe("paid");
+    expect(published.some((e) => e.topic === "payment-paid" && (e.event as { paymentId: string }).paymentId === p.id)).toBe(true);
+
+    const db = await testDb();
+    const logs = await db.select().from(paymentWebhookLogs)
+      .where(eq(paymentWebhookLogs.externalId, "wh-pending-then-paid"));
+    expect(logs).toHaveLength(2); // os dois webhooks foram logados, nenhum descartado
   });
 
   it("cancelled → atualiza status sem publicar", async () => {

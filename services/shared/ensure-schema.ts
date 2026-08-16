@@ -209,6 +209,20 @@ const STATEMENTS: string[] = [
      ALTER TABLE "remarketing_lead_state" ADD CONSTRAINT "remarketing_lead_state_campaign_id_lead_id_key"
        UNIQUE ("campaign_id", "lead_id");
    EXCEPTION WHEN duplicate_object THEN null; END $$`,
+
+  // 0012_processed_webhooks_status_key.sql — idempotência de webhook passa a
+  // considerar o status (external_id, provider, status), não só (external_id,
+  // provider). Sem isso, o primeiro webhook de uma venda (quase sempre o de
+  // criação, com status pending/waiting_for_approval) travava a transação como
+  // "processada" pra sempre, e o webhook de confirmação de pagamento que
+  // chegava depois era descartado silenciosamente antes até de ser logado.
+  `DO $$ BEGIN
+     ALTER TABLE "processed_webhooks" DROP CONSTRAINT "processed_webhooks_external_id_provider_pk";
+   EXCEPTION WHEN undefined_object THEN null; END $$`,
+  `DO $$ BEGIN
+     ALTER TABLE "processed_webhooks" ADD CONSTRAINT "processed_webhooks_external_id_provider_status_pk"
+       PRIMARY KEY ("external_id", "provider", "status");
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
 ];
 
 export async function ensureSchema(): Promise<void> {

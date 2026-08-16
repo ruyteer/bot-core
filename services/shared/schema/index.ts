@@ -296,14 +296,21 @@ export const paymentWebhookLogs = pgTable("payment_webhook_logs", {
   createdAt:       timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
-// Idempotency table — (externalId, provider) must be unique
+// Idempotency table — (externalId, provider, status) must be unique. O status
+// FAZ PARTE da chave de propósito: uma venda gera vários webhooks ao longo do
+// tempo com o MESMO externalId e status diferentes (ex.: SyncPay manda
+// "OnCreate" com pending/waiting_for_approval e só depois "OnUpdate" com
+// paid_out). Com a chave antiga (externalId, provider) só, o primeiro webhook
+// (quase sempre o de venda pendente) marcava a transação como "processada" pra
+// sempre, e o webhook de confirmação de pagamento que chegava depois era
+// descartado silenciosamente — nem chegava a ser logado.
 export const processedWebhooks = pgTable("processed_webhooks", {
   externalId:   text("external_id").notNull(),
   provider:     text("provider").notNull(),
   payloadHash:  text("payload_hash"),
   status:       text("status").notNull(),
   createdAt:    timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (t) => [primaryKey({ columns: [t.externalId, t.provider] })]);
+}, (t) => [primaryKey({ columns: [t.externalId, t.provider, t.status] })]);
 
 // ─── BROADCASTS ───────────────────────────────────────────────────────────────
 

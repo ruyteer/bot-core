@@ -88,8 +88,14 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
     return;
   }
 
-  // Idempotency — skip if already processed with same status
-  const already = await payRepo.isProcessed(primaryId, event.provider);
+  // Idempotency — skip if already processed with the SAME status. Status faz
+  // parte da chave de propósito: uma venda gera vários webhooks com o mesmo
+  // externalId ao longo do tempo (ex.: SyncPay manda "pending"/
+  // "waiting_for_approval" na criação e só depois "paid_out" na confirmação)
+  // — dedupar só por (externalId, provider) fazia o primeiro webhook (quase
+  // sempre o de venda pendente) travar a venda pra sempre, descartando o
+  // webhook de pagamento confirmado antes mesmo dele ser logado.
+  const already = await payRepo.isProcessed(primaryId, event.provider, event.status);
   if (already) return;
 
   const payment = await payRepo.findByAnyExternalId(candidates, event.provider);

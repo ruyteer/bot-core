@@ -172,10 +172,14 @@ export class PaymentDrizzleRepository {
     await db.update(payments).set({ status, updatedAt: new Date() }).where(eq(payments.id, id));
   }
 
-  async isProcessed(externalId: string, provider: string): Promise<boolean> {
+  async isProcessed(externalId: string, provider: string, status: string): Promise<boolean> {
     const [row] = await db.select({ externalId: processedWebhooks.externalId })
       .from(processedWebhooks)
-      .where(and(eq(processedWebhooks.externalId, externalId), eq(processedWebhooks.provider, provider)));
+      .where(and(
+        eq(processedWebhooks.externalId, externalId),
+        eq(processedWebhooks.provider, provider),
+        eq(processedWebhooks.status, status),
+      ));
     return !!row;
   }
 
