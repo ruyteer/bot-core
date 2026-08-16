@@ -11,7 +11,12 @@
     "SYNCPAY_SPLIT_USER_ID": { "$env": "SYNCPAY_SPLIT_USER_ID" },
     "NEXUSPAG_SPLIT_USER_ID": { "$env": "NEXUSPAG_SPLIT_USER_ID" },
     "WIINPAY_SPLIT_USER_ID": { "$env": "WIINPAY_SPLIT_USER_ID" },
-    "BUCKPAY_SPLIT_EMAIL": { "$env": "BUCKPAY_SPLIT_EMAIL" }
+    "BUCKPAY_SPLIT_EMAIL": { "$env": "BUCKPAY_SPLIT_EMAIL" },
+    "MEDIA_S3_ENDPOINT": { "$env": "MEDIA_S3_ENDPOINT" },
+    "MEDIA_S3_REGION": { "$env": "MEDIA_S3_REGION" },
+    "MEDIA_S3_BUCKET": { "$env": "MEDIA_S3_BUCKET" },
+    "MEDIA_S3_ACCESS_KEY": { "$env": "MEDIA_S3_ACCESS_KEY" },
+    "MEDIA_S3_SECRET_KEY": { "$env": "MEDIA_S3_SECRET_KEY" }
   },
   "worker_threads": 0,
   "pubsub": [

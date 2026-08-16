@@ -8,6 +8,7 @@ import { eq } from "drizzle-orm";
 import type { LeadWithStats } from "./domain/lead.entity.js";
 import { getLeadAnalytics } from "./application/lead-analytics.js";
 import type { LeadAnalytics } from "./application/lead-analytics.js";
+import { TelegramClient, TelegramApiError } from "../runner/application/telegram.client.js";
 
 const repo = new LeadDrizzleRepository();
 
@@ -175,25 +176,23 @@ export const sendMessage = api(
 
     const token = decrypt(bot.telegramToken);
     const chatId = lead.telegramChatId.toString();
+    // botId habilita o cache de file_id (media_cache) — sem isso, este era o
+    // único endpoint de envio que rebaixava o arquivo do storage a CADA
+    // mensagem, em vez de reusar o file_id já cacheado pelo resto do runner.
+    const tg = new TelegramClient(token, lead.botId);
 
-    let res: Response;
-    if (kind === "text" && text) {
-      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text }),
-      });
-    } else if (kind === "photo" && mediaUrl) {
-      res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, photo: mediaUrl }),
-      });
-    } else {
-      throw APIError.invalidArgument("unsupported message kind or missing content");
+    try {
+      if (kind === "text" && text) {
+        await tg.sendMessage({ chatId, text });
+      } else if (kind === "photo" && mediaUrl) {
+        await tg.sendPhoto({ chatId, photo: mediaUrl });
+      } else {
+        throw APIError.invalidArgument("unsupported message kind or missing content");
+      }
+    } catch (err) {
+      if (err instanceof TelegramApiError) throw APIError.internal(err.message);
+      throw err;
     }
-
-    if (!res.ok) throw APIError.internal("telegram API error");
 
     await repo.saveMessage(id, lead.botId, "outbound", { kind, text, mediaUrl });
     return { ok: true };

@@ -12,6 +12,8 @@
     "db:push": "drizzle-kit push"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1111.0",
+    "busboy": "^1.6.0",
     "drizzle-orm": "^0.38.0",
     "encore.dev": "^1.57.9",
     "jose": "^6.2.3",
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.3",
+    "@types/busboy": "^1.5.4",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22",
     "@types/pg": "^8",

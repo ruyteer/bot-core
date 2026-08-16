@@ -21,3 +21,10 @@ export const nexuspagSplitUserId = secret("NEXUSPAG_SPLIT_USER_ID");
 export const wiinpaySplitUserId  = secret("WIINPAY_SPLIT_USER_ID");
 // BuckPay identifica o recebedor do split por E-MAIL cadastrado na Buck (não user_id).
 export const buckpaySplitEmail   = secret("BUCKPAY_SPLIT_EMAIL");
+
+// Storage de mídia (Railway Bucket, S3-compatível) — substitui o Supabase Storage.
+export const mediaS3Endpoint  = secret("MEDIA_S3_ENDPOINT");
+export const mediaS3Region    = secret("MEDIA_S3_REGION");
+export const mediaS3Bucket    = secret("MEDIA_S3_BUCKET");
+export const mediaS3AccessKey = secret("MEDIA_S3_ACCESS_KEY");
+export const mediaS3SecretKey = secret("MEDIA_S3_SECRET_KEY");
