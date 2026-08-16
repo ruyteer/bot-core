@@ -393,20 +393,13 @@ export function collectCandidates(...values: unknown[]): string[] {
 }
 
 // Statuses de PAGO conhecidos da SyncPay — match EXATO, nunca substring (ver
-// abaixo). "waiting_for_approval" está incluído de propósito: consulta em
-// produção (2026-08-13, payment_webhook_logs) mostrou que as transações desta
-// conta SyncPay nunca saem desse status para um "paid"/"completed" — a doc
-// oficial da SyncPay nem lista "WAITING_FOR_APPROVAL" entre os status do
-// endpoint de consulta (só pending/completed/failed/refunded/med), então é um
-// evento só-webhook que, nessa conta, é o sinal final de venda aprovada.
-// Decisão do usuário (2026-08-13): tratar como pago. Se a SyncPay um dia
-// começar a mandar um "paid"/"completed" real após o waiting_for_approval,
-// isso já cai aqui do mesmo jeito — não precisa de match por substring.
+// abaixo). "waiting_for_approval" NÃO é pago — é venda pendente (a aprovação
+// ainda não saiu); tratá-lo como pago (decisão de 2026-08-13, revertida em
+// 2026-08-16) fazia o bot liberar acesso antes da venda ser de fato aprovada.
 // "paid_out" confirmado em produção (2026-08-14): é o evento webhook que a
-// SyncPay manda quando o PIX é de fato liquidado — sem isso no set, esses
-// webhooks chegavam (registro "all" funciona) mas caíam em "pending" e a
-// venda nunca era aprovada.
-const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "paid_out", "approved", "success", "confirmed", "waiting_for_approval"]);
+// SyncPay manda quando o PIX é de fato liquidado/aprovado — é o sinal final
+// de venda paga nessa conta.
+const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "paid_out", "approved", "success", "confirmed"]);
 
 export function normalizeSyncpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   // O webhook novo aninha a transação em `data`; o padrão OLD (do campo
