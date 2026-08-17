@@ -5,17 +5,19 @@ import { GetProfileUseCase } from "./application/use-cases/get-profile.use-case.
 import { db } from "../shared/database.js";
 import { payments, bots, profiles } from "../shared/schema/index.js";
 import { eq, and, inArray, sql } from "drizzle-orm";
+import { platformFeeCentsFor } from "../referrals/application/referral-config.js";
 
 const repo       = new ProfileDrizzleRepository();
 const getProfile = new GetProfileUseCase(repo);
 
 interface MeResponse {
-  id:        string;
-  email:     string;
-  name:      string;
-  isAdmin:   boolean;
-  isBlocked: boolean;
-  roles:     string[];
+  id:               string;
+  email:            string;
+  name:             string;
+  isAdmin:          boolean;
+  isBlocked:        boolean;
+  roles:            string[];
+  platformFeeCents: number;
 }
 
 // ─── Revenue & Level ─────────────────────────────────────────────────────────
@@ -75,7 +77,8 @@ export const updateProfile = api(
   async ({ name }: { name: string }): Promise<MeResponse> => {
     const { userID: userId } = getAuthData()!;
     await db.update(profiles).set({ name, updatedAt: new Date() }).where(eq(profiles.id, userId));
-    const profile = await getProfile.execute(userId);
+    const profile          = await getProfile.execute(userId);
+    const platformFeeCents = await platformFeeCentsFor(userId);
     return {
       id:        profile.id,
       email:     profile.email,
@@ -83,6 +86,7 @@ export const updateProfile = api(
       isAdmin:   profile.isAdmin,
       isBlocked: profile.isBlocked,
       roles:     profile.roles,
+      platformFeeCents,
     };
   },
 );
@@ -92,7 +96,8 @@ export const me = api(
   { method: "GET", path: "/auth/me", expose: true, auth: true },
   async (): Promise<MeResponse> => {
     const { userID: userId } = getAuthData()!;
-    const profile = await getProfile.execute(userId);
+    const profile          = await getProfile.execute(userId);
+    const platformFeeCents = await platformFeeCentsFor(userId);
     return {
       id:        profile.id,
       email:     profile.email,
@@ -100,6 +105,7 @@ export const me = api(
       isAdmin:   profile.isAdmin,
       isBlocked: profile.isBlocked,
       roles:     profile.roles,
+      platformFeeCents,
     };
   },
 );
