@@ -292,6 +292,18 @@ function renderBlockButton(btn: Record<string, unknown>, vars: Map<string, strin
   return { kind: "callback", label };
 }
 
+// Cor do botão — suportada pelo Telegram desde o Bot API 9.4 (fev/2026):
+// `style` em InlineKeyboardButton, só "primary"|"success"|"danger". A paleta
+// do editor (buttonStyle.ts, no front) tem 4 opções porque também cobre
+// "warning" — sem equivalente no Telegram, então cai em undefined (omitido =
+// estilo padrão do app do lead, igual a nunca ter tido cor nenhuma).
+function telegramButtonStyle(style: unknown): "primary" | "success" | "danger" | undefined {
+  if (style === "primary") return "primary";
+  if (style === "constructive") return "success";
+  if (style === "destructive") return "danger";
+  return undefined;
+}
+
 // Teclado inline dos blocos de botões de um nó `message`. Botões de link viram
 // linha `url`; os demais mandam o id curto COM ESCOPO DE NÓ como `callback_data`.
 function blockButtonsKeyboard(
@@ -309,9 +321,10 @@ function blockButtonsKeyboard(
     if (!Array.isArray(btns)) return;
     btns.forEach((btn, btnIdx) => {
       const r = renderBlockButton(btn, vars);
-      if (r.kind === "url") rows.push([{ text: r.label, url: r.url }]);
+      const style = telegramButtonStyle(btn?.style);
+      if (r.kind === "url") rows.push([{ text: r.label, url: r.url, ...(style ? { style } : {}) }]);
       else if (r.kind === "callback") {
-        rows.push([{ text: r.label, callback_data: buttonCallbackId(nodeId, blockIdx, btnIdx) }]);
+        rows.push([{ text: r.label, callback_data: buttonCallbackId(nodeId, blockIdx, btnIdx), ...(style ? { style } : {}) }]);
       }
     });
   });
@@ -1323,12 +1336,13 @@ export class ExecuteFlowStepUseCase {
     const buttons = (c.buttons as Array<Record<string, unknown>>) ?? [];
     const keyboard = buttons.map((b, i) => {
       const label = (b.text ?? b.label ?? "") as string;
-      if (typeof b.url === "string" && b.url) return [{ text: label, url: b.url }];
+      const style = telegramButtonStyle(b.style);
+      if (typeof b.url === "string" && b.url) return [{ text: label, url: b.url, ...(style ? { style } : {}) }];
       // callback_data = id posicional curto (`btn:<i>`), resolvido no retorno para
       // o handleId do editor (`callback || text || btn_<i>`). Com `callback`
       // preenchido o destino é exatamente o de antes; sem ele, o botão deixa de
       // mandar string vazia (que o Telegram rejeita) e passa a casar com a aresta.
-      return [{ text: label, callback_data: buttonCallbackId(nodeId, null, i) }];
+      return [{ text: label, callback_data: buttonCallbackId(nodeId, null, i), ...(style ? { style } : {}) }];
     });
     await tg.sendMessage({
       chatId,
