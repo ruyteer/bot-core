@@ -51,7 +51,7 @@ function belongsToBot(botId: string) {
 
 // Handle de uma oferta dentro de um nó `offer`. O frontend usa exatamente
 // `offer.callback || offer.product_name || offer_<i>` como id dos conectores
-// (`<handle>__paid|__pending|__no_action`) — replicamos para casar na retomada.
+// (`<handle>__paid|__pending`) — replicamos para casar na retomada.
 function offerHandleId(offer: Record<string, unknown>, i: number): string {
   const callback = typeof offer.callback === "string" ? offer.callback : "";
   const name     = typeof offer.product_name === "string" ? offer.product_name : "";
@@ -59,7 +59,7 @@ function offerHandleId(offer: Record<string, unknown>, i: number): string {
 }
 
 // Coleta as ofertas "compráveis" de um nó com o handleId EXATO que o frontend usa
-// nos conectores (`<handleId>__paid|__pending|__no_action`). Cobre o nó `offer`
+// nos conectores (`<handleId>__paid|__pending`). Cobre o nó `offer`
 // dedicado (content.offers) e blocos de oferta dentro de um nó `message`
 // (blocks[].offers, cujo fallback de handle é `offer_<blockIdx>_<offerIdx>`).
 // A ordem do retorno é o índice usado no callback `offer:<i>`.
@@ -240,7 +240,7 @@ function collectNodeButtons(content: Record<string, unknown>): Array<{ button: R
     if (!btn || typeof btn !== "object") return;
     // `url` abre link e não volta como callback. `action: "offer"` é legado (o
     // editor atual só oferece Funil/Link): o conector dele é `<handle>__paid|
-    // __pending|__no_action` e a compra só dispara por `offer:<i>` — não há
+    // __pending` e a compra só dispara por `offer:<i>` — não há
     // aresta `<handle>` para casar, então ele NÃO pode segurar o nó.
     if (btn.action === "url" || btn.action === "offer") return;
     out.push({ button: btn, handleId: buttonHandleId(btn, fallback) });
@@ -678,9 +678,9 @@ export class ExecuteFlowStepUseCase {
       // Create or replace progress
       if (prog) {
         // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
-        // (o "sem clique" do nó onde o lead estava, o __no_action de uma oferta,
-        // um nó `delay`) ficaria órfão e depois arrancaria o lead do funil
-        // recomeçado. Cancela antes de reposicionar no trigger.
+        // (o "sem clique" do nó onde o lead estava, o timeout de "sem ação" de
+        // uma oferta, um nó `delay`) ficaria órfão e depois arrancaria o lead
+        // do funil recomeçado. Cancela antes de reposicionar no trigger.
         await db.delete(scheduledDelays).where(and(
           eq(scheduledDelays.progressId, prog.id),
           eq(scheduledDelays.status, "pending"),
@@ -963,12 +963,12 @@ export class ExecuteFlowStepUseCase {
         await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
         // Nó de mensagem pode conter blocos de oferta (botões de compra). Se houver,
         // comporta-se como nó offer: apresenta as ofertas, espera o clique e agenda
-        // o ramo __no_action — não avança automaticamente.
+        // o timeout de "sem ação" (ramo __pending) — não avança automaticamente.
         const msgOffers = collectNodeOffers(c);
         if (msgOffers.length > 0) {
           await this.presentOffers(c, msgOffers, chatId, tg, protect, vars, node.id);
           await advanceProgress(progressId, node.id, "active");
-          await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
+          await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "no_action");
           return;
         }
         // Bloco de BOTÕES dentro do nó de mensagem: o teclado inline já foi
@@ -1161,9 +1161,9 @@ export class ExecuteFlowStepUseCase {
         await this.executeOfferNode(c, chatId, tg, protect, vars, node.id);
         await saveOutbound(leadId, botId, { ...c, kind: "offer", nodeId: node.id });
         await advanceProgress(progressId, node.id, "active");
-        // Se o lead nunca clicar em comprar, dispara o ramo __no_action após o
-        // unpaid_timeout. Cancelado quando ele clica (handleOfferPurchase).
-        await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "__no_action");
+        // Se o lead nunca clicar em comprar, dispara o ramo __pending após o
+        // timeout de "sem ação". Cancelado quando ele clica (handleOfferPurchase).
+        await this.scheduleOfferTimeouts(funnelId, node, progressId, leadId, botId, "no_action");
         return;
     }
 
@@ -1387,34 +1387,37 @@ export class ExecuteFlowStepUseCase {
   }
 
   // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
-  // Tempo (minutos, mín. 60s):
-  //   __no_action → `no_action_timeout` → `unpaid_timeout` → 5 (default antigo)
-  //   __pending   → `unpaid_timeout` → 5
-  // O campo dedicado `no_action_timeout` existe porque "Sem ação" era pilotado
-  // pelo campo "Tempo para não pago" — dois ramos com semânticas diferentes
-  // presos ao mesmo número. Sem o campo novo, nada muda.
-  // Agenda um delay por oferta cujo handle (`<handleId>__no_action|__pending`)
-  // tenha conexão. Para __pending, só a oferta `onlyHandleId` (a que o lead clicou).
+  // "Sem ação" (nunca clicou) e "Não pago" (clicou, gerou PIX, não pagou) saem
+  // pelo MESMO handle __pending — a UI só expõe uma linha/conexão por oferta
+  // (ver OfferNode.tsx). O que difere entre os dois casos é só a DURAÇÃO do
+  // timeout: `kind` escolhe entre `no_action_timeout` (com fallback pra
+  // `unpaid_timeout`) e `unpaid_timeout` puro. Antes disso, eram dois handles
+  // separados (__no_action/__pending) — dava pra configurar destinos
+  // diferentes, mas na prática 100% dos funis publicados usavam o mesmo
+  // destino nos dois (ou só configuravam um dos dois), então unificar não
+  // muda o roteamento de ninguém, só simplifica o editor.
+  // Agenda um delay por oferta cujo handle (`<handleId>__pending`) tenha
+  // conexão. `onlyHandleId`: só a oferta que o lead clicou (kind="unpaid").
   private async scheduleOfferTimeouts(
     funnelId:     string,
     node:         typeof funnelNodes.$inferSelect,
     progressId:   string,
     leadId:       string,
     botId:        string,
-    suffix:       "__no_action" | "__pending",
+    kind:         "no_action" | "unpaid",
     onlyHandleId?: string,
   ): Promise<void> {
     const content = node.content as Record<string, unknown> & { unpaid_timeout?: number; no_action_timeout?: number };
     const offersList = collectNodeOffers(content);
     const unpaidMin  = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
-    const timeoutMin = suffix === "__no_action" && typeof content.no_action_timeout === "number" && content.no_action_timeout > 0
+    const timeoutMin = kind === "no_action" && typeof content.no_action_timeout === "number" && content.no_action_timeout > 0
       ? content.no_action_timeout
       : unpaidMin;
     const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
 
     for (const { handleId } of offersList) {
       if (onlyHandleId !== undefined && handleId !== onlyHandleId) continue;
-      const target = await nextNode(funnelId, node.id, `${handleId}${suffix}`);
+      const target = await nextNode(funnelId, node.id, `${handleId}__pending`);
       if (!target) continue;
       await db.insert(scheduledDelays).values({
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
@@ -1462,7 +1465,7 @@ export class ExecuteFlowStepUseCase {
     chatId: string,
     tg:     TelegramClient,
   ): Promise<void> {
-    // O lead interagiu com a oferta → cancela os timeouts __no_action pendentes
+    // O lead interagiu com a oferta → cancela o timeout de "sem ação" pendente
     // deste progresso (só há os do nó de oferta atual).
     await db.delete(scheduledDelays).where(and(
       eq(scheduledDelays.progressId, prog.id),
@@ -1521,7 +1524,7 @@ export class ExecuteFlowStepUseCase {
 
     // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
     // Cancelado quando o pagamento confirma (handlePaidOffer).
-    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "__pending", handleId);
+    await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "unpaid", handleId);
 
     const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
@@ -1660,8 +1663,8 @@ export class ExecuteFlowStepUseCase {
     // Retoma o funil pelo ramo __paid. Sem conexão nesse handle, cai na saída
     // GENÉRICA do nó (source_handle null): é onde muitos usuários ligam o
     // "continuar após pagamento" no editor — antes era uma aresta morta e o
-    // funil parava no "Pagamento confirmado". Os handles __pending/__no_action
-    // não entram no fallback (têm semântica própria de timeout).
+    // funil parava no "Pagamento confirmado". O handle __pending não entra
+    // nesse fallback (tem semântica própria de timeout).
     let nextId = await nextNode(payment.funnelId, payment.nodeId, payment.paidHandle);
     if (!nextId) {
       const [defaultConn] = await db.select().from(nodeConnections).where(and(

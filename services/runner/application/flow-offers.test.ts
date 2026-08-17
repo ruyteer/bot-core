@@ -34,11 +34,15 @@ async function setupOffer(opts: { offer: Record<string, unknown>; extraConns?: A
 }
 
 describe("offer node — apresentação e compra", () => {
-  it("apresenta botão de compra offer:0 e agenda __no_action", async () => {
+  // "Sem ação" (nunca clicou) e "Não pago" (clicou, não pagou) saem pelo MESMO
+  // handle __pending hoje — a UI só expõe uma linha/conexão por oferta
+  // (OfferNode.tsx). O que muda entre os dois casos é só a duração do timeout
+  // (no_action_timeout vs unpaid_timeout), não o destino.
+  it("apresenta botão de compra offer:0 e agenda o timeout de sem ação via __pending", async () => {
     const handle = "promo";
     const { bot } = await setupOffer({
       offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
-      extraConns: [{ from: "off", to: "noact", handle: `${handle}__no_action` }],
+      extraConns: [{ from: "off", to: "pending", handle: `${handle}__pending` }],
     });
     await useCase.execute({ botId: bot.id, update: startUpdate(700) });
     const presented = getTelegramCalls().find((c) => c.body.reply_markup);
@@ -50,17 +54,14 @@ describe("offer node — apresentação e compra", () => {
 
     const db = await testDb();
     const delays = await db.select().from(scheduledDelays);
-    expect(delays.length).toBe(1); // __no_action agendado
+    expect(delays.length).toBe(1); // timeout de "sem ação" agendado pro handle __pending
   });
 
   it("clique gera PIX em CENTAVOS, persiste payment e envia QR + copia-e-cola", async () => {
     const handle = "promo";
     const { bot } = await setupOffer({
       offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar", product_type: "content", delivery_url: "https://entrega" },
-      extraConns: [
-        { from: "off", to: "paid", handle: `${handle}__paid` },
-        { from: "off", to: "noact", handle: `${handle}__no_action` },
-      ],
+      extraConns: [{ from: "off", to: "paid", handle: `${handle}__paid` }],
     });
     await useCase.execute({ botId: bot.id, update: startUpdate(701) });
     await useCase.execute({ botId: bot.id, update: callbackUpdate(701, "offer:0") });
@@ -78,21 +79,24 @@ describe("offer node — apresentação e compra", () => {
     expect(getSentMessages().some((m) => m.includes("<code>"))).toBe(true);
   });
 
-  it("__no_action cancelado ao clicar; __pending agendado", async () => {
+  it("delay de 'sem ação' é cancelado ao clicar e substituído por um novo delay de 'não pago' (mesmo destino __pending)", async () => {
     const handle = "promo";
     const { bot } = await setupOffer({
       offer: { product_name: "Curso", price: 30, callback: handle, button_text: "Comprar" },
-      extraConns: [
-        { from: "off", to: "pending", handle: `${handle}__pending` },
-        { from: "off", to: "noact", handle: `${handle}__no_action` },
-      ],
+      extraConns: [{ from: "off", to: "pending", handle: `${handle}__pending` }],
     });
     await useCase.execute({ botId: bot.id, update: startUpdate(702) });
-    await useCase.execute({ botId: bot.id, update: callbackUpdate(702, "offer:0") });
     const db = await testDb();
-    const pend = await db.select().from(scheduledDelays).where(eq(scheduledDelays.status, "pending"));
-    // só deve restar o __pending (1), o __no_action foi apagado
-    expect(pend.length).toBe(1);
+    const beforeClick = await db.select().from(scheduledDelays).where(eq(scheduledDelays.status, "pending"));
+    expect(beforeClick.length).toBe(1); // delay de "sem ação" agendado na apresentação
+    const firstDelayId = beforeClick[0].id;
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(702, "offer:0") });
+    const afterClick = await db.select().from(scheduledDelays).where(eq(scheduledDelays.status, "pending"));
+    // continua só 1 (mesmo destino __pending), mas é OUTRA linha — a de "sem
+    // ação" foi apagada no clique e uma nova de "não pago" tomou o lugar.
+    expect(afterClick.length).toBe(1);
+    expect(afterClick[0].id).not.toBe(firstDelayId);
   });
 });
 
