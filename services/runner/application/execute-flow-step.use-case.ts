@@ -1382,7 +1382,8 @@ export class ExecuteFlowStepUseCase {
       const label = (typeof offer.button_text === "string" && offer.button_text)
         ? offer.button_text
         : `Comprar — R$ ${price.toFixed(2)}`;
-      return [{ text: label, callback_data: offerCallbackId(nodeId, i) }];
+      const style = telegramButtonStyle(offer.style);
+      return [{ text: label, callback_data: offerCallbackId(nodeId, i), ...(style ? { style } : {}) }];
     });
 
     const intro = typeof content.intro_message === "string" && content.intro_message
