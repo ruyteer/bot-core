@@ -316,7 +316,10 @@ interface AdminUserDetails {
   // O frontend (AdminUserDetails) lê estes dois — sem eles, `data.gateways.length`
   // dava TypeError e a página de detalhes quebrava no render.
   gateways:        Array<{ id: string; provider: string; label: string; is_active: boolean }>;
-  impersonation_log: Array<{ id: string; created_at: string; action: string }>;
+  // Formato consumido por AdminUserDetails.tsx — {id, created_at, action} era o
+  // formato antigo (nunca populado de verdade, sempre []) e não batia com o que
+  // o frontend de fato lê.
+  impersonation_log: Array<{ id: string; admin_email: string | null; reason: string | null; created_at: string }>;
 }
 
 export const getUserDetails = api(
@@ -432,12 +435,13 @@ export const getUserDetails = api(
         provider:   r.provider,
       })),
       gateways: userGateways.map((g) => ({ id: g.id, provider: g.provider, label: g.label, is_active: g.isActive })),
-      impersonation_log: (await db.select({ id: impersonationLog.id, createdAt: impersonationLog.createdAt })
-        .from(impersonationLog)
-        .where(eq(impersonationLog.targetUserId, id))
-        .orderBy(desc(impersonationLog.createdAt))
-        .limit(20)
-      ).map((r) => ({ id: r.id, created_at: r.createdAt.toISOString(), action: "impersonate" })),
+      impersonation_log: (await exec<{ id: string; admin_email: string | null; reason: string | null; created_at: unknown }>(sql`
+        SELECT il.id, p.email AS admin_email, il.reason, il.created_at
+        FROM impersonation_log il
+        LEFT JOIN profiles p ON p.id = il.admin_user_id
+        WHERE il.target_user_id = ${id}
+        ORDER BY il.created_at DESC LIMIT 20
+      `)).map((r) => ({ id: r.id, admin_email: r.admin_email, reason: r.reason, created_at: toIso(r.created_at) })),
     };
   },
 );
