@@ -3,6 +3,7 @@
   "secrets": {
     "ENCRYPTION_KEY": { "$env": "ENCRYPTION_KEY" },
     "SUPABASE_URL": { "$env": "SUPABASE_URL" },
+    "SUPABASE_SERVICE_ROLE_KEY": { "$env": "SUPABASE_SERVICE_ROLE_KEY" },
     "ENCORE_EXTERNAL_URL": { "$env": "ENCORE_EXTERNAL_URL" },
     "DATABASE_URL": { "$env": "DATABASE_URL" },
     "VAPID_PUBLIC_KEY": { "$env": "VAPID_PUBLIC_KEY" },

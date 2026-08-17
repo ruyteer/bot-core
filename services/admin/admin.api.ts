@@ -5,11 +5,13 @@ import {
   profiles, userRoles, bots, funnels, leads, payments, paymentGateways,
   funnelOffers, adminNotifications, adminNotificationRecipients,
   pushSubscriptions, paymentRevenueCredits, platformConfig, paymentWebhookLogs,
+  impersonationLog,
 } from "../shared/schema/index.js";
 import { desc } from "drizzle-orm";
 import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
 import { eq, and, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
+import { supabaseUrl, supabaseServiceRoleKey } from "../config/secrets.js";
 
 // drizzle/node-postgres db.execute() returns QueryResult<T> — extract rows
 async function exec<T>(query: SQL): Promise<T[]> {
@@ -430,8 +432,12 @@ export const getUserDetails = api(
         provider:   r.provider,
       })),
       gateways: userGateways.map((g) => ({ id: g.id, provider: g.provider, label: g.label, is_active: g.isActive })),
-      // Impersonation ainda não implementada — array vazio p/ satisfazer a UI.
-      impersonation_log: [],
+      impersonation_log: (await db.select({ id: impersonationLog.id, createdAt: impersonationLog.createdAt })
+        .from(impersonationLog)
+        .where(eq(impersonationLog.targetUserId, id))
+        .orderBy(desc(impersonationLog.createdAt))
+        .limit(20)
+      ).map((r) => ({ id: r.id, created_at: r.createdAt.toISOString(), action: "impersonate" })),
     };
   },
 );
@@ -490,6 +496,44 @@ export const revokeAdmin = api(
     }
     await db.delete(userRoles).where(and(eq(userRoles.userId, id), eq(userRoles.role, "admin")));
     return { ok: true };
+  },
+);
+
+// ─── POST /admin/users/:id/impersonate ────────────────────────────────────────
+// Gera um magic link via API admin do Supabase (service role — bypassa RLS) e
+// devolve só o hashed_token: o frontend troca por sessão real chamando
+// supabase.auth.verifyOtp({ token_hash, type }) — a service role key NUNCA
+// sai do backend. Toda chamada fica registrada em impersonation_log (auditoria).
+export const impersonateUser = api(
+  { method: "POST", path: "/admin/users/:id/impersonate", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<{ email: string; tokenHash: string; verificationType: string }> => {
+    const { userID } = getAuthData()!;
+    await requireAdmin(userID);
+    if (id === userID) throw APIError.invalidArgument("não é possível impersonar a própria conta");
+
+    const [target] = await db.select({ email: profiles.email }).from(profiles).where(eq(profiles.id, id)).limit(1);
+    if (!target?.email) throw APIError.notFound("usuário não encontrado ou sem e-mail cadastrado");
+
+    const res = await fetch(`${supabaseUrl()}/auth/v1/admin/generate_link`, {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization:  `Bearer ${supabaseServiceRoleKey()}`,
+        apikey:         supabaseServiceRoleKey(),
+      },
+      body: JSON.stringify({ type: "magiclink", email: target.email }),
+    });
+    const json = await res.json() as { hashed_token?: string; verification_type?: string; msg?: string };
+    if (!res.ok || !json.hashed_token) {
+      console.error("[admin] impersonate: generate_link falhou", { status: res.status, body: json });
+      throw APIError.internal("falha ao gerar sessão de impersonação");
+    }
+
+    // Auditoria ANTES de devolver o token — se o admin nunca chegar a trocar o
+    // token por sessão, ainda fica registrado que ele PEDIU pra impersonar.
+    await db.insert(impersonationLog).values({ adminUserId: userID, targetUserId: id });
+
+    return { email: target.email, tokenHash: json.hashed_token, verificationType: json.verification_type ?? "magiclink" };
   },
 );
 
