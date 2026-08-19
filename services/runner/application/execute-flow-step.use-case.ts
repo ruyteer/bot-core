@@ -18,7 +18,6 @@ import { createPixWithFallback } from "../../payments/application/create-pix-wit
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
-import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
@@ -294,6 +293,18 @@ function renderBlockButton(btn: Record<string, unknown>, vars: Map<string, strin
   return { kind: "callback", label };
 }
 
+// Cor do botão — suportada pelo Telegram desde o Bot API 9.4 (fev/2026):
+// `style` em InlineKeyboardButton, só "primary"|"success"|"danger". A paleta
+// do editor (buttonStyle.ts, no front) tem 4 opções porque também cobre
+// "warning" — sem equivalente no Telegram, então cai em undefined (omitido =
+// estilo padrão do app do lead, igual a nunca ter tido cor nenhuma).
+function telegramButtonStyle(style: unknown): "primary" | "success" | "danger" | undefined {
+  if (style === "primary") return "primary";
+  if (style === "constructive") return "success";
+  if (style === "destructive") return "danger";
+  return undefined;
+}
+
 // Teclado inline dos blocos de botões de um nó `message`. Botões de link viram
 // linha `url`; os demais mandam o id curto COM ESCOPO DE NÓ como `callback_data`.
 function blockButtonsKeyboard(
@@ -385,6 +396,24 @@ interface ExecutionContext {
 // Sem escapar, um `<`, `>` ou `&` no texto faz o Telegram rejeitar e abortar o passo.
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Username/first_name do Telegram são controlados pelo lead (qualquer pessoa
+// que der /start no bot) e viram texto de push notification pro dono do bot —
+// remove caracteres de controle/override de direção (spoofing visual) e limita
+// o tamanho antes de usar como conteúdo confiável de notificação.
+function sanitizeNotificationText(s: string, maxLen = 64): string {
+  const isUnsafeCodePoint = (cp: number) =>
+    (cp <= 0x1F) || cp === 0x7F ||
+    (cp >= 0x200B && cp <= 0x200F) ||
+    (cp >= 0x202A && cp <= 0x202E) ||
+    (cp >= 0x2060 && cp <= 0x2069) ||
+    cp === 0xFEFF;
+  const stripped = Array.from(s)
+    .filter((ch) => !isUnsafeCodePoint(ch.codePointAt(0) ?? 0))
+    .join("")
+    .trim();
+  return stripped.length > maxLen ? `${stripped.slice(0, maxLen)}…` : stripped;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -634,7 +663,7 @@ export class ExecuteFlowStepUseCase {
       void sendPushToUser(bot.userId, {
         eventType: PUSH_EVENT_TYPES.NEW_LEAD,
         title:     "🆕 Novo lead!",
-        body:      from.username ? `@${from.username}` : (from.first_name ?? "Novo contato"),
+        body:      sanitizeNotificationText(from.username ? `@${from.username}` : (from.first_name ?? "Novo contato")),
         data:      { url: "/leads", lead_id: lead.id },
       }).catch((err) => console.error("[runner] push de novo lead falhou:", err));
     }
@@ -1606,6 +1635,15 @@ export class ExecuteFlowStepUseCase {
       offerId: offer.id, offerName: offer.name, amount, status: "pending",
       externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
     });
+
+    // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
+    // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
+    void sendPushToUser(bot.userId, {
+      eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
+      title:     "🧾 PIX gerado",
+      body:      `${offer.name} — R$ ${(amount / 100).toFixed(2)}`,
+      data:      { url: "/sales", lead_id: lead.id },
+    }).catch((err) => console.error("[runner] push de PIX gerado (broadcast) falhou:", err));
 
     const caption = `💠 <b>${escapeHtml(offer.name)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });

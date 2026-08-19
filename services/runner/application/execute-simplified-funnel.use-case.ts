@@ -5,7 +5,6 @@ import {
 } from "../../shared/schema/index.js";
 import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { interpolate, leadFieldsMap } from "./interpolate.js";
-import { telegramButtonStyle } from "./telegram-button-style.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
@@ -287,15 +286,11 @@ export class ExecuteSimplifiedFunnelUseCase {
     if (!ctaEnabled) {
       for (const plan of plans) {
         if (!plan?.id || !plan?.name) continue;
-        const style = telegramButtonStyle(plan.style);
-        welcomeKeyboard.push([{ text: `${plan.name} — ${fmtBRL(Number(plan.price || 0))}`, callback_data: `sp_${plan.id}`, ...(style ? { style } : {}) }]);
+        welcomeKeyboard.push([{ text: `${plan.name} — ${fmtBRL(Number(plan.price || 0))}`, callback_data: `sp_${plan.id}` }]);
       }
     }
     for (const btn of (welcome.buttons as Array<Record<string, unknown>>) || []) {
-      if (btn?.label && btn?.url) {
-        const style = telegramButtonStyle(btn.style);
-        welcomeKeyboard.push([{ text: String(btn.label), url: String(btn.url), ...(style ? { style } : {}) }]);
-      }
+      if (btn?.label && btn?.url) welcomeKeyboard.push([{ text: String(btn.label), url: String(btn.url) }]);
     }
     const welcomeMarkup = welcomeKeyboard.length ? { inline_keyboard: welcomeKeyboard } : undefined;
     const welcomeMedia = readSimpleMediaList(welcome);
@@ -304,11 +299,9 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
 
     if (ctaEnabled) {
-      const acceptStyle = telegramButtonStyle(cta.accept_style);
-      const declineStyle = telegramButtonStyle(cta.decline_style);
       const ctaKeyboard = [[
-        { text: String(cta.accept_label || "Quero ver os planos"), callback_data: `sc_accept_${funnel.id}`, ...(acceptStyle ? { style: acceptStyle } : {}) },
-        { text: String(cta.decline_label || "Agora não"), callback_data: `sc_decline_${funnel.id}`, ...(declineStyle ? { style: declineStyle } : {}) },
+        { text: String(cta.accept_label || "Quero ver os planos"), callback_data: `sc_accept_${funnel.id}` },
+        { text: String(cta.decline_label || "Agora não"), callback_data: `sc_decline_${funnel.id}` },
       ]];
       await sendMediaBlock({
         tg, chatId, media: readSimpleMediaList(cta), caption: itp(String(cta.text || "").trim()),
@@ -325,8 +318,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     const keyboard: Array<Array<Record<string, unknown>>> = [];
     for (const plan of plans) {
       if (!plan?.id || !plan?.name) continue;
-      const style = telegramButtonStyle(plan.style);
-      keyboard.push([{ text: `${plan.name} — ${fmtBRL(Number(plan.price || 0))}`, callback_data: `sp_${plan.id}`, ...(style ? { style } : {}) }]);
+      keyboard.push([{ text: `${plan.name} — ${fmtBRL(Number(plan.price || 0))}`, callback_data: `sp_${plan.id}` }]);
     }
     if (!keyboard.length) { await tg.sendMessage({ chatId, text: "⚠️ Nenhum plano configurado.", protectContent: protect }); return; }
     const legacyDescr = plans.map((p) => (typeof p?.description === "string" ? p.description.trim() : "")).filter(Boolean);
@@ -344,20 +336,16 @@ export class ExecuteSimplifiedFunnelUseCase {
         const shortId = String(ob.id || "").substring(0, 8);
         const itemLabelTpl = nonEmptyStr(ob.button_label) || "➕ {nome} (+{preco})";
         const itemLabel = replaceOrderBumpVars(itemLabelTpl, { nome: String(ob.name || ""), preco: fmtBRL(Number(ob.price || 0)) });
-        const style = telegramButtonStyle(ob.style);
-        keyboard.push([{ text: itemLabel, callback_data: `sb_one_${planId}_${shortId}`, ...(style ? { style } : {}) }]);
+        keyboard.push([{ text: itemLabel, callback_data: `sb_one_${planId}_${shortId}` }]);
       }
       const addAllTpl = nonEmptyStr(cfg.order_bumps_add_all_label) || "✅ Adicionar tudo (+{preco})";
-      const addAllStyle = telegramButtonStyle(cfg.order_bumps_add_all_style);
-      keyboard.push([{ text: replaceOrderBumpVars(addAllTpl, { preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}`, ...(addAllStyle ? { style: addAllStyle } : {}) }]);
+      keyboard.push([{ text: replaceOrderBumpVars(addAllTpl, { preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}` }]);
     } else {
       const addOneTpl = nonEmptyStr(cfg.order_bumps_add_one_label) || "✅ Adicionar (+{preco})";
-      const addOneStyle = telegramButtonStyle(cfg.order_bumps_add_one_style);
-      keyboard.push([{ text: replaceOrderBumpVars(addOneTpl, { nome: String(applicable[0]?.name || ""), preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}`, ...(addOneStyle ? { style: addOneStyle } : {}) }]);
+      keyboard.push([{ text: replaceOrderBumpVars(addOneTpl, { nome: String(applicable[0]?.name || ""), preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}` }]);
     }
     const declineLabel = nonEmptyStr(cfg.order_bumps_decline_label) || "Não, obrigado";
-    const declineStyle = telegramButtonStyle(cfg.order_bumps_decline_style);
-    keyboard.push([{ text: declineLabel, callback_data: `sb_no_${planId}`, ...(declineStyle ? { style: declineStyle } : {}) }]);
+    keyboard.push([{ text: declineLabel, callback_data: `sb_no_${planId}` }]);
     await tg.sendMessage({ chatId, text, replyMarkup: { inline_keyboard: keyboard }, protectContent: protect });
   }
 
@@ -646,10 +634,9 @@ export class ExecuteSimplifiedFunnelUseCase {
       const text = (typeof u.description === "string" && u.description.trim())
         ? u.description.trim()
         : `🎁 <b>Oferta especial só pra você!</b>\n\n<b>${u.name}</b>\n\nAdicione agora por apenas <b>${priceLabel}</b>.`;
-      const uStyle = telegramButtonStyle(u.style);
       await tg.sendMessage({
         chatId, text, protectContent: bot.protectContent,
-        replyMarkup: { inline_keyboard: [[{ text: `✅ Quero! — ${priceLabel}`, callback_data: `su_${task.refId}`, ...(uStyle ? { style: uStyle } : {}) }]] },
+        replyMarkup: { inline_keyboard: [[{ text: `✅ Quero! — ${priceLabel}`, callback_data: `su_${task.refId}` }]] },
       });
       return;
     }
@@ -667,10 +654,9 @@ export class ExecuteSimplifiedFunnelUseCase {
       const text = (typeof d.description === "string" && d.description.trim())
         ? d.description.trim()
         : `💡 <b>Última chance!</b>\n\nQue tal levar <b>${d.name}</b> por apenas <b>${priceLabel}</b>?`;
-      const dStyle = telegramButtonStyle(d.style);
       await tg.sendMessage({
         chatId, text, protectContent: bot.protectContent,
-        replyMarkup: { inline_keyboard: [[{ text: `✅ Quero! — ${priceLabel}`, callback_data: `sd_${task.refId}`, ...(dStyle ? { style: dStyle } : {}) }]] },
+        replyMarkup: { inline_keyboard: [[{ text: `✅ Quero! — ${priceLabel}`, callback_data: `sd_${task.refId}` }]] },
       });
     }
   }

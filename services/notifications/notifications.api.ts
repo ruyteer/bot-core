@@ -1,6 +1,7 @@
-import { api } from "encore.dev/api";
+import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
+import { PUSH_EVENT_TYPES } from "./application/send-push.use-case.js";
 import {
   adminNotifications,
   adminNotificationRecipients,
@@ -250,11 +251,16 @@ export const getEventPreferences = api(
 export const updateEventPreferences = api(
   { method: "PATCH", path: "/notifications/event-preferences", expose: true, auth: true },
   async ({ eventType, enabled }: { eventType: string; enabled?: boolean }): Promise<{ ok: boolean }> => {
+    if (!(Object.values(PUSH_EVENT_TYPES) as string[]).includes(eventType)) {
+      throw APIError.invalidArgument(`eventType inválido: ${eventType}`);
+    }
     const { userID: userId } = getAuthData()!;
     const rows = await db.select().from(userNotificationPreferences).where(eq(userNotificationPreferences.userId, userId)).limit(1);
-    const existing = (rows[0]?.eventPrefs ?? {}) as Record<string, { enabled: boolean }>;
-    const current = existing[eventType] ?? { enabled: true };
-    const next: Record<string, { enabled: boolean }> = {
+    const existing = (rows[0]?.eventPrefs ?? {}) as Record<string, boolean | { enabled: boolean }>;
+    const existingEntry = existing[eventType];
+    // Formato legado gravava um boolean cru em vez de `{ enabled }`.
+    const current = typeof existingEntry === "boolean" ? { enabled: existingEntry } : (existingEntry ?? { enabled: true });
+    const next: Record<string, boolean | { enabled: boolean }> = {
       ...existing,
       [eventType]: {
         enabled: enabled !== undefined ? enabled : current.enabled,
