@@ -1,6 +1,7 @@
-import { api } from "encore.dev/api";
+import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
+import { PUSH_EVENT_TYPES } from "./application/send-push.use-case.js";
 import {
   adminNotifications,
   adminNotificationRecipients,
@@ -236,10 +237,12 @@ export const removePushSubscription = api(
 // GET /notifications/event-preferences — per-event push preferences
 export const getEventPreferences = api(
   { method: "GET", path: "/notifications/event-preferences", expose: true, auth: true },
-  async (): Promise<{ prefs: Record<string, { enabled: boolean; soundEnabled: boolean }> }> => {
+  async (): Promise<{ prefs: Record<string, { enabled: boolean }> }> => {
     const { userID: userId } = getAuthData()!;
     const rows = await db.select().from(userNotificationPreferences).where(eq(userNotificationPreferences.userId, userId)).limit(1);
-    const prefs = (rows[0]?.eventPrefs ?? {}) as Record<string, { enabled: boolean; soundEnabled: boolean }>;
+    // Preferências antigas podem ainda ter uma chave `soundEnabled` no JSON (som
+    // por evento foi removido) — ela é apenas ignorada aqui, sem limpeza retroativa.
+    const prefs = (rows[0]?.eventPrefs ?? {}) as Record<string, { enabled: boolean }>;
     return { prefs };
   },
 );
@@ -247,16 +250,20 @@ export const getEventPreferences = api(
 // PATCH /notifications/event-preferences — update per-event push preferences
 export const updateEventPreferences = api(
   { method: "PATCH", path: "/notifications/event-preferences", expose: true, auth: true },
-  async ({ eventType, enabled, soundEnabled }: { eventType: string; enabled?: boolean; soundEnabled?: boolean }): Promise<{ ok: boolean }> => {
+  async ({ eventType, enabled }: { eventType: string; enabled?: boolean }): Promise<{ ok: boolean }> => {
+    if (!(Object.values(PUSH_EVENT_TYPES) as string[]).includes(eventType)) {
+      throw APIError.invalidArgument(`eventType inválido: ${eventType}`);
+    }
     const { userID: userId } = getAuthData()!;
     const rows = await db.select().from(userNotificationPreferences).where(eq(userNotificationPreferences.userId, userId)).limit(1);
-    const existing = (rows[0]?.eventPrefs ?? {}) as Record<string, { enabled: boolean; soundEnabled: boolean }>;
-    const current = existing[eventType] ?? { enabled: true, soundEnabled: true };
-    const next: Record<string, { enabled: boolean; soundEnabled: boolean }> = {
+    const existing = (rows[0]?.eventPrefs ?? {}) as Record<string, boolean | { enabled: boolean }>;
+    const existingEntry = existing[eventType];
+    // Formato legado gravava um boolean cru em vez de `{ enabled }`.
+    const current = typeof existingEntry === "boolean" ? { enabled: existingEntry } : (existingEntry ?? { enabled: true });
+    const next: Record<string, boolean | { enabled: boolean }> = {
       ...existing,
       [eventType]: {
-        enabled:      enabled      !== undefined ? enabled      : current.enabled,
-        soundEnabled: soundEnabled !== undefined ? soundEnabled : current.soundEnabled,
+        enabled: enabled !== undefined ? enabled : current.enabled,
       },
     };
     await db.insert(userNotificationPreferences)

@@ -21,6 +21,7 @@ import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-
 import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
+import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -386,6 +387,24 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Username/first_name do Telegram são controlados pelo lead (qualquer pessoa
+// que der /start no bot) e viram texto de push notification pro dono do bot —
+// remove caracteres de controle/override de direção (spoofing visual) e limita
+// o tamanho antes de usar como conteúdo confiável de notificação.
+function sanitizeNotificationText(s: string, maxLen = 64): string {
+  const isUnsafeCodePoint = (cp: number) =>
+    (cp <= 0x1F) || cp === 0x7F ||
+    (cp >= 0x200B && cp <= 0x200F) ||
+    (cp >= 0x202A && cp <= 0x202E) ||
+    (cp >= 0x2060 && cp <= 0x2069) ||
+    cp === 0xFEFF;
+  const stripped = Array.from(s)
+    .filter((ch) => !isUnsafeCodePoint(ch.codePointAt(0) ?? 0))
+    .join("")
+    .trim();
+  return stripped.length > maxLen ? `${stripped.slice(0, maxLen)}…` : stripped;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // Envia o indicador "digitando…"/"gravando áudio…" e PAUSA antes do envio real.
@@ -592,6 +611,11 @@ export class ExecuteFlowStepUseCase {
       },
     }).returning();
 
+    // `createdAt`/`updatedAt` só coincidem quando a linha acabou de ser inserida
+    // (o UPDATE do onConflictDoUpdate sempre grava um `updatedAt` novo) — é como
+    // distinguimos lead novo de lead já existente nesse upsert.
+    const isNewLead = lead.createdAt.getTime() === lead.updatedAt.getTime();
+
     // Save inbound message
     if (messageText) {
       await saveInbound(lead.id, botId, { kind: "text", text: messageText });
@@ -619,6 +643,18 @@ export class ExecuteFlowStepUseCase {
       if (Number(startCount?.n ?? 0) === 1) {
         await enqueuePixelEvents(botId, "Lead", { leadId: lead.id });
       }
+    }
+
+    // Push para o dono do bot em lead novo (não em toda atualização do upsert
+    // acima). Não bloqueia o processamento do update — sendPushToUser trata os
+    // próprios erros, o catch aqui é só cinto extra.
+    if (isNewLead) {
+      void sendPushToUser(bot.userId, {
+        eventType: PUSH_EVENT_TYPES.NEW_LEAD,
+        title:     "🆕 Novo lead!",
+        body:      sanitizeNotificationText(from.username ? `@${from.username}` : (from.first_name ?? "Novo contato")),
+        data:      { url: "/leads", lead_id: lead.id },
+      }).catch((err) => console.error("[runner] push de novo lead falhou:", err));
     }
 
     // Answer callback immediately to stop Telegram spinner
@@ -1526,6 +1562,15 @@ export class ExecuteFlowStepUseCase {
       paidHandle:  `${handleId}__paid`,
     });
 
+    // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
+    // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
+    void sendPushToUser(bot.userId, {
+      eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
+      title:     "🧾 PIX gerado",
+      body:      `${productName} — R$ ${(amount / 100).toFixed(2)}`,
+      data:      { url: "/sales", lead_id: lead.id },
+    }).catch((err) => console.error("[runner] push de PIX gerado falhou:", err));
+
     // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
     // Cancelado quando o pagamento confirma (handlePaidOffer).
     await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "unpaid", handleId);
@@ -1579,6 +1624,15 @@ export class ExecuteFlowStepUseCase {
       offerId: offer.id, offerName: offer.name, amount, status: "pending",
       externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
     });
+
+    // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
+    // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
+    void sendPushToUser(bot.userId, {
+      eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
+      title:     "🧾 PIX gerado",
+      body:      `${offer.name} — R$ ${(amount / 100).toFixed(2)}`,
+      data:      { url: "/sales", lead_id: lead.id },
+    }).catch((err) => console.error("[runner] push de PIX gerado (broadcast) falhou:", err));
 
     const caption = `💠 <b>${escapeHtml(offer.name)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
     await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });

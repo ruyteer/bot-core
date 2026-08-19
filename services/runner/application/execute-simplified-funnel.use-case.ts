@@ -12,6 +12,7 @@ import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.
 import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import type { SimplifiedPaymentCtx, SimplifiedDeliveryItem, Payment } from "../../payments/domain/payment.entity.js";
+import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -463,6 +464,15 @@ export class ExecuteSimplifiedFunnelUseCase {
       funnelId:         ctx.funnelId,
       simplifiedCtx:    ctx,
     });
+
+    // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
+    // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
+    void sendPushToUser(bot.userId, {
+      eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
+      title:     "🧾 PIX gerado",
+      body:      `${productName} — ${fmtBRL(amount)}`,
+      data:      { url: "/sales", lead_id: lead.id },
+    }).catch((err) => console.error("[simplified] push de PIX gerado falhou:", err));
 
     await this.sendPixMessages(tg, chatId, pix.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
     return { paymentId: created.id };

@@ -56,7 +56,7 @@ describe("sendPushToUser", () => {
     expect(r.sent).toBe(2);
     expect(sendNotification).toHaveBeenCalledTimes(2);
     const payload = JSON.parse(sendNotification.mock.calls[0][1] as string);
-    expect(payload).toMatchObject({ title: "Venda aprovada", body: "R$ 10,00", event_type: "sale", sound: true });
+    expect(payload).toMatchObject({ title: "Venda aprovada", body: "R$ 10,00", event_type: "sale" });
   });
 
   it("não envia para outro usuário", async () => {
@@ -92,6 +92,21 @@ describe("sendPushToUser", () => {
     expect((await sendPushToUser(userId, { eventType: "sale", title: "x" })).skipped).toBe("pref-disabled");
     // outro tipo de evento continua passando
     expect((await sendPushToUser(userId, { eventType: "admin_announcement", title: "x" })).sent).toBe(1);
+  });
+
+  it("respeita o evento desligado quando eventPrefs guarda { enabled, soundEnabled } (formato salvo por updateEventPreferences)", async () => {
+    withVapid();
+    const userId = await createProfile();
+    await seedSub(userId, "https://push.example/evt-obj");
+    const db = await testDb();
+    await db.insert(userNotificationPreferences).values({
+      userId,
+      eventPrefs: { sale_approved: { enabled: false, soundEnabled: true } },
+    });
+
+    expect((await sendPushToUser(userId, { eventType: "sale_approved", title: "x" })).skipped).toBe("pref-disabled");
+    // outro evento, não desligado, continua passando
+    expect((await sendPushToUser(userId, { eventType: "pix_generated", title: "x" })).sent).toBe(1);
   });
 
   it("inscrição expirada (410) é removida do banco", async () => {

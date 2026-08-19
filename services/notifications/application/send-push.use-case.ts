@@ -9,14 +9,21 @@ import { vapidPublicKey, vapidPrivateKey, vapidSubject } from "../../config/secr
 // registrava o service worker e salvava a inscrição em push_subscriptions, mas
 // nada nunca enviava um push. Sem isto, notificação no navegador não funciona.
 
+// As 3 chaves de evento que a UI expõe como toggle em /notifications (preferências
+// por evento, `userNotificationPreferences.eventPrefs`). `admin_announcement` é
+// emitido fora dessa lista (broadcast do admin, sem preferência por evento).
+export const PUSH_EVENT_TYPES = {
+  SALE_APPROVED: "sale_approved",
+  PIX_GENERATED: "pix_generated",
+  NEW_LEAD:      "new_lead",
+} as const;
+
 export interface PushPayload {
-  eventType: string;              // 'sale' | 'admin_announcement' | ...
+  eventType: string;              // 'sale_approved' | 'pix_generated' | 'new_lead' | 'admin_announcement' | ...
   title:     string;
   body?:     string;
   /** Vai para `notification.data` no service worker (url de clique, imagem...). */
   data?:     Record<string, unknown>;
-  /** false = não tocar o som de caixa registradora no cliente. */
-  sound?:    boolean;
 }
 
 export interface PushResult {
@@ -64,7 +71,12 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
   if (pref) {
     if (pref.pushEnabled === false) return { ...empty, skipped: "pref-disabled" };
     const events = (pref.eventPrefs ?? {}) as Record<string, unknown>;
-    if (events[payload.eventType] === false) return { ...empty, skipped: "pref-disabled" };
+    const eventPref = events[payload.eventType];
+    // `updateEventPreferences` grava `{ enabled, soundEnabled }` por evento (o
+    // que a UI de fato envia); um `false` cru também é aceito por compat.
+    const eventDisabled = eventPref === false
+      || (typeof eventPref === "object" && eventPref !== null && (eventPref as { enabled?: boolean }).enabled === false);
+    if (eventDisabled) return { ...empty, skipped: "pref-disabled" };
   }
 
   const subs = await db.select().from(pushSubscriptions)
@@ -77,7 +89,6 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
     title:      payload.title,
     body:       payload.body ?? "",
     event_type: payload.eventType,
-    sound:      payload.sound !== false,
     data:       payload.data ?? {},
   });
 

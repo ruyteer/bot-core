@@ -1,7 +1,7 @@
 import { api } from "encore.dev/api";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { paymentPaid } from "../shared/events/index.js";
-import { sendPushToUser } from "../notifications/application/send-push.use-case.js";
+import { sendPushToUser, PUSH_EVENT_TYPES } from "../notifications/application/send-push.use-case.js";
 import { accrueReferralCommission } from "../referrals/application/accrue-commission.js";
 import { enqueuePixelEvents } from "../bots/application/pixel-events.js";
 import { db } from "../shared/database.js";
@@ -147,7 +147,7 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.
       const amount = event.amount ?? payment.amount;
       void sendPushToUser(payment.userId, {
-        eventType: "sale",
+        eventType: PUSH_EVENT_TYPES.SALE_APPROVED,
         title:     "💰 Venda aprovada!",
         body:      `${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
         data:      { url: "/sales", payment_id: payment.id },
