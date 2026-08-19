@@ -18,8 +18,10 @@ import { createPixWithFallback } from "../../payments/application/create-pix-wit
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
+import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
+import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -290,18 +292,6 @@ function renderBlockButton(btn: Record<string, unknown>, vars: Map<string, strin
   // ele aqui — desenhá-lo daria um botão morto.
   if (btn.action === "offer") return { kind: "none" };
   return { kind: "callback", label };
-}
-
-// Cor do botão — suportada pelo Telegram desde o Bot API 9.4 (fev/2026):
-// `style` em InlineKeyboardButton, só "primary"|"success"|"danger". A paleta
-// do editor (buttonStyle.ts, no front) tem 4 opções porque também cobre
-// "warning" — sem equivalente no Telegram, então cai em undefined (omitido =
-// estilo padrão do app do lead, igual a nunca ter tido cor nenhuma).
-function telegramButtonStyle(style: unknown): "primary" | "success" | "danger" | undefined {
-  if (style === "primary") return "primary";
-  if (style === "constructive") return "success";
-  if (style === "destructive") return "danger";
-  return undefined;
 }
 
 // Teclado inline dos blocos de botões de um nó `message`. Botões de link viram
@@ -603,6 +593,11 @@ export class ExecuteFlowStepUseCase {
       },
     }).returning();
 
+    // `createdAt`/`updatedAt` só coincidem quando a linha acabou de ser inserida
+    // (o UPDATE do onConflictDoUpdate sempre grava um `updatedAt` novo) — é como
+    // distinguimos lead novo de lead já existente nesse upsert.
+    const isNewLead = lead.createdAt.getTime() === lead.updatedAt.getTime();
+
     // Save inbound message
     if (messageText) {
       await saveInbound(lead.id, botId, { kind: "text", text: messageText });
@@ -630,6 +625,18 @@ export class ExecuteFlowStepUseCase {
       if (Number(startCount?.n ?? 0) === 1) {
         await enqueuePixelEvents(botId, "Lead", { leadId: lead.id });
       }
+    }
+
+    // Push para o dono do bot em lead novo (não em toda atualização do upsert
+    // acima). Não bloqueia o processamento do update — sendPushToUser trata os
+    // próprios erros, o catch aqui é só cinto extra.
+    if (isNewLead) {
+      void sendPushToUser(bot.userId, {
+        eventType: PUSH_EVENT_TYPES.NEW_LEAD,
+        title:     "🆕 Novo lead!",
+        body:      from.username ? `@${from.username}` : (from.first_name ?? "Novo contato"),
+        data:      { url: "/leads", lead_id: lead.id },
+      }).catch((err) => console.error("[runner] push de novo lead falhou:", err));
     }
 
     // Answer callback immediately to stop Telegram spinner
@@ -1536,6 +1543,15 @@ export class ExecuteFlowStepUseCase {
       nodeId:      node.id,
       paidHandle:  `${handleId}__paid`,
     });
+
+    // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
+    // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
+    void sendPushToUser(bot.userId, {
+      eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
+      title:     "🧾 PIX gerado",
+      body:      `${productName} — R$ ${(amount / 100).toFixed(2)}`,
+      data:      { url: "/sales", lead_id: lead.id },
+    }).catch((err) => console.error("[runner] push de PIX gerado falhou:", err));
 
     // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
     // Cancelado quando o pagamento confirma (handlePaidOffer).
