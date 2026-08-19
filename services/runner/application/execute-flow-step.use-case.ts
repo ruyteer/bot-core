@@ -18,6 +18,7 @@ import { createPixWithFallback } from "../../payments/application/create-pix-wit
 import { encoreExternalUrl } from "../../config/secrets.js";
 import type { Payment } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
+import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 
@@ -290,18 +291,6 @@ function renderBlockButton(btn: Record<string, unknown>, vars: Map<string, strin
   // ele aqui — desenhá-lo daria um botão morto.
   if (btn.action === "offer") return { kind: "none" };
   return { kind: "callback", label };
-}
-
-// Cor do botão — suportada pelo Telegram desde o Bot API 9.4 (fev/2026):
-// `style` em InlineKeyboardButton, só "primary"|"success"|"danger". A paleta
-// do editor (buttonStyle.ts, no front) tem 4 opções porque também cobre
-// "warning" — sem equivalente no Telegram, então cai em undefined (omitido =
-// estilo padrão do app do lead, igual a nunca ter tido cor nenhuma).
-function telegramButtonStyle(style: unknown): "primary" | "success" | "danger" | undefined {
-  if (style === "primary") return "primary";
-  if (style === "constructive") return "success";
-  if (style === "destructive") return "danger";
-  return undefined;
 }
 
 // Teclado inline dos blocos de botões de um nó `message`. Botões de link viram
