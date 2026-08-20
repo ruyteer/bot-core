@@ -28,6 +28,8 @@ interface NotificationResponse {
   createdAt:   string;
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 // GET /notifications/mine — notifications for the current user
@@ -231,6 +233,9 @@ export const savePushSubscription = api(
 export const removePushSubscription = api(
   { method: "DELETE", path: "/notifications/push-subscription/:id", expose: true, auth: true },
   async ({ id }: { id: string }): Promise<void> => {
+    if (!UUID_REGEX.test(id)) {
+      throw APIError.invalidArgument(`id inválido: ${id}`);
+    }
     const { userID: userId } = getAuthData()!;
     await db.delete(pushSubscriptions)
       .where(and(eq(pushSubscriptions.id, id), eq(pushSubscriptions.userId, userId)));

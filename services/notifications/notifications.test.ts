@@ -195,6 +195,16 @@ describe("removePushSubscription", () => {
     expect(left).toHaveLength(1);
     expect(left[0].id).toBe(sub.id);
   });
+
+  it("id malformado (não-uuid, ex.: a string literal 'undefined' vinda de um bug no frontend) retorna erro controlado em vez de deixar subir o erro cru do driver Postgres", async () => {
+    const userId = await createProfile();
+    await seedSub(userId, "https://push.example/malformed-id");
+    currentAuthUserId = userId;
+
+    await expect(removePushSubscription({ id: "undefined" })).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
+  });
 });
 
 describe("savePushSubscription", () => {
