@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueBroadcasts } from "./application/process-broadcasts.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { scheduledMessages, broadcastRuns, payments, leads, funnelOffers } from "../shared/schema/index.js";
+import { scheduledMessages, broadcastRuns, payments, leads, funnelOffers, botGroups } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 
@@ -123,6 +123,37 @@ describe("processDueBroadcasts — não envia para grupos (bug João)", () => {
     await seedMsg(bot.id, bot.userId, { message: "promo", filterType: "all", targetType: "leads" });
     await processDueBroadcasts();
     expect(getTelegramCalls("sendMessage").length).toBe(1); // só o usuário recebe
+  });
+});
+
+describe("processDueBroadcasts — targetGroupIds inválido (bug offer_style-like: chat_id no lugar do uuid)", () => {
+  it("targetGroupIds com valor não-uuid é descartado, não derruba o broadcast nem vira 'todos os grupos'", async () => {
+    const bot = await createBot();
+    const db = await testDb();
+    await db.insert(botGroups).values({ botId: bot.id, name: "Canal real", telegramChatId: -1004316952477n, type: "channel" });
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo", targetType: "groups", targetGroupIds: ["-1004347875198"], // chat_id, não uuid — o bug relatado
+    });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1); // processou sem lançar
+
+    // Não manda pro canal real (que existe) — o filtro inválido não pode virar "sem filtro = todos".
+    expect(getTelegramCalls("sendMessage").length).toBe(0);
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].totalTargets).toBe(0);
+    expect(runs[0].status).toBe("completed"); // failedCount 0 conta como sucesso, não falha
+  });
+
+  it("targetGroupIds com uuid válido manda só pro grupo selecionado, não pros outros do bot", async () => {
+    const bot = await createBot();
+    const db = await testDb();
+    const [selected] = await db.insert(botGroups).values({ botId: bot.id, name: "Selecionado", telegramChatId: -1001111111n, type: "group" }).returning();
+    await db.insert(botGroups).values({ botId: bot.id, name: "Não selecionado", telegramChatId: -1002222222n, type: "group" });
+    await seedMsg(bot.id, bot.userId, { message: "promo", targetType: "groups", targetGroupIds: [selected.id] });
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMessage").length).toBe(1);
   });
 });
 

@@ -7,6 +7,8 @@ import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // ── Variáveis do broadcast (chave simples, igual ao painel) ─────────────────────
 function replaceVars(text: string, lead: { firstName?: string | null; lastName?: string | null; telegramUsername?: string | null }): string {
   return (text || "")
@@ -170,7 +172,16 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   const offers = (Array.isArray(adv.offers) ? adv.offers : []) as Array<{ product_id?: string; external_ref?: string; button_text?: string; style?: unknown }>;
   const filterProductId = (adv.filter_product_id as string | null) ?? null;
   const targetType = msg.targetType || "leads";
-  const targetGroupIds = (Array.isArray(msg.targetGroupIds) ? msg.targetGroupIds : []) as string[];
+  const rawTargetGroupIds = (Array.isArray(msg.targetGroupIds) ? msg.targetGroupIds : []) as string[];
+  // targetGroupIds precisa ser bot_groups.id (uuid) — nunca o telegram_chat_id. Um bug
+  // antigo do painel (corrigido em bot-ui) chegou a gravar o chat_id do Telegram aqui,
+  // o que quebra o inArray abaixo com "invalid input syntax for type uuid" e derruba o
+  // broadcast inteiro, inclusive os leads já enviados com sucesso antes de chegar aqui.
+  // Filtra silenciosamente qualquer valor que não pareça uuid em vez de deixar propagar.
+  const targetGroupIds = rawTargetGroupIds.filter((id) => UUID_REGEX.test(id));
+  if (targetGroupIds.length !== rawTargetGroupIds.length) {
+    console.error("[broadcast] targetGroupIds com valor não-uuid descartado:", msg.id, rawTargetGroupIds);
+  }
   const botIdList = (Array.isArray(msg.botIds) && msg.botIds.length ? msg.botIds : [msg.botId]).map(String);
 
   const botRows = await db.select().from(bots).where(inArray(bots.id, botIdList));
@@ -201,9 +212,13 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
 
     // Grupos/canais
     if (targetType === "groups" || targetType === "both") {
-      const groups = targetGroupIds.length
-        ? await db.select().from(botGroups).where(and(eq(botGroups.botId, bot.id), inArray(botGroups.id, targetGroupIds)))
-        : await db.select().from(botGroups).where(eq(botGroups.botId, bot.id));
+      // Distingue "nenhum filtro" (rawTargetGroupIds vazio → todos os grupos do bot) de
+      // "filtro tinha só ids inválidos" (não pode virar "todos os grupos" por acidente).
+      const groups = rawTargetGroupIds.length === 0
+        ? await db.select().from(botGroups).where(eq(botGroups.botId, bot.id))
+        : targetGroupIds.length
+          ? await db.select().from(botGroups).where(and(eq(botGroups.botId, bot.id), inArray(botGroups.id, targetGroupIds)))
+          : [];
       for (const g of groups) {
         const chatId = g.telegramChatId.toString();
         const text = msg.message || "";
