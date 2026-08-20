@@ -16,6 +16,16 @@ vi.mock("web-push", () => ({
 
 const { sendPushToUser } = await import("./application/send-push.use-case.js");
 
+// removePushSubscription usa getAuthData (via ~encore/auth) para restringir a
+// remoção ao dono da inscrição — mockado aqui para controlar o usuário
+// autenticado por teste, já que fora do runtime `encore test` esse módulo não
+// existe (ver test/stubs/encore-auth.ts, que só cobre encore.dev/auth).
+let currentAuthUserId: string | null = null;
+vi.mock("~encore/auth", () => ({
+  getAuthData: () => (currentAuthUserId ? { userID: currentAuthUserId } : null),
+}));
+const { removePushSubscription } = await import("./notifications.api.js");
+
 async function seedSub(userId: string, endpoint: string) {
   const db = await testDb();
   const [row] = await db.insert(pushSubscriptions)
@@ -136,5 +146,49 @@ describe("sendPushToUser", () => {
     expect(r.removed).toBe(0);
     const db = await testDb();
     expect((await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId))).length).toBe(1);
+  });
+});
+
+describe("removePushSubscription", () => {
+  // O frontend manda `endpoint` via query string num DELETE (Encore decodifica
+  // query params GET/DELETE para os campos do handler, não do body). Chamar o
+  // handler com `{ endpoint }` direto reproduz exatamente essa forma decodificada.
+  it("remove a inscrição do próprio usuário a partir do `endpoint` recebido (contrato de query string)", async () => {
+    const userId = await createProfile();
+    const sub = await seedSub(userId, "https://push.example/mine");
+    currentAuthUserId = userId;
+
+    await removePushSubscription({ endpoint: sub.endpoint });
+
+    const db = await testDb();
+    const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
+    expect(left).toHaveLength(0);
+  });
+
+  it("não remove a inscrição de outro usuário, mesmo passando o endpoint exato dele", async () => {
+    const userA = await createProfile();
+    const userB = await createProfile();
+    const subA = await seedSub(userA, "https://push.example/of-a");
+    currentAuthUserId = userB; // autenticado como B, tentando remover o endpoint de A
+
+    await removePushSubscription({ endpoint: subA.endpoint });
+
+    const db = await testDb();
+    const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userA));
+    expect(left).toHaveLength(1);
+    expect(left[0].endpoint).toBe(subA.endpoint);
+  });
+
+  it("endpoint inexistente não afeta outras inscrições do usuário", async () => {
+    const userId = await createProfile();
+    const sub = await seedSub(userId, "https://push.example/kept");
+    currentAuthUserId = userId;
+
+    await removePushSubscription({ endpoint: "https://push.example/never-existed" });
+
+    const db = await testDb();
+    const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
+    expect(left).toHaveLength(1);
+    expect(left[0].endpoint).toBe(sub.endpoint);
   });
 });
