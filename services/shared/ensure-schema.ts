@@ -205,10 +205,14 @@ const STATEMENTS: string[] = [
      FROM "remarketing_lead_state"
    )
    DELETE FROM "remarketing_lead_state" WHERE "id" IN (SELECT "id" FROM ranked WHERE rn > 1)`,
+  // UNIQUE cria um índice implícito com o mesmo nome da constraint: se esse
+  // índice já existe (ex.: boot anterior já criou a constraint), o Postgres
+  // falha ao tentar recriá-lo com duplicate_table (42P07, "relation already
+  // exists"), não duplicate_object (42710) — precisa capturar os dois.
   `DO $$ BEGIN
      ALTER TABLE "remarketing_lead_state" ADD CONSTRAINT "remarketing_lead_state_campaign_id_lead_id_key"
        UNIQUE ("campaign_id", "lead_id");
-   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+   EXCEPTION WHEN duplicate_object OR duplicate_table THEN null; END $$`,
 
   // 0012_processed_webhooks_status_key.sql — idempotência de webhook passa a
   // considerar o status (external_id, provider, status), não só (external_id,
@@ -219,10 +223,15 @@ const STATEMENTS: string[] = [
   `DO $$ BEGIN
      ALTER TABLE "processed_webhooks" DROP CONSTRAINT "processed_webhooks_external_id_provider_pk";
    EXCEPTION WHEN undefined_object THEN null; END $$`,
+  // Mesmo risco de índice implícito do caso acima (duplicate_table), mais um
+  // terceiro: PRIMARY KEY é única por tabela, então reaplicar esta constraint
+  // (já existente, mesmo nome) faz o Postgres barrar antes de checar nome de
+  // índice, com invalid_table_definition ("multiple primary keys ... are not
+  // allowed") — precisa capturar os três.
   `DO $$ BEGIN
      ALTER TABLE "processed_webhooks" ADD CONSTRAINT "processed_webhooks_external_id_provider_status_pk"
        PRIMARY KEY ("external_id", "provider", "status");
-   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+   EXCEPTION WHEN duplicate_object OR duplicate_table OR invalid_table_definition THEN null; END $$`,
 
   // 0013_remarketing_offer_style.sql — botão da oferta do remarketing também
   // pode ter cor (primary/constructive/destructive). Coluna nullable, sem
