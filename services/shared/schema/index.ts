@@ -395,6 +395,7 @@ export const remarketingMessages = pgTable("remarketing_messages", {
   media:         jsonb("media").notNull().default({}),
   inlineButtons: jsonb("inline_buttons").notNull().default([]),
   offerId:       uuid("offer_id").references(() => funnelOffers.id, { onDelete: "set null" }),
+  offerStyle:    text("offer_style"),
   delayValue:    integer("delay_value").notNull().default(0),
   delayUnit:     text("delay_unit").notNull().default("hours"),
   orderIndex:    integer("order_index").notNull().default(0),
