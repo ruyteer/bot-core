@@ -24,7 +24,7 @@ let currentAuthUserId: string | null = null;
 vi.mock("~encore/auth", () => ({
   getAuthData: () => (currentAuthUserId ? { userID: currentAuthUserId } : null),
 }));
-const { removePushSubscription } = await import("./notifications.api.js");
+const { removePushSubscription, savePushSubscription } = await import("./notifications.api.js");
 
 async function seedSub(userId: string, endpoint: string) {
   const db = await testDb();
@@ -151,48 +151,80 @@ describe("sendPushToUser", () => {
 
 describe("removePushSubscription", () => {
   // O stub de api() usado nos testes (test/stubs/encore-api.ts) devolve o
-  // handler cru, sem roteamento HTTP nem parsing de query string — então
-  // estes testes cobrem só a lógica de posse/isolamento do handler (delete
-  // filtrado por userId + endpoint), não o contrato HTTP real (Encore
-  // decodificando `endpoint` da query string de um DELETE). Esse round-trip
-  // — que era a causa raiz do bug original — não tem cobertura automatizada
-  // neste harness; validar manualmente ou via teste de integração `encore test`.
-  it("remove a inscrição do próprio usuário a partir do `endpoint` recebido (lógica de posse)", async () => {
+  // handler cru, sem roteamento HTTP — então estes testes cobrem só a lógica
+  // de posse/isolamento do handler (delete filtrado por userId + id), não o
+  // contrato HTTP real (Encore decodificando `id` do path de um DELETE
+  // /notifications/push-subscription/:id). Esse round-trip não tem cobertura
+  // automatizada neste harness; validar manualmente ou via teste de
+  // integração `encore test`.
+  it("remove a inscrição do próprio usuário a partir do `id` recebido (lógica de posse)", async () => {
     const userId = await createProfile();
     const sub = await seedSub(userId, "https://push.example/mine");
     currentAuthUserId = userId;
 
-    await removePushSubscription({ endpoint: sub.endpoint });
+    await removePushSubscription({ id: sub.id });
 
     const db = await testDb();
     const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
     expect(left).toHaveLength(0);
   });
 
-  it("não remove a inscrição de outro usuário, mesmo passando o endpoint exato dele", async () => {
+  it("não remove a inscrição de outro usuário, mesmo passando o id exato dele", async () => {
     const userA = await createProfile();
     const userB = await createProfile();
     const subA = await seedSub(userA, "https://push.example/of-a");
-    currentAuthUserId = userB; // autenticado como B, tentando remover o endpoint de A
+    currentAuthUserId = userB; // autenticado como B, tentando remover o id de A
 
-    await removePushSubscription({ endpoint: subA.endpoint });
+    await removePushSubscription({ id: subA.id });
 
     const db = await testDb();
     const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userA));
     expect(left).toHaveLength(1);
-    expect(left[0].endpoint).toBe(subA.endpoint);
+    expect(left[0].id).toBe(subA.id);
   });
 
-  it("endpoint inexistente não afeta outras inscrições do usuário", async () => {
+  it("id inexistente não afeta outras inscrições do usuário", async () => {
     const userId = await createProfile();
     const sub = await seedSub(userId, "https://push.example/kept");
     currentAuthUserId = userId;
 
-    await removePushSubscription({ endpoint: "https://push.example/never-existed" });
+    await removePushSubscription({ id: "00000000-0000-0000-0000-000000000000" });
 
     const db = await testDb();
     const left = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
     expect(left).toHaveLength(1);
-    expect(left[0].endpoint).toBe(sub.endpoint);
+    expect(left[0].id).toBe(sub.id);
+  });
+});
+
+describe("savePushSubscription", () => {
+  it("retorna o id da inscrição inserida", async () => {
+    const userId = await createProfile();
+    currentAuthUserId = userId;
+
+    const result = await savePushSubscription({
+      endpoint: "https://push.example/new",
+      p256dh: "p256dh-test",
+      auth: "auth-test",
+    });
+
+    expect(result.ok).toBe(true);
+    const db = await testDb();
+    const [row] = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.endpoint, "https://push.example/new"));
+    expect(result.id).toBe(row.id);
+  });
+
+  it("retorna o mesmo id ao atualizar uma inscrição existente (upsert pelo endpoint)", async () => {
+    const userId = await createProfile();
+    currentAuthUserId = userId;
+    const sub = await seedSub(userId, "https://push.example/upsert");
+
+    const result = await savePushSubscription({
+      endpoint: sub.endpoint,
+      p256dh: "p256dh-updated",
+      auth: "auth-updated",
+    });
+
+    expect(result.id).toBe(sub.id);
   });
 });
