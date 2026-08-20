@@ -223,6 +223,11 @@ const STATEMENTS: string[] = [
      ALTER TABLE "processed_webhooks" ADD CONSTRAINT "processed_webhooks_external_id_provider_status_pk"
        PRIMARY KEY ("external_id", "provider", "status");
    EXCEPTION WHEN duplicate_object THEN null; END $$`,
+
+  // 0013_remarketing_offer_style.sql — botão da oferta do remarketing também
+  // pode ter cor (primary/constructive/destructive). Coluna nullable, sem
+  // default: null mantém o comportamento atual (sem cor).
+  `ALTER TABLE "remarketing_messages" ADD COLUMN IF NOT EXISTS "offer_style" text`,
 ];
 
 export async function ensureSchema(): Promise<void> {

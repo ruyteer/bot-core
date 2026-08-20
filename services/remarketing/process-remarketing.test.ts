@@ -117,3 +117,93 @@ describe("remarketing — oferta anexada renderiza botão de compra", () => {
     expect(kb.flat().some((b) => b.callback_data === `bcast_buy_${offer.id}`)).toBe(true);
   });
 });
+
+describe("remarketing — cor do botão (style)", () => {
+  type Btn = { text?: string; callback_data?: string; url?: string; style?: string };
+
+  it("style válido no botão inline é traduzido pro formato do Telegram", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6200n);
+    const c = await campaign(bot.id);
+    await message(c.id, { inlineButtons: [{ text: "Saiba mais", url: "https://x.com", style: "constructive" }] });
+    await state(c.id, bot.id, lead);
+    await processDueRemarketing();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBe("success");
+  });
+
+  it("style inválido no botão inline é descartado (omitido do payload)", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6201n);
+    const c = await campaign(bot.id);
+    await message(c.id, { inlineButtons: [{ text: "Saiba mais", url: "https://x.com", style: "not_a_real_style" }] });
+    await state(c.id, bot.id, lead);
+    await processDueRemarketing();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBeUndefined();
+  });
+
+  it("botão inline sem style não quebra o envio (omitido do payload)", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6202n);
+    const c = await campaign(bot.id);
+    await message(c.id, { inlineButtons: [{ text: "Saiba mais", url: "https://x.com" }] });
+    await state(c.id, bot.id, lead);
+    const n = await processDueRemarketing();
+    expect(n).toBe(1);
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBeUndefined();
+  });
+
+  it("offerStyle válido no botão da oferta é traduzido pro formato do Telegram", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6203n);
+    const c = await campaign(bot.id);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await message(c.id, { offerId: offer.id, offerStyle: "destructive" });
+    await state(c.id, bot.id, lead);
+    await processDueRemarketing();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
+    expect(btn?.style).toBe("danger");
+  });
+
+  it("offerStyle inválido no botão da oferta é descartado (omitido do payload)", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6204n);
+    const c = await campaign(bot.id);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await message(c.id, { offerId: offer.id, offerStyle: "hackerman" });
+    await state(c.id, bot.id, lead);
+    await processDueRemarketing();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
+    expect(btn?.style).toBeUndefined();
+  });
+
+  it("mensagem com offerId sem offerStyle não quebra o envio (omitido do payload)", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6205n);
+    const c = await campaign(bot.id);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await message(c.id, { offerId: offer.id });
+    await state(c.id, bot.id, lead);
+    const n = await processDueRemarketing();
+    expect(n).toBe(1);
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
+    expect(btn?.style).toBeUndefined();
+  });
+});

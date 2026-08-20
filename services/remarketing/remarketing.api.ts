@@ -4,6 +4,7 @@ import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, sql } from "drizzle-orm";
+import { sanitizeButtonStyle, sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 
 // ─── Response shapes ─────────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ interface MessageResponse {
   media:         unknown;
   inlineButtons: unknown;
   offerId:       string | null;
+  offerStyle:    string | null;
   delayValue:    number;
   delayUnit:     string;
   orderIndex:    number;
@@ -100,6 +102,7 @@ function toMessageResponse(m: typeof remarketingMessages.$inferSelect): MessageR
     media:         m.media,
     inlineButtons: m.inlineButtons,
     offerId:       m.offerId,
+    offerStyle:    m.offerStyle,
     delayValue:    m.delayValue,
     delayUnit:     m.delayUnit,
     orderIndex:    m.orderIndex,
@@ -319,7 +322,7 @@ export const listMessages = api(
 // PUT /remarketing/:id/messages — replace all messages
 export const saveMessages = api(
   { method: "PUT", path: "/remarketing/:id/messages", expose: true, auth: true },
-  async ({ id, messages }: { id: string; messages: Array<{ message: string; media?: unknown; inlineButtons?: unknown; offerId?: string | null; delayValue: number; delayUnit: string; orderIndex: number }> }): Promise<{ ok: boolean }> => {
+  async ({ id, messages }: { id: string; messages: Array<{ message: string; media?: unknown; inlineButtons?: unknown; offerId?: string | null; offerStyle?: unknown; delayValue: number; delayUnit: string; orderIndex: number }> }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
     await assertCampaignOwnership(id, userId);
 
@@ -330,8 +333,9 @@ export const saveMessages = api(
           campaignId:    id,
           message:       m.message,
           media:         m.media ?? {},
-          inlineButtons: m.inlineButtons ?? [],
+          inlineButtons: sanitizeButtonArray(m.inlineButtons ?? []),
           offerId:       m.offerId ?? null,
+          offerStyle:    sanitizeButtonStyle(m.offerStyle) ?? null,
           delayValue:    m.delayValue,
           delayUnit:     m.delayUnit,
           orderIndex:    m.orderIndex,

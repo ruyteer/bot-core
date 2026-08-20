@@ -139,3 +139,82 @@ describe("processDueBroadcasts — oferta + botão (bug João)", () => {
     expect(kb.flat().some((b) => b.callback_data === `bcast_buy_${offer.id}`)).toBe(true);
   });
 });
+
+describe("processDueBroadcasts — cor do botão (style)", () => {
+  type Btn = { text?: string; callback_data?: string; url?: string; style?: string };
+
+  it("style válido no botão inline é traduzido pro formato do Telegram", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7200n);
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: { inline_buttons: [{ text: "Saiba mais", url: "https://x.com", style: "constructive" }] } as Record<string, unknown>,
+    });
+    await processDueBroadcasts();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBe("success");
+  });
+
+  it("style inválido no botão inline é descartado (omitido do payload)", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7201n);
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: { inline_buttons: [{ text: "Saiba mais", url: "https://x.com", style: "not_a_real_style" }] } as Record<string, unknown>,
+    });
+    await processDueBroadcasts();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBeUndefined();
+  });
+
+  it("botão inline sem style não quebra o envio (omitido do payload)", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7202n);
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: { inline_buttons: [{ text: "Saiba mais", url: "https://x.com" }] } as Record<string, unknown>,
+    });
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.text === "Saiba mais");
+    expect(btn?.style).toBeUndefined();
+  });
+
+  it("style válido no botão de oferta é traduzido pro formato do Telegram", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7203n);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: { offers: [{ product_id: offer.id, button_text: "Comprar", style: "destructive" }] } as Record<string, unknown>,
+    });
+    await processDueBroadcasts();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
+    expect(btn?.style).toBe("danger");
+  });
+
+  it("style inválido no botão de oferta é descartado (omitido do payload)", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 7204n);
+    const db = await testDb();
+    const [offer] = await db.insert(funnelOffers).values({ botId: bot.id, name: "Curso", price: 1990 }).returning();
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: { offers: [{ product_id: offer.id, button_text: "Comprar", style: "hackerman" }] } as Record<string, unknown>,
+    });
+    await processDueBroadcasts();
+    const call = getTelegramCalls("sendMessage")[0];
+    const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
+    const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
+    expect(btn?.style).toBeUndefined();
+  });
+});

@@ -6,6 +6,7 @@ import {
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
+import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
 
 type Unit = "minutes" | "hours" | "days";
 const toMs = (value: number, unit: Unit) => {
@@ -160,14 +161,20 @@ export async function processDueRemarketing(): Promise<number> {
       const chatId = lead.telegramChatId.toString();
       const text = replaceVars(msg.message || "", lead);
       const media = (Array.isArray(msg.media) ? msg.media : (msg.media && typeof msg.media === "object" && Array.isArray((msg.media as { items?: unknown }).items) ? (msg.media as { items: MediaItem[] }).items : [])) as MediaItem[];
-      const buttons = (Array.isArray(msg.inlineButtons) ? msg.inlineButtons : []) as Array<{ text?: string; url?: string }>;
-      const kb: Array<Array<Record<string, unknown>>> = buttons.filter((b) => b?.text && b?.url).map((b) => [{ text: String(b.text), url: String(b.url) }]);
+      const buttons = (Array.isArray(msg.inlineButtons) ? msg.inlineButtons : []) as Array<{ text?: string; url?: string; style?: unknown }>;
+      const kb: Array<Array<Record<string, unknown>>> = buttons.filter((b) => b?.text && b?.url).map((b) => {
+        const style = telegramButtonStyle(b.style);
+        return [{ text: String(b.text), url: String(b.url), ...(style ? { style } : {}) }];
+      });
       // Oferta anexada → botão de compra (bcast_buy), tratado pelo runner.
       if (msg.offerId) {
         // Oferta é escopada por bot: precisa ser a do bot que está enviando,
         // senão o callback bcast_buy cairia num bot que não conhece a oferta.
         const [off] = await db.select().from(funnelOffers).where(and(eq(funnelOffers.id, msg.offerId), eq(funnelOffers.botId, sendBotId)));
-        if (off) kb.push([{ text: `🛒 ${off.name} — ${(Number(off.price) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}`, callback_data: `bcast_buy_${off.id}` }]);
+        if (off) {
+          const offerStyle = telegramButtonStyle(msg.offerStyle);
+          kb.push([{ text: `🛒 ${off.name} — ${(Number(off.price) / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}`, callback_data: `bcast_buy_${off.id}`, ...(offerStyle ? { style: offerStyle } : {}) }]);
+        }
       }
       const replyMarkup = kb.length ? { inline_keyboard: kb } : undefined;
 

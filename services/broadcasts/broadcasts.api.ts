@@ -5,6 +5,7 @@ import { db } from "../shared/database.js";
 import { scheduledMessages, bots, broadcastRuns } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
 import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
+import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 
 // ─── Ingestão de datas ────────────────────────────────────────────────────────
 // Strings ISO-8601 COM offset/Z são um instante inequívoco e podem ser parseadas
@@ -87,6 +88,17 @@ function toScheduledResponse(r: typeof scheduledMessages.$inferSelect): Schedule
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// advancedFilters é JSON arbitrário vindo do cliente (create/update), mas quando
+// carrega inline_buttons/offers (é o que sendBroadcast/buildKeyboard leem em
+// process-broadcasts.use-case.ts) o `style` de cada botão passa pela mesma whitelist.
+function sanitizeAdvancedFilters(input: unknown): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+  const obj = { ...(input as Record<string, unknown>) };
+  if ("inline_buttons" in obj) obj.inline_buttons = sanitizeButtonArray(obj.inline_buttons);
+  if ("offers" in obj) obj.offers = sanitizeButtonArray(obj.offers);
+  return obj;
+}
 
 async function getUserBotIds(userId: string): Promise<string[]> {
   const rows = await db.select({ id: bots.id }).from(bots).where(eq(bots.userId, userId));
@@ -181,7 +193,7 @@ export const create = api(
       message:                  req.message,
       broadcastType:            req.broadcastType ?? "instant",
       filterType:               req.filterType ?? "all",
-      advancedFilters:          req.advancedFilters ?? null,
+      advancedFilters:          sanitizeAdvancedFilters(req.advancedFilters ?? null),
       targetType:               req.targetType ?? "leads",
       targetGroupIds:           req.targetGroupIds ?? [],
       funnelId:                 req.funnelId ?? null,
@@ -228,8 +240,8 @@ export const send = api(
       filterType:      req.filterType,
       advancedFilters: {
         filter_product_id: req.filterProductId ?? null,
-        inline_buttons:    req.inlineButtons ?? [],
-        offers:            req.offers ?? [],
+        inline_buttons:    sanitizeButtonArray(req.inlineButtons ?? []),
+        offers:            sanitizeButtonArray(req.offers ?? []),
         media:             req.media ?? [],
       },
       targetType:      req.targetType,
@@ -273,7 +285,7 @@ export const update = api(
     const patch: Partial<typeof scheduledMessages.$inferInsert> = { updatedAt: new Date() };
     if (req.message !== undefined)                patch.message = req.message;
     if (req.filterType !== undefined)             patch.filterType = req.filterType;
-    if ("advancedFilters" in req)                 patch.advancedFilters = req.advancedFilters;
+    if ("advancedFilters" in req)                 patch.advancedFilters = sanitizeAdvancedFilters(req.advancedFilters);
     if (req.targetType !== undefined)             patch.targetType = req.targetType;
     if (req.targetGroupIds !== undefined)         patch.targetGroupIds = req.targetGroupIds;
     if (req.scheduledAt !== undefined)            patch.scheduledAt = parseScheduledAt(req.scheduledAt, tz);

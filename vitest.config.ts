@@ -23,6 +23,9 @@ export default defineConfig({
       "encore.dev/api": resolve(here, "test/stubs/encore-api.ts"),
       "encore.dev/service": resolve(here, "test/stubs/encore-service.ts"),
       "encore.dev/auth": resolve(here, "test/stubs/encore-auth.ts"),
+      // Handlers de API importam getAuthData de "~encore/auth" (código gerado pelo
+      // Encore, ausente localmente/em CI) — aponta pro mesmo stub de encore.dev/auth.
+      "~encore/auth": resolve(here, "test/stubs/encore-auth.ts"),
     },
   },
 });
