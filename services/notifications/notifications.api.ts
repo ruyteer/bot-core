@@ -28,6 +28,8 @@ interface NotificationResponse {
   createdAt:   string;
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 // GET /notifications/mine — notifications for the current user
@@ -212,25 +214,31 @@ export const getVapidKey = api(
 
 export const savePushSubscription = api(
   { method: "POST", path: "/notifications/push-subscription", expose: true, auth: true },
-  async ({ endpoint, p256dh, auth }: { endpoint: string; p256dh: string; auth: string }): Promise<{ ok: boolean }> => {
+  async ({ endpoint, p256dh, auth }: { endpoint: string; p256dh: string; auth: string }): Promise<{ ok: boolean; id: string }> => {
     const { userID: userId } = getAuthData()!;
-    await db.insert(pushSubscriptions)
+    const [row] = await db.insert(pushSubscriptions)
       .values({ userId, endpoint, p256dh, auth })
       .onConflictDoUpdate({
         target: [pushSubscriptions.endpoint],
         set: { p256dh, auth },
-      });
-    return { ok: true };
+      })
+      .returning({ id: pushSubscriptions.id });
+    return { ok: true, id: row.id };
   },
 );
 
-// DELETE /notifications/push-subscription
+// DELETE /notifications/push-subscription/:id — remove pelo id (uuid) da
+// inscrição em vez do endpoint completo, para não expor essa URL identificando
+// o dispositivo do usuário em query string de logs de proxy/APM.
 export const removePushSubscription = api(
-  { method: "DELETE", path: "/notifications/push-subscription", expose: true, auth: true },
-  async ({ endpoint }: { endpoint: string }): Promise<void> => {
+  { method: "DELETE", path: "/notifications/push-subscription/:id", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<void> => {
+    if (!UUID_REGEX.test(id)) {
+      throw APIError.invalidArgument(`id inválido: ${id}`);
+    }
     const { userID: userId } = getAuthData()!;
     await db.delete(pushSubscriptions)
-      .where(and(eq(pushSubscriptions.endpoint, endpoint), eq(pushSubscriptions.userId, userId)));
+      .where(and(eq(pushSubscriptions.id, id), eq(pushSubscriptions.userId, userId)));
   },
 );
 
