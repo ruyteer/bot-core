@@ -5,6 +5,7 @@ import {
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
+import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
 
 // ── Variáveis do broadcast (chave simples, igual ao painel) ─────────────────────
 function replaceVars(text: string, lead: { firstName?: string | null; lastName?: string | null; telegramUsername?: string | null }): string {
@@ -80,15 +81,16 @@ interface MediaItem { url: string; media_type: string; has_spoiler?: boolean }
 function buildKeyboard(buttons: Array<Record<string, unknown>>): { inline_keyboard: unknown[][] } | undefined {
   const rows = (buttons || []).filter((b) => b && (b.text || b.label)).map((b) => {
     const text = String(b.text ?? b.label ?? "");
-    if (b.url) return [{ text, url: String(b.url) }];
-    return [{ text, callback_data: String(b.callback ?? b.value ?? "noop") }];
+    const style = telegramButtonStyle(b.style);
+    if (b.url) return [{ text, url: String(b.url), ...(style ? { style } : {}) }];
+    return [{ text, callback_data: String(b.callback ?? b.value ?? "noop"), ...(style ? { style } : {}) }];
   });
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
 // Resolve botões de OFERTA (funnel_offers) do broadcast → botão "comprar" com
 // callback bcast_buy_<id>, tratado pelo runner. price em centavos (exibe /100).
-async function resolveOfferButtons(botId: string, offers: Array<{ product_id?: string; external_ref?: string; button_text?: string }>): Promise<Array<Array<Record<string, unknown>>>> {
+async function resolveOfferButtons(botId: string, offers: Array<{ product_id?: string; external_ref?: string; button_text?: string; style?: unknown }>): Promise<Array<Array<Record<string, unknown>>>> {
   if (!offers || offers.length === 0) return [];
   const refs = offers.map((o) => o.external_ref).filter(Boolean) as string[];
   const ids = offers.map((o) => o.product_id).filter(Boolean) as string[];
@@ -101,7 +103,8 @@ async function resolveOfferButtons(botId: string, offers: Array<{ product_id?: s
     const p = products.find((pp) => (o.external_ref && pp.externalRef === o.external_ref) || (o.product_id && pp.id === o.product_id));
     if (!p) continue;
     const label = (o.button_text && o.button_text.trim()) ? o.button_text : `🛒 ${p.name} — ${fmt(p.price)}`;
-    rows.push([{ text: label, callback_data: `bcast_buy_${p.id}` }]);
+    const style = telegramButtonStyle(o.style);
+    rows.push([{ text: label, callback_data: `bcast_buy_${p.id}`, ...(style ? { style } : {}) }]);
   }
   return rows;
 }
@@ -164,7 +167,7 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   const adv = (msg.advancedFilters && typeof msg.advancedFilters === "object" ? msg.advancedFilters : {}) as Record<string, unknown>;
   const media = (Array.isArray(adv.media) ? adv.media : []) as MediaItem[];
   const inlineButtons = (Array.isArray(adv.inline_buttons) ? adv.inline_buttons : []) as Array<Record<string, unknown>>;
-  const offers = (Array.isArray(adv.offers) ? adv.offers : []) as Array<{ product_id?: string; external_ref?: string; button_text?: string }>;
+  const offers = (Array.isArray(adv.offers) ? adv.offers : []) as Array<{ product_id?: string; external_ref?: string; button_text?: string; style?: unknown }>;
   const filterProductId = (adv.filter_product_id as string | null) ?? null;
   const targetType = msg.targetType || "leads";
   const targetGroupIds = (Array.isArray(msg.targetGroupIds) ? msg.targetGroupIds : []) as string[];
