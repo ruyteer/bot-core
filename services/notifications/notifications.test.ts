@@ -150,10 +150,14 @@ describe("sendPushToUser", () => {
 });
 
 describe("removePushSubscription", () => {
-  // O frontend manda `endpoint` via query string num DELETE (Encore decodifica
-  // query params GET/DELETE para os campos do handler, não do body). Chamar o
-  // handler com `{ endpoint }` direto reproduz exatamente essa forma decodificada.
-  it("remove a inscrição do próprio usuário a partir do `endpoint` recebido (contrato de query string)", async () => {
+  // O stub de api() usado nos testes (test/stubs/encore-api.ts) devolve o
+  // handler cru, sem roteamento HTTP nem parsing de query string — então
+  // estes testes cobrem só a lógica de posse/isolamento do handler (delete
+  // filtrado por userId + endpoint), não o contrato HTTP real (Encore
+  // decodificando `endpoint` da query string de um DELETE). Esse round-trip
+  // — que era a causa raiz do bug original — não tem cobertura automatizada
+  // neste harness; validar manualmente ou via teste de integração `encore test`.
+  it("remove a inscrição do próprio usuário a partir do `endpoint` recebido (lógica de posse)", async () => {
     const userId = await createProfile();
     const sub = await seedSub(userId, "https://push.example/mine");
     currentAuthUserId = userId;
