@@ -4,6 +4,7 @@ import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, sql } from "drizzle-orm";
+import { sanitizeButtonStyle, sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 
 // ─── Response shapes ─────────────────────────────────────────────────────────
 
@@ -109,30 +110,6 @@ function toMessageResponse(m: typeof remarketingMessages.$inferSelect): MessageR
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-// Whitelist server-side do estilo de botão: inlineButtons/offerStyle chegam do
-// cliente como JSON praticamente arbitrário (saveMessages abaixo), e `style`
-// acaba indo parar direto no Telegram (Bot API 9.4) via telegramButtonStyle()
-// no processamento do remarketing. Qualquer valor fora dos 3 aceitos pelo
-// editor é descartado aqui — nunca gravado como veio do cliente nem
-// repassado cru pro Telegram.
-const VALID_BUTTON_STYLES = new Set(["primary", "constructive", "destructive"]);
-
-function sanitizeButtonStyle(style: unknown): "primary" | "constructive" | "destructive" | undefined {
-  return typeof style === "string" && VALID_BUTTON_STYLES.has(style) ? (style as "primary" | "constructive" | "destructive") : undefined;
-}
-
-// Aplica a whitelist ao campo `style` de cada item de um array de botões inline,
-// preservando o resto do objeto como veio.
-function sanitizeButtonArray(arr: unknown): unknown[] {
-  if (!Array.isArray(arr)) return [];
-  return arr.map((item) => {
-    if (!item || typeof item !== "object") return item;
-    const { style, ...rest } = item as Record<string, unknown>;
-    const clean = sanitizeButtonStyle(style);
-    return clean ? { ...rest, style: clean } : rest;
-  });
-}
 
 async function getUserBotIds(userId: string): Promise<string[]> {
   const rows = await db.select({ id: bots.id }).from(bots).where(eq(bots.userId, userId));
