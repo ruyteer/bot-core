@@ -959,10 +959,7 @@ export class ExecuteFlowStepUseCase {
       const name = info?.title || label;
       await this.upsertGroup(botId, BigInt(chatId), name, type);
 
-      const permissionNote = isChannel
-        ? `permissão de "<b>Postar mensagens</b>"`
-        : `permissão de "<b>Banir usuários</b>"`;
-      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem ${permissionNote}\n2️⃣ No painel, vá em <b>Produtos</b> e crie um produto do tipo "<b>${label} VIP</b>"\n3️⃣ Cole o ID no campo "ID do Grupo Telegram"\n\n🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>`;
+      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem função de <b>Administrador</b>\n2️⃣ Certifique-se de que o bot tem todas as permissões de adminstrador ativadas.\n\n🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>`;
       await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
     }
   }
