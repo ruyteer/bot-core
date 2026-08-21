@@ -1,11 +1,12 @@
 import { api } from "encore.dev/api";
+import { eq } from "drizzle-orm";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { paymentPaid } from "../shared/events/index.js";
-import { sendPushToUser, PUSH_EVENT_TYPES } from "../notifications/application/send-push.use-case.js";
+import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../notifications/application/send-push.use-case.js";
 import { accrueReferralCommission } from "../referrals/application/accrue-commission.js";
 import { enqueuePixelEvents } from "../bots/application/pixel-events.js";
 import { db } from "../shared/database.js";
-import { paymentRevenueCredits } from "../shared/schema/index.js";
+import { paymentRevenueCredits, bots } from "../shared/schema/index.js";
 import { isPlatformAdmin } from "../shared/roles.js";
 import type { Provider } from "./domain/gateway.entity.js";
 import type { Payment } from "./domain/payment.entity.js";
@@ -145,11 +146,17 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
 
       // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
       // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.
+      // Diferente do runner, aqui só temos o payment em mãos — sem o bot já
+      // carregado em escopo — daí o lookup extra por telegramUsername.
       const amount = event.amount ?? payment.amount;
+      const pushBot = await db.select({ telegramUsername: bots.telegramUsername })
+        .from(bots).where(eq(bots.id, payment.botId)).limit(1)
+        .then((rows) => rows[0])
+        .catch((err) => { console.error("[payments] lookup de bot p/ push falhou:", err); return undefined; });
       void sendPushToUser(payment.userId, {
         eventType: PUSH_EVENT_TYPES.SALE_APPROVED,
         title:     "💰 Venda aprovada!",
-        body:      `${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
+        body:      `${formatBotHandle(pushBot?.telegramUsername)} · ${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
         data:      { url: "/sales", payment_id: payment.id },
       }).catch((err) => console.error("[payments] push de venda falhou:", err));
     } else if (event.status === "cancelled" || event.status === "expired") {

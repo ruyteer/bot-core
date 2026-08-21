@@ -18,6 +18,13 @@ export const PUSH_EVENT_TYPES = {
   NEW_LEAD:      "new_lead",
 } as const;
 
+// Formata o @handle do bot pra identificar, no corpo do push, qual dos bots
+// do usuário gerou o evento (ele pode ter vários). Mesmo fallback usado no
+// log de atividades da dashboard pra bot sem telegramUsername configurado.
+export function formatBotHandle(telegramUsername: string | null | undefined): string {
+  return telegramUsername ? `@${telegramUsername}` : "Bot não identificado";
+}
+
 export interface PushPayload {
   eventType: string;              // 'sale_approved' | 'pix_generated' | 'new_lead' | 'admin_announcement' | ...
   title:     string;
