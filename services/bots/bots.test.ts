@@ -9,7 +9,7 @@ import { testDb } from "../../test/helpers/db.js";
 import { bots } from "../shared/schema/index.js";
 import { createProfile, createBot } from "../../test/helpers/seed.js";
 import { getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
-import { setProfilePhoto, tgCallOrThrow } from "./application/telegram-profile.js";
+import { setProfilePhoto, setChatPhoto, tgCallOrThrow } from "./application/telegram-profile.js";
 
 const repo = new BotDrizzleRepository();
 
@@ -155,5 +155,18 @@ describe("telegram-profile", () => {
     forceTelegramError("setMyName");
     await expect(tgCallOrThrow("111:ABC", "setMyName", { name: "X" })).rejects.toThrow(/setMyName/);
     await expect(tgCallOrThrow("111:ABC", "setMyDescription", { description: "ok" })).resolves.toBeDefined();
+  });
+
+  it("setChatPhoto envia o binário direto no campo photo do multipart", async () => {
+    await setChatPhoto("111:ABC", "-100123", Buffer.from("fake-jpeg").toString("base64"));
+    const call = getTelegramCalls("setChatPhoto")[0];
+    expect(call).toBeDefined();
+    expect(call.body.chat_id).toBe("-100123");
+    expect(call.body.photo).toMatchObject({ file: "photo.jpg" });
+  });
+
+  it("setChatPhoto propaga o erro do Telegram em vez de fingir sucesso", async () => {
+    forceTelegramError("setChatPhoto");
+    await expect(setChatPhoto("111:ABC", "-100123", "eA==")).rejects.toThrow(/setChatPhoto/);
   });
 });
