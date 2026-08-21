@@ -88,9 +88,10 @@ export class LeadDrizzleRepository implements LeadRepository {
     }
 
     // Fetch bot names
-    const botRows = await db.select({ id: bots.id, name: bots.name })
+    const botRows = await db.select({ id: bots.id, name: bots.name, telegramUsername: bots.telegramUsername })
       .from(bots).where(inArray(bots.id, botIds));
     const botNameMap = new Map(botRows.map((b) => [b.id, b.name]));
+    const botUsernameMap = new Map(botRows.map((b) => [b.id, b.telegramUsername]));
 
     // Build progress map (prefer progress with currentNodeId)
     const progressMap = new Map<string, typeof progressRows[0]>();
@@ -106,6 +107,7 @@ export class LeadDrizzleRepository implements LeadRepository {
       return {
         ...lead,
         botName: botNameMap.get(r.botId) ?? null,
+        botUsername: botUsernameMap.get(r.botId) ?? null,
         conversionTimeMs: firstPay ? firstPay.getTime() - r.createdAt.getTime() : null,
         progress: prog
           ? {

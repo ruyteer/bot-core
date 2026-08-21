@@ -26,6 +26,7 @@ interface LeadResponse {
   id:               string;
   botId:            string;
   botName:          string | null;
+  botUsername:      string | null;
   telegramChatId:   string;
   telegramUsername: string | null;
   firstName:        string | null;
@@ -45,6 +46,7 @@ function toResponse(l: LeadWithStats): LeadResponse {
     id:               l.id,
     botId:            l.botId,
     botName:          l.botName,
+    botUsername:      l.botUsername,
     telegramChatId:   l.telegramChatId.toString(),
     telegramUsername: l.telegramUsername,
     firstName:        l.firstName,

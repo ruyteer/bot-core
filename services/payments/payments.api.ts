@@ -35,6 +35,7 @@ interface PaymentResponse {
   description:      string | null;
   botId:            string;
   botName:          string | null;
+  botUsername:      string | null;
   leadId:           string | null;
   leadName:         string | null;
   leadUsername:     string | null;
@@ -105,6 +106,7 @@ function toPaymentResponse(p: PaymentWithMeta, attr?: LeadAttribution): PaymentR
     description:  p.description,
     botId:        p.botId,
     botName:      p.botName,
+    botUsername:  p.botUsername,
     leadId:       p.leadId,
     leadName:     p.leadName,
     leadUsername: p.leadUsername,
