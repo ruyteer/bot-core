@@ -149,8 +149,10 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       // Diferente do runner, aqui só temos o payment em mãos — sem o bot já
       // carregado em escopo — daí o lookup extra por telegramUsername.
       const amount = event.amount ?? payment.amount;
-      const [pushBot] = await db.select({ telegramUsername: bots.telegramUsername })
-        .from(bots).where(eq(bots.id, payment.botId)).limit(1);
+      const pushBot = await db.select({ telegramUsername: bots.telegramUsername })
+        .from(bots).where(eq(bots.id, payment.botId)).limit(1)
+        .then((rows) => rows[0])
+        .catch((err) => { console.error("[payments] lookup de bot p/ push falhou:", err); return undefined; });
       void sendPushToUser(payment.userId, {
         eventType: PUSH_EVENT_TYPES.SALE_APPROVED,
         title:     "💰 Venda aprovada!",
