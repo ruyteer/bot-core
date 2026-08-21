@@ -92,6 +92,25 @@ export class PaymentDrizzleRepository {
     return row ? this.toPayment(row) : null;
   }
 
+  // Pagamento PENDENTE já gerado pra esta oferta deste nó/lead — usado pelo
+  // runner (execute-flow-step.use-case.ts → handleOfferPurchase) pra NÃO reemitir
+  // PIX quando o mesmo botão de compra é clicado mais de uma vez antes do
+  // primeiro ser pago (duplo-toque, ou um teclado antigo resolvido por escopo
+  // reverso e tocado de novo). Some da busca assim que o webhook confirma
+  // (markPaid → status "paid") ou cancela/expira (updateStatus) o pagamento.
+  async findPendingForOffer(leadId: string, nodeId: string, paidHandle: string): Promise<Payment | null> {
+    const [row] = await db.select().from(payments)
+      .where(and(
+        eq(payments.leadId, leadId),
+        eq(payments.nodeId, nodeId),
+        eq(payments.paidHandle, paidHandle),
+        eq(payments.status, "pending"),
+      ))
+      .orderBy(sql`${payments.createdAt} DESC`)
+      .limit(1);
+    return row ? this.toPayment(row) : null;
+  }
+
   async findByBotIds(botIds: string[], startDate?: Date, endDate?: Date): Promise<PaymentWithMeta[]> {
     if (botIds.length === 0) return [];
 

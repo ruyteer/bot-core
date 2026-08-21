@@ -140,30 +140,32 @@ function parseScopedCallback(
   return { scope: segs[0], parts: segs.slice(1) };
 }
 
-// Índice da oferta clicada DENTRO do nó em que o lead está parado.
-//   `o:<nó>:<i>` (atual)  → só resolve se `<nó>` for este nó.
-//   `offer:<i>` (legado)  → teclados já entregues antes deste deploy; posicional,
-//                           sem identidade de nó — indecidível, resolve como antes.
-// `foreign` = o clique veio comprovadamente de OUTRO nó → ignorar (senão o índice
-// cairia numa oferta diferente e cobraria pelo produto errado).
-function resolveOfferCallback(callbackData: string, nodeId: string): { index: number | null; foreign: boolean } {
+// Índice da oferta clicada DENTRO do nó `nodeId` — o dono do teclado, já
+// resolvido pelo CHAMADOR (o nó atual quando o escopo bate, ou o nó de ORIGEM
+// achado por escopo reverso quando o clique é de um teclado antigo ainda vivo
+// no chat — ver `resolveScopedOriginNode`). `o:<nó>:<i>` (atual) só existe pra
+// impedir o índice de cair numa oferta de outro nó (cobraria o produto errado);
+// `offer:<i>` (legado, teclados entregues antes deste deploy) é posicional, sem
+// identidade de nó — indecidível, sempre resolvido contra o `nodeId` dado.
+function resolveOfferCallback(callbackData: string, nodeId: string): number | null {
   const toIdx = (s: string): number | null => (/^\d+$/.test(s) ? parseInt(s, 10) : null);
   const scoped = parseScopedCallback(callbackData, "o");
   if (scoped) {
-    if (scoped.scope !== nodeScopeId(nodeId)) return { index: null, foreign: true };
-    return { index: scoped.parts.length === 1 ? toIdx(scoped.parts[0]) : null, foreign: false };
+    return scoped.scope === nodeScopeId(nodeId) && scoped.parts.length === 1 ? toIdx(scoped.parts[0]) : null;
   }
-  return { index: toIdx(callbackData.slice("offer:".length)), foreign: false };
+  return toIdx(callbackData.slice("offer:".length));
 }
 
-// Handles candidatos para um `callback_data` recebido, em ordem de prioridade.
-//   • `b:<nó>:…` (formato ATUAL) → só resolve se `<nó>` for o nó em que o lead
-//     está; caso contrário é clique em teclado velho (`foreign`) e não vale nada.
-//     Dentro do nó certo a resolução é posicional: editar o texto do botão depois
-//     de desenhar a aresta não quebra o casamento.
+// Handles candidatos para um `callback_data` recebido, resolvidos contra o
+// CONTEÚDO de `nodeId` — o dono do teclado, já resolvido pelo CHAMADOR (o nó
+// atual quando o escopo bate, ou o nó de ORIGEM achado por escopo reverso
+// quando o clique é de um teclado antigo ainda vivo no chat — ver
+// `resolveScopedOriginNode`). Em ordem de prioridade:
+//   • `b:<nó>:…` (formato ATUAL) → posicional DENTRO do nó dado: editar o texto
+//     do botão depois de desenhar a aresta não quebra o casamento.
 //   • `btn:<i>` / `btn:<bloco>:<i>` (formato anterior, ainda no chat de quem
-//     recebeu antes deste deploy) → posicional, sem identidade de nó embutida: o
-//     dono é indecidível e só resta resolver como antes.
+//     recebeu antes deste deploy) → posicional, sem identidade de nó embutida —
+//     sempre contra o nó dado (é o único jeito de resolver este formato).
 //   • qualquer outro valor → ele próprio, formato ANTIGO (`callback_data` =
 //     `btn.callback`/`btn.value`). Aqui a checagem de dono é implícita: `nextNode`
 //     só procura arestas DESTE nó.
@@ -172,15 +174,17 @@ function resolveButtonCallback(
   content:      Record<string, unknown>,
   callbackData: string,
   nodeId:       string,
-): { handles: string[]; known: boolean; foreign: boolean } {
+): { handles: string[]; known: boolean } {
   const handles: string[] = [];
   const add = (h: unknown): void => {
     if (typeof h === "string" && h && !handles.includes(h)) handles.push(h);
   };
 
   const scoped = parseScopedCallback(callbackData, "b");
+  // Defensivo: o chamador já deve ter resolvido `nodeId` = dono do escopo antes
+  // de chegar aqui. Se ainda assim não bater, não há handle válido a extrair.
   if (scoped && scoped.scope !== nodeScopeId(nodeId)) {
-    return { handles: [], known: false, foreign: true };
+    return { handles: [], known: false };
   }
 
   const positional = scoped
@@ -225,7 +229,7 @@ function resolveButtonCallback(
     }
   }
   add(callbackData);
-  return { handles, known, foreign: false };
+  return { handles, known };
 }
 
 // Coleta os botões CLICÁVEIS (os que ganham conector de FUNIL no editor) de um
@@ -541,6 +545,27 @@ async function connectedHandles(funnelId: string, nodeId: string): Promise<Set<s
   return new Set(rows.map((r) => r.handle).filter((h): h is string => typeof h === "string" && h.length > 0));
 }
 
+// Acha o nó DONO de um callback com escopo (`b:`/`o:`), dentro do MESMO funil do
+// progresso: o nó atual quando o escopo bate (caminho normal, sem query extra),
+// ou — pra um teclado ANTIGO ainda vivo no chat (a saída "sem clique"/"sem ação"
+// já moveu o lead adiante e o escopo do clique não é mais o do nó atual) — o nó
+// de ORIGEM, achado batendo o escopo (8 chars) contra os nós deste funil.
+//
+// Ambíguo (dois nós colidindo no mesmo prefixo de 8 chars) ou nenhum nó
+// encontrado (nó apagado, ou escopo de OUTRO funil) → null: o chamador mantém o
+// comportamento de ignorar o clique — nunca escolhe "o primeiro que bater", pra
+// não arriscar processar a compra/aresta errada.
+async function resolveScopedOriginNode(
+  funnelId:    string,
+  currentNode: typeof funnelNodes.$inferSelect | null,
+  scope:       string,
+): Promise<typeof funnelNodes.$inferSelect | null> {
+  if (currentNode && nodeScopeId(currentNode.id) === scope) return currentNode;
+  const nodes = await db.select().from(funnelNodes).where(eq(funnelNodes.funnelId, funnelId));
+  const matches = nodes.filter((n) => nodeScopeId(n.id) === scope);
+  return matches.length === 1 ? matches[0] : null;
+}
+
 async function advanceProgress(progressId: string, nodeId: string | null, status: string): Promise<void> {
   await db.update(leadProgress).set({ currentNodeId: nodeId, status, updatedAt: new Date() })
     .where(eq(leadProgress.id, progressId));
@@ -754,51 +779,73 @@ export class ExecuteFlowStepUseCase {
       // de 64 bytes do TG; `offer:<i>` é o formato legado). Funciona no nó `offer`
       // dedicado E em ofertas embutidas num nó `message` — o índice é resolvido pela
       // mesma ordem de collectNodeOffers.
-      if (currentNode && (callbackData.startsWith("offer:") || callbackData.startsWith("o:"))) {
-        const { index, foreign } = resolveOfferCallback(callbackData, currentNode.id);
-        // Teclado de oferta de OUTRO nó (o lead rolou o chat e tocou num botão
-        // antigo): o índice cairia numa oferta diferente e geraria PIX do produto
-        // errado. O callback já foi respondido lá em cima — aqui nada acontece.
-        if (foreign) return;
-        const offersList = collectNodeOffers(currentNode.content as Record<string, unknown>);
+      if (callbackData.startsWith("offer:") || callbackData.startsWith("o:")) {
+        // Dono do teclado: o nó atual quando o escopo bate, OU — clique num
+        // teclado ANTIGO ainda vivo no chat (o timeout "sem ação" já moveu o lead
+        // pra outro nó) — o nó de ORIGEM, achado por escopo reverso. Ambíguo, de
+        // outro funil, ou nó apagado → ignora (o callback já foi respondido lá em
+        // cima); `offer:<i>` legado sem nó atual também é indecidível → ignora.
+        const scopedOffer = parseScopedCallback(callbackData, "o");
+        const originNode = scopedOffer
+          ? await resolveScopedOriginNode(prog.funnelId, currentNode ?? null, scopedOffer.scope)
+          : (currentNode ?? null);
+        if (!originNode) return;
+
+        const index = resolveOfferCallback(callbackData, originNode.id);
+        const offersList = collectNodeOffers(originNode.content as Record<string, unknown>);
         const picked = index !== null ? offersList[index] : undefined;
         if (picked) {
-          await this.handleOfferPurchase(picked.offer, picked.handleId, currentNode, prog, lead, bot, chatIdStr, tg);
+          // O nó passado é o de ORIGEM (pode ser diferente do nó em que o lead
+          // está agora) — é dele que vem a oferta certa, preservando a garantia
+          // que o guard antigo protegia: nunca cobrar pelo produto do nó errado.
+          await this.handleOfferPurchase(picked.offer, picked.handleId, originNode, prog, lead, bot, chatIdStr, tg);
         }
         return;
       }
 
       // Clique num botão de funil. Vale para o nó `buttons` dedicado E para
-      // blocos de botões dentro de um nó `message`.
-      const nodeContent = (currentNode?.content ?? {}) as Record<string, unknown>;
-      const nodeButtons = currentNode ? collectNodeButtons(nodeContent) : [];
-      if (currentNode && (currentNode.type === "buttons" || nodeButtons.length > 0)) {
-        // `callback_data` atual é o id curto com escopo do nó; os antigos eram o
-        // id posicional sem escopo e o próprio handle. Candidatos em ordem.
-        const { handles, known, foreign } = resolveButtonCallback(nodeContent, callbackData, currentNode.id);
-        // Clique num teclado que pertence COMPROVADAMENTE a outro nó (o lead
-        // rolou o chat e tocou num botão antigo). Ele não pilota o nó atual: o
-        // callback já foi respondido, o spinner some e nada mais acontece.
-        if (foreign) return;
+      // blocos de botões dentro de um nó `message` — do nó ATUAL ou de um nó
+      // ANTIGO (teclado já entregue antes de um timeout mover o lead adiante).
+      const currentButtons = currentNode ? collectNodeButtons((currentNode.content ?? {}) as Record<string, unknown>) : [];
+      const scopedBtn = parseScopedCallback(callbackData, "b");
+      const looksLikeButtonClick = !!scopedBtn || callbackData.startsWith("btn:")
+        || !!(currentNode && (currentNode.type === "buttons" || currentButtons.length > 0));
+      if (looksLikeButtonClick) {
+        // Dono do teclado: o nó atual quando o escopo bate, OU o nó de ORIGEM
+        // achado por escopo reverso (teclado antigo). `btn:<i>`/handle cru
+        // (legado, sem nó embutido) continuam indecidíveis → sempre contra o nó
+        // atual. Ambíguo/de outro funil/nó apagado → ignora, como antes.
+        const originNode = scopedBtn
+          ? await resolveScopedOriginNode(prog.funnelId, currentNode ?? null, scopedBtn.scope)
+          : (currentNode ?? null);
+        if (!originNode) return;
+
+        // Candidatos resolvidos contra o CONTEÚDO do nó de ORIGEM, não do nó atual.
+        const originContent = (originNode.content ?? {}) as Record<string, unknown>;
+        const { handles, known } = resolveButtonCallback(originContent, callbackData, originNode.id);
+
         let nextId: string | null = null;
         for (const handle of handles) {
-          nextId = await nextNode(prog.funnelId, currentNode.id, handle);
+          nextId = await nextNode(prog.funnelId, originNode.id, handle);
           if (nextId) break;
         }
 
         // Botão sem aresta num nó de MENSAGEM (handle órfão: o texto do botão foi
         // editado depois de a aresta ser desenhada). Antes desta feature o nó nem
-        // parava — ia embora pela saída genérica; mantemos essa saída para o
-        // clique não virar beco sem saída. Só quando o clique é comprovadamente
-        // DESTE nó, para um toque em teclado velho não empurrar o lead adiante.
-        const ownsClick = known || nodeButtons.some((b) => b.handleId === callbackData);
-        if (!nextId && currentNode.type === "message" && ownsClick) {
-          nextId = await nextNode(prog.funnelId, currentNode.id);
+        // parava — ia embora pela saída genérica; mantemos essa saída (do nó de
+        // ORIGEM) para o clique não virar beco sem saída. Só quando o clique é
+        // comprovadamente deste nó, pra um toque em teclado velho não empurrar o
+        // lead adiante por engano.
+        const originButtons = collectNodeButtons(originContent);
+        const ownsClick = known || originButtons.some((b) => b.handleId === callbackData);
+        if (!nextId && originNode.type === "message" && ownsClick) {
+          nextId = await nextNode(prog.funnelId, originNode.id);
         }
 
+        // Só avança se o clique levou a algum lugar — de um nó ANTIGO sem saída
+        // pra esse handle, o progresso NÃO é tocado: o lead continua onde está, e
+        // a saída já ativa do funil (a que já rodou) continua valendo normalmente.
         if (nextId) {
-          // Só agora cancela o timeout "sem clique" pendente: se o clique não
-          // levou a lugar nenhum, o único escape do lead continua armado.
           await db.delete(scheduledDelays).where(and(
             eq(scheduledDelays.progressId, prog.id),
             eq(scheduledDelays.status, "pending"),
@@ -1505,6 +1552,25 @@ export class ExecuteFlowStepUseCase {
     chatId: string,
     tg:     TelegramClient,
   ): Promise<void> {
+    const paidHandle = `${handleId}__paid`;
+
+    // Re-clique no MESMO botão de oferta (teclado antigo tocado de novo depois de
+    // resolvido por escopo reverso, ou duplo-toque no nó atual) enquanto o PIX
+    // anterior ainda está pendente: reenvia o MESMO código em vez de gerar outro
+    // — sem isto, cada toque cobrava de novo pelo mesmo produto. Some da lista
+    // quando o gateway confirma o pagamento (webhook → markPaid) ou o marca
+    // cancelled/expired — só então um novo clique gera um PIX novo.
+    const existing = await payRepo.findPendingForOffer(lead.id, node.id, paidHandle);
+    if (existing?.pixCode) {
+      await tg.sendMessage({
+        chatId,
+        text: `<code>${escapeHtml(existing.pixCode)}</code>`,
+        protectContent: bot.protectContent,
+        replyMarkup: pixCopyButtonMarkup(existing.pixCode),
+      });
+      return;
+    }
+
     // O lead interagiu com a oferta → cancela o timeout de "sem ação" pendente
     // deste progresso (só há os do nó de oferta atual).
     await db.delete(scheduledDelays).where(and(
@@ -1559,7 +1625,7 @@ export class ExecuteFlowStepUseCase {
       funnelId:    prog.funnelId,
       progressId:  prog.id,
       nodeId:      node.id,
-      paidHandle:  `${handleId}__paid`,
+      paidHandle,
     });
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
