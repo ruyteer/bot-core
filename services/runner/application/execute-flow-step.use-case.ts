@@ -21,7 +21,7 @@ import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-
 import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
-import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
+import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notifications/application/send-push.use-case.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -697,7 +697,7 @@ export class ExecuteFlowStepUseCase {
       void sendPushToUser(bot.userId, {
         eventType: PUSH_EVENT_TYPES.NEW_LEAD,
         title:     "🆕 Novo lead!",
-        body:      sanitizeNotificationText(from.username ? `@${from.username}` : (from.first_name ?? "Novo contato")),
+        body:      sanitizeNotificationText(`${formatBotHandle(bot.telegramUsername)} · ${from.username ? `@${from.username}` : (from.first_name ?? "Novo contato")}`),
         data:      { url: "/leads", lead_id: lead.id },
       }).catch((err) => console.error("[runner] push de novo lead falhou:", err));
     }
@@ -1682,7 +1682,7 @@ export class ExecuteFlowStepUseCase {
     void sendPushToUser(bot.userId, {
       eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
       title:     "🧾 PIX gerado",
-      body:      `${productName} — R$ ${(amount / 100).toFixed(2)}`,
+      body:      `${formatBotHandle(bot.telegramUsername)} · ${productName} — R$ ${(amount / 100).toFixed(2)}`,
       data:      { url: "/sales", lead_id: lead.id },
     }).catch((err) => console.error("[runner] push de PIX gerado falhou:", err));
 
@@ -1763,7 +1763,7 @@ export class ExecuteFlowStepUseCase {
     void sendPushToUser(bot.userId, {
       eventType: PUSH_EVENT_TYPES.PIX_GENERATED,
       title:     "🧾 PIX gerado",
-      body:      `${offer.name} — R$ ${(amount / 100).toFixed(2)}`,
+      body:      `${formatBotHandle(bot.telegramUsername)} · ${offer.name} — R$ ${(amount / 100).toFixed(2)}`,
       data:      { url: "/sales", lead_id: lead.id },
     }).catch((err) => console.error("[runner] push de PIX gerado (broadcast) falhou:", err));
 
