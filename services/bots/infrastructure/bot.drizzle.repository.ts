@@ -1,6 +1,6 @@
 import { eq, and, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
-import { bots, leads, payments } from "../../shared/schema/index.js";
+import { bots } from "../../shared/schema/index.js";
 import { decrypt } from "../../shared/crypto.js";
 import type { Bot, BotInternal, BotWithStats, CreateBotInput, UpdateBotInput } from "../domain/bot.entity.js";
 import type { BotRepository } from "../domain/bot.repository.js";
@@ -47,12 +47,22 @@ export class BotDrizzleRepository implements BotRepository {
         defaultGatewayId: bots.defaultGatewayId,
         createdAt:        bots.createdAt,
         updatedAt:        bots.updatedAt,
+        // Nomes de tabela/coluna em SQL cru (não objetos Column do Drizzle) de
+        // propósito: numa select de tabela única, o Drizzle re-renderiza SEM
+        // qualificação de tabela qualquer `Column` referenciada dentro de um
+        // `sql<>` de um campo selecionado — inclusive as de dentro de subqueries
+        // correlacionadas. `${bots.id}` virava só `"id"`, que o Postgres então
+        // resolvia no escopo INTERNO da subquery (`leads.id`/`payments.id`, já
+        // que essas tabelas também têm `id`). A condição virava `leads.bot_id =
+        // leads.id`, nunca verdadeira — todo bot vinha com 0 leads e 0 vendas,
+        // sem erro. Mesmo padrão de `admin.api.ts`/`referrals.api.ts`: texto cru
+        // com nome de tabela por extenso evita depender desse comportamento.
         leadsCount: sql<number>`(
-          SELECT COUNT(*)::int FROM ${leads} WHERE ${leads.botId} = ${bots.id}
+          SELECT COUNT(*)::int FROM leads WHERE leads.bot_id = bots.id
         )`,
         salesCount: sql<number>`(
-          SELECT COUNT(*)::int FROM ${payments}
-          WHERE ${payments.botId} = ${bots.id} AND ${payments.status} = 'paid'
+          SELECT COUNT(*)::int FROM payments
+          WHERE payments.bot_id = bots.id AND payments.status = 'paid'
         )`,
       })
       .from(bots)
