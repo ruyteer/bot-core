@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
+import { processPendingDelays } from "../runner.js";
 import { testDb } from "../../../test/helpers/db.js";
 import { scheduledDelays, leadProgress, leadVariables, leads, leadEvents } from "../../shared/schema/index.js";
 import { LeadDrizzleRepository } from "../../leads/infrastructure/lead.drizzle.repository.js";
@@ -99,6 +100,106 @@ describe("buttons node", () => {
     const call = getTelegramCalls("sendMessage").find((c) => c.body.reply_markup);
     const kb = (call!.body.reply_markup as { inline_keyboard: unknown[][] }).inline_keyboard;
     expect(kb[0][0]).toMatchObject({ text: "Site", url: "https://x.com" });
+  });
+
+  it("callback legado com prefixo btn:<i> (sem escopo de nó) continua resolvendo pelo nó atual", async () => {
+    const bot = await createBot();
+    const { nodeIds } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "b", type: "buttons", content: { message: "Escolha:", buttons: [{ text: "A" }] } },
+        { key: "done", type: "message", content: { message: "LEGADO-OK" } },
+      ],
+      // handleId = `btn.callback || btn.text || fallback` — sem callback, é o
+      // próprio texto do botão ("A").
+      connections: [{ from: "t", to: "b" }, { from: "b", to: "done", handle: "A" }],
+    });
+    void nodeIds;
+    await useCase.execute({ botId: bot.id, update: startUpdate(14) });
+    // Formato `btn:<i>` — anterior ao `b:<nó>:<i>` atual, ainda pode estar em
+    // teclados já entregues a leads antes deste deploy.
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(14, "btn:0") });
+    expect(getSentMessages()).toContain("LEGADO-OK");
+  });
+});
+
+// ── ESCOPO REVERSO — clique em botão de FUNIL num teclado ANTIGO ────────────
+// O timeout "sem clique" move o lead pra outro nó; um teclado já entregue antes
+// disso continua vivo no chat. Antes, um toque nele era descartado (`foreign`)
+// e, se o nó de destino não tivesse saída própria, o lead ficava preso pra
+// sempre — o bug do backlog. Agora o clique é resolvido contra o nó de ORIGEM.
+describe("escopo reverso — clique em botão ANTIGO depois do timeout 'sem clique'", () => {
+  // "moved" segue por uma aresta genérica até "parked" (nó `input` sem pergunta):
+  // pausa ali em vez de completar o funil, então dá pra checar depois se o
+  // progresso foi tocado ou não pelo clique no botão antigo.
+  async function setupNoClickFunnel(extraConns: Array<{ from: string; to: string; handle?: string }> = []) {
+    const bot = await createBot();
+    const { funnelId, nodeIds } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "b", type: "buttons", content: {
+          message: "Escolha:", no_click_timeout_seconds: 5,
+          buttons: [{ text: "A", callback: "a" }],
+        } },
+        { key: "moved", type: "message", content: { message: "MOVIDO" } },
+        { key: "parked", type: "input", content: {} },
+        { key: "chosen", type: "message", content: { message: "ESCOLHEU-A" } },
+      ],
+      connections: [
+        { from: "t", to: "b" },
+        { from: "b", to: "moved", handle: "no_click" },
+        { from: "moved", to: "parked" },
+        ...extraConns,
+      ],
+    });
+    return { bot, funnelId, nodeIds };
+  }
+
+  it("clique no botão antigo segue a saída do nó antigo, quando ela existe", async () => {
+    const { bot } = await setupNoClickFunnel([{ from: "b", to: "chosen", handle: "a" }]);
+    await useCase.execute({ botId: bot.id, update: startUpdate(15) });
+    const kb = (getTelegramCalls().find((c) => c.body.reply_markup)!.body.reply_markup as {
+      inline_keyboard: { callback_data?: string }[][];
+    }).inline_keyboard;
+    const oldCallback = kb[0][0].callback_data!;
+
+    // Vence o "sem clique" ANTES do clique chegar — o lead é movido adiante
+    // (cenário do bug: o clique no teclado antigo chega depois).
+    const db = await testDb();
+    await db.update(scheduledDelays).set({ executeAt: new Date(Date.now() - 1000) });
+    await processPendingDelays();
+    expect(getSentMessages()).toContain("MOVIDO");
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(15, oldCallback) });
+    // Seguiu a saída do nó ANTIGO ("b" → handle "a"), não ficou preso em "parked".
+    expect(getSentMessages()).toContain("ESCOLHEU-A");
+  });
+
+  it("clique no botão antigo sem saída própria não mexe no progresso — a saída já ativa continua valendo", async () => {
+    // Sem conexão pro handle "a": o botão antigo não tem por onde sair.
+    const { bot, nodeIds } = await setupNoClickFunnel([]);
+    await useCase.execute({ botId: bot.id, update: startUpdate(16) });
+    const kb = (getTelegramCalls().find((c) => c.body.reply_markup)!.body.reply_markup as {
+      inline_keyboard: { callback_data?: string }[][];
+    }).inline_keyboard;
+    const oldCallback = kb[0][0].callback_data!;
+
+    const db = await testDb();
+    await db.update(scheduledDelays).set({ executeAt: new Date(Date.now() - 1000) });
+    await processPendingDelays();
+    expect(getSentMessages()).toContain("MOVIDO");
+
+    const leadId = await leadIdByChat(bot.id, 16);
+    const [before] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
+    expect(before.currentNodeId).toBe(nodeIds.parked); // parou esperando input, como esperado
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(16, oldCallback) });
+
+    const [after] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
+    // O progresso não foi tocado — o lead continua onde a saída já ativa o deixou.
+    expect(after.currentNodeId).toBe(nodeIds.parked);
   });
 });
 

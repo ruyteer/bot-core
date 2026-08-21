@@ -3,6 +3,7 @@ import {
   bigint, doublePrecision, jsonb, integer, primaryKey,
   uniqueIndex, unique, index,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
 
@@ -279,7 +280,19 @@ export const payments = pgTable("payments", {
   simplifiedCtx:    jsonb("simplified_ctx"),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:        timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Fecha a janela de corrida do dedupe de PIX (findPendingForOffer faz
+  // check-then-act, com uma chamada de rede ao gateway entre o SELECT e o
+  // INSERT): dois cliques concorrentes no MESMO botão de oferta (double-tap, ou
+  // reentrega at-least-once do update do Telegram/pubsub) liam "sem pendente"
+  // antes de qualquer um inserir e geravam DOIS PIX pra mesma oferta/lead. Só um
+  // "pending" por (lead_id, node_id, paid_handle) por vez — pago/cancelado/
+  // expirado libera pra um novo. handleOfferPurchase trata a violação desta
+  // constraint como "já existe" e reenvia o pendente em vez de propagar o erro.
+  uniqueIndex("payments_pending_offer_unique")
+    .on(t.leadId, t.nodeId, t.paidHandle)
+    .where(sql`${t.status} = 'pending'`),
+]);
 
 export const paymentWebhookLogs = pgTable("payment_webhook_logs", {
   id:              uuid("id").defaultRandom().primaryKey(),

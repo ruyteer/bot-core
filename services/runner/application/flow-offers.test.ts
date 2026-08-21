@@ -1,9 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import { processPendingDelays } from "../runner.js";
 import { testDb } from "../../../test/helpers/db.js";
-import { payments, scheduledDelays, leads, funnelOffers } from "../../shared/schema/index.js";
+import { payments, scheduledDelays, leads, funnelOffers, funnelNodes } from "../../shared/schema/index.js";
 import {
   createBot, createGateway, createFlowFunnel, startUpdate, callbackUpdate,
 } from "../../../test/helpers/seed.js";
@@ -97,6 +98,227 @@ describe("offer node — apresentação e compra", () => {
     // ação" foi apagada no clique e uma nova de "não pago" tomou o lugar.
     expect(afterClick.length).toBe(1);
     expect(afterClick[0].id).not.toBe(firstDelayId);
+  });
+});
+
+// Resolução reversa de escopo: o clique num botão de OFERTA antigo (teclado já
+// entregue antes de o timeout "sem ação" mover o lead pra outro nó) deve
+// resolver contra o nó de ORIGEM (achado pelo escopo embutido no callback), em
+// vez de ser descartado como "foreign" — é o bug do backlog ("botões antigos
+// param de funcionar e o lead fica preso").
+describe("escopo reverso — clique em oferta ANTIGA depois do timeout", () => {
+  it("clique numa oferta antiga depois do timeout 'sem ação' gera o PIX correto da oferta antiga", async () => {
+    const handle = "promo";
+    const { bot } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      extraConns: [{ from: "off", to: "noact", handle: `${handle}__pending` }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(730) });
+    const presented = getTelegramCalls().find((c) => c.body.reply_markup);
+    const kb = (presented!.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
+    const oldCallback = kb[0][0].callback_data!;
+
+    // Vence o timeout de "sem ação" ANTES do clique chegar — o lead é movido pro
+    // nó "noact" (exatamente o cenário do bug: o clique no teclado antigo chega
+    // depois de o current_node_id já ter mudado).
+    const db = await testDb();
+    await db.update(scheduledDelays).set({ executeAt: new Date(Date.now() - 1000) });
+    await processPendingDelays();
+    expect(getSentMessages()).toContain("NAO-CLICOU");
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(730, oldCallback) });
+
+    const [pay] = await db.select().from(payments);
+    expect(pay).toBeDefined();
+    expect(pay.amount).toBe(1990);               // 19.90 reais → 1990 centavos (produto certo)
+    expect(pay.paidHandle).toBe(`${handle}__paid`);
+    expect(pay.pixCode).toBeTruthy();
+    expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0);
+  });
+
+  it("re-clique no mesmo botão de oferta antigo não duplica o PIX", async () => {
+    const handle = "promo";
+    const { bot } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      extraConns: [{ from: "off", to: "noact", handle: `${handle}__pending` }],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(731) });
+    const presented = getTelegramCalls().find((c) => c.body.reply_markup);
+    const kb = (presented!.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
+    const oldCallback = kb[0][0].callback_data!;
+
+    const db = await testDb();
+    await db.update(scheduledDelays).set({ executeAt: new Date(Date.now() - 1000) });
+    await processPendingDelays();
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(731, oldCallback) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(731, oldCallback) }); // re-clique
+
+    const rows = await db.select().from(payments);
+    expect(rows.length).toBe(1);                          // um único pagamento
+    expect(getTelegramCalls("sendPhoto").length).toBe(1);  // só o 1º clique gerou QR novo
+  });
+
+  it("escopo ambíguo (colisão de prefixo de 8 chars) é ignorado, sem crash", async () => {
+    const bot = await createBot();
+    const gwId = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const { funnelId, nodeIds } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "off", type: "offer", content: { offers: [
+          { product_name: "X", price: 10, gateway_id: gwId, callback: "promo", button_text: "Comprar" },
+        ] } },
+      ],
+      connections: [{ from: "t", to: "off" }],
+    });
+    const db = await testDb();
+    // Segundo nó com o MESMO escopo de 8 chars do nó "off" — colisão forçada
+    // (uuids aleatórios colidindo nos 8 primeiros chars é raríssimo na prática,
+    // mas a resolução reversa tem que aguentar sem escolher "o primeiro que bater").
+    const scope = nodeIds.off.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+    await db.insert(funnelNodes).values({
+      id: `${scope}-9999-4999-8999-999999999999`,
+      funnelId, type: "message", content: { message: "OUTRO" },
+    });
+
+    await useCase.execute({ botId: bot.id, update: startUpdate(732) });
+    const kb = (getTelegramCalls().find((c) => c.body.reply_markup)!.body.reply_markup as {
+      inline_keyboard: { callback_data?: string }[][];
+    }).inline_keyboard;
+    const cb = kb[0][0].callback_data!;
+
+    // Sai do nó "off" pra forçar a resolução reversa (senão o escopo bateria
+    // direto com o nó atual, sem passar pela busca ambígua).
+    const { leadProgress } = await import("../../shared/schema/index.js");
+    await db.update(leadProgress).set({ currentNodeId: nodeIds.t });
+
+    await expect(useCase.execute({ botId: bot.id, update: callbackUpdate(732, cb) })).resolves.not.toThrow();
+    const rows = await db.select().from(payments);
+    expect(rows.length).toBe(0); // ambíguo → ignorado, nenhum PIX gerado
+  });
+
+  it("callback de escopo de OUTRO funil é ignorado (segurança)", async () => {
+    const bot = await createBot();
+    const gwId = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    // Funil A (inativo): só pra mintar um escopo de nó que pertence a OUTRO funil.
+    const { nodeIds: nodeIdsA } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id, isActive: false,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "off", type: "offer", content: { offers: [
+          { product_name: "Outro", price: 5, gateway_id: gwId, callback: "x", button_text: "Comprar" },
+        ] } },
+      ],
+      connections: [{ from: "t", to: "off" }],
+    });
+    const scopeA = nodeIdsA.off.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+
+    // Funil B (ativo): onde o lead realmente está.
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "OI" } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+
+    await useCase.execute({ botId: bot.id, update: startUpdate(733) });
+    expect(getSentMessages()).toContain("OI");
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(733, `o:${scopeA}:0`) });
+
+    const db = await testDb();
+    const rows = await db.select().from(payments);
+    expect(rows.length).toBe(0);
+  });
+});
+
+// Achados [Medium] da revisão de segurança/reviewer sobre a branch de escopo
+// reverso: (1) handleOfferPurchase fazia check-then-act (findPendingForOffer →
+// createPixWithFallback → payRepo.create) sem lock nem transação — dois
+// cliques concorrentes liam "sem pendente" antes de qualquer um inserir e
+// geravam dois PIX; corrigido com o índice único parcial
+// `payments_pending_offer_unique` (migration 0014) + captura da violação no
+// INSERT. (2) findPendingForOffer não tinha teto de idade — um PIX morto no
+// gateway (sem o webhook de expiração ter chegado) seria reenviado pro lead
+// pra sempre; corrigido reaproveitando o `unpaid_timeout` do nó como teto.
+describe("PIX pendente — teto de idade e corrida de INSERT (revisão de segurança)", () => {
+  it("PIX pendente mais velho que o timeout 'não pago' do nó é ignorado — gera um PIX novo", async () => {
+    const handle = "promo";
+    const { bot } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      unpaidTimeout: 1, // minuto — só define o teto que envelhecemos manualmente abaixo
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(740) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(740, "offer:0") });
+
+    const db = await testDb();
+    const first = (await db.select().from(payments))[0];
+    expect(first.status).toBe("pending");
+
+    // Envelhece o pendente além do teto de 1 minuto (unpaid_timeout do nó) —
+    // simula um PIX morto no gateway sem o webhook de expiração ter chegado.
+    await db.update(payments)
+      .set({ createdAt: new Date(Date.now() - 2 * 60_000) })
+      .where(eq(payments.id, first.id));
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(740, "offer:0") });
+
+    const rows = await db.select().from(payments).orderBy(payments.createdAt);
+    expect(rows.length).toBe(2);
+    expect(rows[0].id).toBe(first.id);
+    expect(rows[0].status).toBe("expired");   // expirado localmente, libera a constraint única
+    expect(rows[1].status).toBe("pending");   // PIX novo, de fato gerado
+    expect(rows[1].id).not.toBe(first.id);
+    expect(getTelegramCalls("sendPhoto").length).toBe(2); // dois PIX gerados de verdade (1 por clique)
+  });
+
+  // Reproduzir a corrida de verdade (duas execuções concorrentes de verdade)
+  // não dá em um teste unitário sequencial — este teste SIMULA a corrida
+  // mockando findPendingForOffer pra devolver "nada pendente" na 1ª chamada
+  // (o instante em que a execução perdedora fez sua leitura, ANTES de a
+  // vencedora commitar o INSERT dela) enquanto o pendente da vencedora já está
+  // no banco. O INSERT desta execução deve então bater na constraint única
+  // (payments_pending_offer_unique) e cair no catch, sem propagar erro nem
+  // duplicar a linha.
+  it("[simulação] violação da constraint única no INSERT concorrente reenvia o PIX da vencedora, sem erro pro lead", async () => {
+    const handle = "promo";
+    const { bot, gwId, nodeIds } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(741) });
+
+    const db = await testDb();
+    const [lead] = await db.select().from(leads).where(eq(leads.telegramChatId, 741n));
+
+    // "Vencedora" da corrida: já inseriu o pendente pra este lead/nó/handle
+    // ANTES de esta execução alcançar o INSERT dela.
+    const winner = await payRepo.create({
+      userId: bot.userId, botId: bot.id, gatewayId: gwId, leadId: lead.id,
+      nodeId: nodeIds.off, paidHandle: `${handle}__paid`,
+      amount: 1990, offerName: "Curso", pixCode: "WINNER-PIX-CODE",
+    });
+
+    // Mock só na 1ª chamada: simula a leitura desta execução (perdedora) ANTES
+    // do INSERT da vencedora ficar visível. A 2ª chamada (dentro do catch, já
+    // depois da constraint barrar) usa a implementação real e enxerga a
+    // vencedora normalmente.
+    const spy = vi.spyOn(PaymentDrizzleRepository.prototype, "findPendingForOffer")
+      .mockImplementationOnce(async () => null);
+    try {
+      await expect(
+        useCase.execute({ botId: bot.id, update: callbackUpdate(741, "offer:0") }),
+      ).resolves.not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+
+    const rows = await db.select().from(payments);
+    expect(rows.length).toBe(1);          // o INSERT desta execução foi barrado pela constraint — sem duplicata
+    expect(rows[0].id).toBe(winner.id);   // só a linha da vencedora existe
+    expect(getSentMessages().some((m) => m.includes("WINNER-PIX-CODE"))).toBe(true); // reenviou o PIX dela
   });
 });
 
