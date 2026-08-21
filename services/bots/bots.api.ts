@@ -12,7 +12,7 @@ import { DeleteBotUseCase } from "./application/use-cases/delete-bot.use-case.js
 import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook.use-case.js";
 import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
 import { SyncBotProfileUseCase } from "./application/use-cases/sync-bot-profile.use-case.js";
-import { tgCall, tgCallOrThrow, setProfilePhoto } from "./application/telegram-profile.js";
+import { tgCall, tgCallOrThrow, setProfilePhoto, setChatPhoto } from "./application/telegram-profile.js";
 import type { BotWithStats } from "./domain/bot.entity.js";
 
 const repo              = new BotDrizzleRepository();
@@ -288,9 +288,12 @@ interface UpdateTelegramProfileRequest {
   removePhoto?:     boolean;
 }
 
-// PATCH /bots/:id/telegram-profile
+// PATCH /bots/:id/telegram-profile — a foto vai em base64 dentro do JSON (client
+// cap: 5MB), que infla ~33%; o bodyLimit default do Encore (2MiB) estourava com
+// "length limit exceeded" antes mesmo do handler rodar. Espelha o cap do client
+// com folga para o overhead do base64 + demais campos do JSON.
 export const updateTelegramProfile = api(
-  { method: "PATCH", path: "/bots/:id/telegram-profile", expose: true, auth: true },
+  { method: "PATCH", path: "/bots/:id/telegram-profile", expose: true, auth: true, bodyLimit: 10 * 1024 * 1024 },
   async ({ id, name, description, shortDescription, photoBase64, removePhoto }: UpdateTelegramProfileRequest): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
     const bot = await repo.findInternalById(id);
@@ -363,34 +366,32 @@ interface UpdateGroupInfoRequest {
 }
 
 // PATCH /bots/:id/groups/:chatId/info — update group title/description/photo via Telegram
+// A foto vai em base64 dentro do JSON (client cap: 10MB), que infla ~33%; o
+// bodyLimit default do Encore (2MiB) estourava com "length limit exceeded"
+// antes mesmo do handler rodar. Espelha o cap do client com folga.
 export const updateGroupInfo = api(
-  { method: "PATCH", path: "/bots/:id/groups/:chatId/info", expose: true, auth: true },
+  { method: "PATCH", path: "/bots/:id/groups/:chatId/info", expose: true, auth: true, bodyLimit: 16 * 1024 * 1024 },
   async ({ id, chatId, title, description, photoBase64, removePhoto }: UpdateGroupInfoRequest): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
     const bot = await repo.findInternalById(id);
     if (!bot || bot.userId !== userId) throw APIError.notFound("bot not found");
 
     const tasks: Promise<unknown>[] = [];
-    if (title !== undefined)       tasks.push(tgCall(bot.telegramToken, "setChatTitle", { chat_id: chatId, title }));
-    if (description !== undefined) tasks.push(tgCall(bot.telegramToken, "setChatDescription", { chat_id: chatId, description }));
+    if (title !== undefined)       tasks.push(tgCallOrThrow(bot.telegramToken, "setChatTitle", { chat_id: chatId, title }));
+    if (description !== undefined) tasks.push(tgCallOrThrow(bot.telegramToken, "setChatDescription", { chat_id: chatId, description }));
 
     if (removePhoto) {
-      tasks.push(tgCall(bot.telegramToken, "deleteChatPhoto", { chat_id: chatId }));
+      tasks.push(tgCallOrThrow(bot.telegramToken, "deleteChatPhoto", { chat_id: chatId }));
     } else if (photoBase64) {
-      const buf = Buffer.from(photoBase64, "base64");
-      const blob = new Blob([buf], { type: "image/jpeg" });
-      const form = new FormData();
-      form.append("chat_id", chatId);
-      form.append("photo", blob, "photo.jpg");
-      tasks.push(
-        fetch(`https://api.telegram.org/bot${bot.telegramToken}/setChatPhoto`, { method: "POST", body: form })
-          .then((r) => r.json()),
-      );
+      tasks.push(setChatPhoto(bot.telegramToken, chatId, photoBase64));
     }
 
     const results = await Promise.allSettled(tasks);
-    const failed = results.filter((r) => r.status === "rejected");
-    if (failed.length > 0) throw APIError.internal("some telegram operations failed");
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed.length > 0) {
+      const msg = failed.map((f) => (f.reason as Error)?.message || String(f.reason)).join("; ");
+      throw APIError.unavailable(msg);
+    }
 
     return { ok: true };
   },
