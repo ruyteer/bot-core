@@ -959,7 +959,7 @@ export class ExecuteFlowStepUseCase {
       const name = info?.title || label;
       await this.upsertGroup(botId, BigInt(chatId), name, type);
 
-      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem função de <b>Administrador</b>\n2️⃣ Certifique-se de que o bot tem todas as permissões de adminstrador ativadas.\n\n🆔 <b>ID deste grupo:</b> <code>${chatId}</code>`;
+      const msg = `✅ <b>Bot adicionado com sucesso!</b>\n\nPara usar este ${label.toLowerCase()} como ${label.toLowerCase()} VIP:\n\n1️⃣ Certifique-se de que o bot tem função de <b>Administrador</b>\n2️⃣ Certifique-se de que o bot tem todas as permissões de adminstrador ativadas.\n\n🆔 <b>ID deste ${label.toLowerCase()}:</b> <code>${chatId}</code>`;
       await tg.sendMessage({ chatId: String(chatId), text: msg, protectContent: false }).catch(() => {});
     }
   }
