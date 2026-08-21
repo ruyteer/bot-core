@@ -2,6 +2,8 @@ import { api, APIError } from "encore.dev/api";
 import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { FunnelDrizzleRepository } from "./infrastructure/funnel.drizzle.repository.js";
+import { assertOfferComplete, assertRawOfferComplete, type RawNodeOffer } from "./domain/offer-validation.js";
+import { collectNodeOffers } from "../runner/application/execute-flow-step.use-case.js";
 import type { FunnelWithBots, FunnelDetail, SaveFlowInput } from "./domain/funnel.entity.js";
 import { db } from "../shared/database.js";
 import { funnelOffers, leadProgress, payments, funnelNodes, bots } from "../shared/schema/index.js";
@@ -153,10 +155,34 @@ export const deactivate = api(
 );
 
 // PUT /funnels/:id/flow — save nodes + connections (full replace)
+//
+// Autosave genérico: dispara a cada edição (mover nó, conectar aresta, editar
+// texto), não só quando uma oferta é "finalizada" — por isso a validação
+// abaixo é tolerante a rascunho (assertRawOfferComplete só reprova uma oferta
+// "iniciada", nome ou preço preenchidos; vazia dos dois passa como rascunho
+// legítimo). Sem isso dava pra publicar um funil flow com uma oferta sem
+// entrega configurada dentro de um nó — diferente do funil simplificado, que
+// já bloqueia isso.
 export const saveFlow = api(
   { method: "PUT", path: "/funnels/:id/flow", expose: true, auth: true },
   async ({ id, nodes, connections }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
+    for (const node of nodes) {
+      const content = (node.content ?? {}) as Record<string, unknown>;
+      const offers = collectNodeOffers(content);
+      for (const { offer, handleId } of offers) {
+        assertRawOfferComplete(offer as RawNodeOffer, `a oferta "${handleId}" no nó "${node.id}"`);
+      }
+      // Shape legado de oferta única (sem array `content.offers`, campos soltos
+      // direto em `content` — `product_id`/`product_name`/...): collectNodeOffers
+      // (compartilhado com a entrega em runtime, não mexido aqui de propósito)
+      // só lê `content.offers`/`content.blocks`, então esse shape passa
+      // despercebido por ele. Valida separadamente só aqui, na validação —
+      // sem risco de afetar o casamento de callback/entrega em produção.
+      if (!Array.isArray(content.offers) && typeof content.product_id === "string") {
+        assertRawOfferComplete(content as RawNodeOffer, `a oferta no nó "${node.id}"`);
+      }
+    }
     await repo.saveFlow(id, userId, { nodes, connections });
     scanSourceAsync("funnel", id);
     return { ok: true };
@@ -453,6 +479,8 @@ export const createOffer = api(
     const bot = await db.select({ id: bots.id }).from(bots).where(and(eq(bots.id, req.botId), eq(bots.userId, userId))).limit(1);
     if (!bot.length) throw APIError.notFound("bot not found");
 
+    assertOfferComplete(req);
+
     const [row] = await db.insert(funnelOffers).values({
       botId:           req.botId,
       name:            req.name.trim(),
@@ -482,6 +510,8 @@ export const createOffersBulk = api(
     const userBots = await db.select({ id: bots.id }).from(bots).where(eq(bots.userId, userId));
     const allowedIds = new Set(userBots.map((b) => b.id));
     if (!offers.every((o) => allowedIds.has(o.botId))) throw APIError.permissionDenied("bot not owned");
+
+    offers.forEach((o, i) => assertOfferComplete(o, `a oferta ${i + 1}`));
 
     const rows = await db.insert(funnelOffers).values(
       offers.map((o) => ({
