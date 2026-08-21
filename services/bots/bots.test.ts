@@ -157,6 +157,20 @@ describe("telegram-profile", () => {
     await expect(tgCallOrThrow("111:ABC", "setMyDescription", { description: "ok" })).resolves.toBeDefined();
   });
 
+  // Bug: trocar a foto do grupo disparava setChatDescription com o mesmo valor
+  // já salvo (o client sempre manda a description atual, não só quando o
+  // usuário edita), e o Telegram recusa isso com "is not modified" — um erro
+  // de negócio (HTTP 200, ok:false) que não representa falha nenhuma.
+  it("tgCallOrThrow trata 'is not modified' como no-op, não como erro", async () => {
+    forceTelegramError("setChatDescription", undefined, "Bad Request: chat description is not modified");
+    await expect(tgCallOrThrow("111:ABC", "setChatDescription", { chat_id: "-100123", description: "mesma" }))
+      .resolves.toMatchObject({ ok: false });
+
+    forceTelegramError("setChatTitle", undefined, "Bad Request: chat title is not modified");
+    await expect(tgCallOrThrow("111:ABC", "setChatTitle", { chat_id: "-100123", title: "mesmo" }))
+      .resolves.toMatchObject({ ok: false });
+  });
+
   it("setChatPhoto envia o binário direto no campo photo do multipart", async () => {
     await setChatPhoto("111:ABC", "-100123", Buffer.from("fake-jpeg").toString("base64"));
     const call = getTelegramCalls("setChatPhoto")[0];

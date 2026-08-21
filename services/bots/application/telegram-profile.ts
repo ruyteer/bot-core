@@ -17,12 +17,33 @@ export async function tgCall(token: string, method: string, body?: Record<string
   return res.json() as Promise<TgResponse>;
 }
 
+// Métodos "set*" de texto/título onde o Telegram confirmadamente recusa com
+// "... is not modified" quando o valor enviado já é o valor atual — é
+// idempotência, não erro (o cliente manda o valor corrente sempre, não só
+// quando o usuário edita, então isso acontece toda hora). Restrito a esses
+// métodos de propósito: NÃO inclui remoção de foto (removeMyProfilePhoto,
+// deleteChatPhoto), cujo erro de "nada a fazer" tem semântica/texto distintos
+// (ex.: foto inexistente) e não deve ser engolido pela mesma heurística.
+const IDEMPOTENT_NOT_MODIFIED_METHODS = new Set([
+  "setChatTitle",
+  "setChatDescription",
+  "setMyName",
+  "setMyDescription",
+  "setMyShortDescription",
+]);
+
 // O Telegram responde HTTP 200 com {ok:false, description} em erro de negócio —
 // um fetch que resolve. Quem só olha promise rejeitada (allSettled) nunca vê a
 // falha e reporta sucesso ao usuário. Aqui ok:false vira throw.
 export async function tgCallOrThrow(token: string, method: string, body?: Record<string, unknown>): Promise<TgResponse> {
   const r = await tgCall(token, method, body);
-  if (!r.ok) throw new Error(`${method}: ${r.description || "erro desconhecido do Telegram"}`);
+  if (!r.ok) {
+    if (IDEMPOTENT_NOT_MODIFIED_METHODS.has(method) && r.description?.includes("is not modified")) {
+      console.warn(`[bots] ${method}: valor já era o atual (${r.description}) — tratando como no-op`);
+      return r;
+    }
+    throw new Error(`${method}: ${r.description || "erro desconhecido do Telegram"}`);
+  }
   return r;
 }
 
