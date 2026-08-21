@@ -378,6 +378,26 @@ function saleTypeFromNodeContent(content: Record<string, unknown> | null | undef
   }
 }
 
+// Timeout (em MINUTOS) de "não pago" configurado no nó (`content.unpaid_timeout`,
+// default 5) — mesmo valor que `scheduleOfferTimeouts` usa pro delay do ramo
+// `__pending`. Reaproveitado por `handleOfferPurchase` como teto de idade pra
+// decidir se um PIX pendente ainda é "reaproveitável" (ver Achado 2 da revisão
+// de segurança: sem teto, um PIX morto no gateway — sem o webhook de expiração
+// ter chegado — seria reenviado pro lead pra sempre).
+function unpaidTimeoutMinutes(content: Record<string, unknown> & { unpaid_timeout?: number }): number {
+  return typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+}
+
+// SQLSTATE 23505 (unique_violation) — tanto o driver de produção (pg/
+// node-postgres) quanto o PGlite dos testes expõem o código e o nome da
+// constraint violada em `err.code`/`err.constraint`. Confere o NOME também,
+// pra não tratar qualquer unique_violation da tabela como "corrida do PIX".
+function isUniqueViolation(err: unknown, constraintName: string): boolean {
+  const e = err as { code?: string; constraint?: string; message?: string } | null | undefined;
+  if (!e || e.code !== "23505") return false;
+  return e.constraint === constraintName || (typeof e.message === "string" && e.message.includes(constraintName));
+}
+
 interface ExecutionContext {
   botId:  string;
   update: TelegramUpdate;
@@ -1496,7 +1516,7 @@ export class ExecuteFlowStepUseCase {
   ): Promise<void> {
     const content = node.content as Record<string, unknown> & { unpaid_timeout?: number; no_action_timeout?: number };
     const offersList = collectNodeOffers(content);
-    const unpaidMin  = typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
+    const unpaidMin  = unpaidTimeoutMinutes(content);
     const timeoutMin = kind === "no_action" && typeof content.no_action_timeout === "number" && content.no_action_timeout > 0
       ? content.no_action_timeout
       : unpaidMin;
@@ -1553,6 +1573,7 @@ export class ExecuteFlowStepUseCase {
     tg:     TelegramClient,
   ): Promise<void> {
     const paidHandle = `${handleId}__paid`;
+    const nodeContent = node.content as Record<string, unknown> & { unpaid_timeout?: number };
 
     // Re-clique no MESMO botão de oferta (teclado antigo tocado de novo depois de
     // resolvido por escopo reverso, ou duplo-toque no nó atual) enquanto o PIX
@@ -1562,13 +1583,21 @@ export class ExecuteFlowStepUseCase {
     // cancelled/expired — só então um novo clique gera um PIX novo.
     const existing = await payRepo.findPendingForOffer(lead.id, node.id, paidHandle);
     if (existing?.pixCode) {
-      await tg.sendMessage({
-        chatId,
-        text: `<code>${escapeHtml(existing.pixCode)}</code>`,
-        protectContent: bot.protectContent,
-        replyMarkup: pixCopyButtonMarkup(existing.pixCode),
-      });
-      return;
+      // TETO de idade: sem isso, um PIX morto no gateway (expirou lá, mas o
+      // webhook de expiração nunca chegou) seria reenviado pro lead pra sempre.
+      // Mesmo timeout que já rege o ramo "não pago" (__pending) do próprio nó —
+      // depois dele, o código não vale mais a pena reaproveitar.
+      const ageMs   = Date.now() - existing.createdAt.getTime();
+      const maxAgeMs = unpaidTimeoutMinutes(nodeContent) * 60_000;
+      if (ageMs < maxAgeMs) {
+        await this.resendPix(chatId, bot, tg, existing.pixCode);
+        return;
+      }
+      // Mais velho que o teto: expira localmente. Necessário pra liberar a
+      // constraint única (payments_pending_offer_unique) antes do INSERT
+      // abaixo — enquanto essa linha continuar "pending", nenhum PIX novo
+      // consegue ser criado pra este lead/nó/handle.
+      await payRepo.updateStatus(existing.id, "expired");
     }
 
     // O lead interagiu com a oferta → cancela o timeout de "sem ação" pendente
@@ -1610,23 +1639,43 @@ export class ExecuteFlowStepUseCase {
     const { gateway: gw, pix } = result;
 
     // Persiste a cobrança com o contexto p/ retomar o funil quando pago.
-    await payRepo.create({
-      userId:      bot.userId,
-      botId:       bot.id,
-      leadId:      lead.id,
-      gatewayId:   gw.id,
-      offerName:   productName,
-      amount,
-      status:      "pending",
-      saleType:    saleTypeFromNodeContent(node.content as Record<string, unknown> | null),
-      externalId:  pix.externalId,
-      pixCode:     pix.pixCode,
-      description: productName,
-      funnelId:    prog.funnelId,
-      progressId:  prog.id,
-      nodeId:      node.id,
-      paidHandle,
-    });
+    try {
+      await payRepo.create({
+        userId:      bot.userId,
+        botId:       bot.id,
+        leadId:      lead.id,
+        gatewayId:   gw.id,
+        offerName:   productName,
+        amount,
+        status:      "pending",
+        saleType:    saleTypeFromNodeContent(node.content as Record<string, unknown> | null),
+        externalId:  pix.externalId,
+        pixCode:     pix.pixCode,
+        description: productName,
+        funnelId:    prog.funnelId,
+        progressId:  prog.id,
+        nodeId:      node.id,
+        paidHandle,
+      });
+    } catch (err) {
+      // Corrida: entre o findPendingForOffer lá em cima e este INSERT, OUTRA
+      // execução concorrente (double-tap do lead, ou reentrega at-least-once do
+      // update do Telegram/pubsub do Encore) já criou o pendente pra esta MESMA
+      // oferta/lead/nó — a constraint única parcial (payments_pending_offer_unique,
+      // migration 0014) barrou a duplicata. Não dá pra fechar essa janela só com
+      // lock em app-level: há uma chamada de rede real ao gateway (createPixWithFallback,
+      // logo acima) entre o SELECT e o INSERT. O PIX que ESTA execução gerou fica
+      // órfão (não é persistido nem reaproveitável); reenviamos o da concorrente
+      // que ganhou a corrida, em vez de propagar o erro pro lead.
+      if (isUniqueViolation(err, "payments_pending_offer_unique")) {
+        const winner = await payRepo.findPendingForOffer(lead.id, node.id, paidHandle);
+        if (winner?.pixCode) {
+          await this.resendPix(chatId, bot, tg, winner.pixCode);
+          return;
+        }
+      }
+      throw err;
+    }
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
     // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
@@ -1650,6 +1699,24 @@ export class ExecuteFlowStepUseCase {
       replyMarkup: pixCopyButtonMarkup(pix.pixCode),
     });
     await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
+  }
+
+  // Reenvia um código PIX JÁ GERADO (copia-e-cola + botão) sem tocar o gateway
+  // nem a tabela payments — usado tanto pro re-clique comum (PIX ainda dentro do
+  // teto de idade) quanto pela recuperação da corrida em handleOfferPurchase
+  // (esta execução perdeu a constraint única pra uma concorrente).
+  private async resendPix(
+    chatId:  string,
+    bot:     typeof bots.$inferSelect,
+    tg:      TelegramClient,
+    pixCode: string,
+  ): Promise<void> {
+    await tg.sendMessage({
+      chatId,
+      text: `<code>${escapeHtml(pixCode)}</code>`,
+      protectContent: bot.protectContent,
+      replyMarkup: pixCopyButtonMarkup(pixCode),
+    });
   }
 
   // ── Compra avulsa de oferta (botão de broadcast/remarketing) → gera PIX ──────

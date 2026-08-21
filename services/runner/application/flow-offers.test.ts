@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
@@ -232,6 +232,93 @@ describe("escopo reverso — clique em oferta ANTIGA depois do timeout", () => {
     const db = await testDb();
     const rows = await db.select().from(payments);
     expect(rows.length).toBe(0);
+  });
+});
+
+// Achados [Medium] da revisão de segurança/reviewer sobre a branch de escopo
+// reverso: (1) handleOfferPurchase fazia check-then-act (findPendingForOffer →
+// createPixWithFallback → payRepo.create) sem lock nem transação — dois
+// cliques concorrentes liam "sem pendente" antes de qualquer um inserir e
+// geravam dois PIX; corrigido com o índice único parcial
+// `payments_pending_offer_unique` (migration 0014) + captura da violação no
+// INSERT. (2) findPendingForOffer não tinha teto de idade — um PIX morto no
+// gateway (sem o webhook de expiração ter chegado) seria reenviado pro lead
+// pra sempre; corrigido reaproveitando o `unpaid_timeout` do nó como teto.
+describe("PIX pendente — teto de idade e corrida de INSERT (revisão de segurança)", () => {
+  it("PIX pendente mais velho que o timeout 'não pago' do nó é ignorado — gera um PIX novo", async () => {
+    const handle = "promo";
+    const { bot } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      unpaidTimeout: 1, // minuto — só define o teto que envelhecemos manualmente abaixo
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(740) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(740, "offer:0") });
+
+    const db = await testDb();
+    const first = (await db.select().from(payments))[0];
+    expect(first.status).toBe("pending");
+
+    // Envelhece o pendente além do teto de 1 minuto (unpaid_timeout do nó) —
+    // simula um PIX morto no gateway sem o webhook de expiração ter chegado.
+    await db.update(payments)
+      .set({ createdAt: new Date(Date.now() - 2 * 60_000) })
+      .where(eq(payments.id, first.id));
+
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(740, "offer:0") });
+
+    const rows = await db.select().from(payments).orderBy(payments.createdAt);
+    expect(rows.length).toBe(2);
+    expect(rows[0].id).toBe(first.id);
+    expect(rows[0].status).toBe("expired");   // expirado localmente, libera a constraint única
+    expect(rows[1].status).toBe("pending");   // PIX novo, de fato gerado
+    expect(rows[1].id).not.toBe(first.id);
+    expect(getTelegramCalls("sendPhoto").length).toBe(2); // dois PIX gerados de verdade (1 por clique)
+  });
+
+  // Reproduzir a corrida de verdade (duas execuções concorrentes de verdade)
+  // não dá em um teste unitário sequencial — este teste SIMULA a corrida
+  // mockando findPendingForOffer pra devolver "nada pendente" na 1ª chamada
+  // (o instante em que a execução perdedora fez sua leitura, ANTES de a
+  // vencedora commitar o INSERT dela) enquanto o pendente da vencedora já está
+  // no banco. O INSERT desta execução deve então bater na constraint única
+  // (payments_pending_offer_unique) e cair no catch, sem propagar erro nem
+  // duplicar a linha.
+  it("[simulação] violação da constraint única no INSERT concorrente reenvia o PIX da vencedora, sem erro pro lead", async () => {
+    const handle = "promo";
+    const { bot, gwId, nodeIds } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(741) });
+
+    const db = await testDb();
+    const [lead] = await db.select().from(leads).where(eq(leads.telegramChatId, 741n));
+
+    // "Vencedora" da corrida: já inseriu o pendente pra este lead/nó/handle
+    // ANTES de esta execução alcançar o INSERT dela.
+    const winner = await payRepo.create({
+      userId: bot.userId, botId: bot.id, gatewayId: gwId, leadId: lead.id,
+      nodeId: nodeIds.off, paidHandle: `${handle}__paid`,
+      amount: 1990, offerName: "Curso", pixCode: "WINNER-PIX-CODE",
+    });
+
+    // Mock só na 1ª chamada: simula a leitura desta execução (perdedora) ANTES
+    // do INSERT da vencedora ficar visível. A 2ª chamada (dentro do catch, já
+    // depois da constraint barrar) usa a implementação real e enxerga a
+    // vencedora normalmente.
+    const spy = vi.spyOn(PaymentDrizzleRepository.prototype, "findPendingForOffer")
+      .mockImplementationOnce(async () => null);
+    try {
+      await expect(
+        useCase.execute({ botId: bot.id, update: callbackUpdate(741, "offer:0") }),
+      ).resolves.not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+
+    const rows = await db.select().from(payments);
+    expect(rows.length).toBe(1);          // o INSERT desta execução foi barrado pela constraint — sem duplicata
+    expect(rows[0].id).toBe(winner.id);   // só a linha da vencedora existe
+    expect(getSentMessages().some((m) => m.includes("WINNER-PIX-CODE"))).toBe(true); // reenviou o PIX dela
   });
 });
 

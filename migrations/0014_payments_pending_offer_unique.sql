@@ -1,0 +1,11 @@
+-- Fecha a janela de corrida do dedupe de PIX: handleOfferPurchase
+-- (execute-flow-step.use-case.ts) fazia check-then-act sem lock nem transação
+-- (findPendingForOffer → SELECT, createPixWithFallback → chamada de rede ao
+-- gateway, payRepo.create → INSERT). Dois cliques concorrentes no MESMO botão
+-- de oferta (double-tap do lead, ou reentrega at-least-once do update do
+-- Telegram/pubsub do Encore) liam "sem pendente" antes de qualquer um inserir
+-- e geravam DOIS PIX pra mesma oferta/lead. Índice único parcial: só um
+-- "pending" por (lead_id, node_id, paid_handle) por vez — pago/cancelado/
+-- expirado libera pra um novo. handleOfferPurchase trata a violação desta
+-- constraint como "já existe" e reenvia o pendente em vez de propagar o erro.
+CREATE UNIQUE INDEX "payments_pending_offer_unique" ON "payments" USING btree ("lead_id","node_id","paid_handle") WHERE "payments"."status" = 'pending';

@@ -237,6 +237,16 @@ const STATEMENTS: string[] = [
   // pode ter cor (primary/constructive/destructive). Coluna nullable, sem
   // default: null mantém o comportamento atual (sem cor).
   `ALTER TABLE "remarketing_messages" ADD COLUMN IF NOT EXISTS "offer_style" text`,
+
+  // 0014_payments_pending_offer_unique.sql — fecha a janela de corrida do
+  // dedupe de PIX (achado de revisão de segurança): handleOfferPurchase fazia
+  // check-then-act sem lock/transação entre o SELECT de "já existe pendente" e
+  // o INSERT (com uma chamada de rede ao gateway no meio) — dois cliques
+  // concorrentes no mesmo botão de oferta geravam dois PIX. Só um "pending" por
+  // (lead_id, node_id, paid_handle) por vez.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "payments_pending_offer_unique"
+     ON "payments" USING btree ("lead_id", "node_id", "paid_handle")
+     WHERE "status" = 'pending'`,
 ];
 
 export async function ensureSchema(): Promise<void> {
