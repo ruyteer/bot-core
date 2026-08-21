@@ -8,8 +8,13 @@ const WHATSAPP_SUPPORT_MESSAGE_KEY = "WHATSAPP_SUPPORT_MESSAGE";
 
 // providers de gateway PIX suportados — chave curta exposta ao cliente ↔ chave
 // interna em platform_config (GATEWAY_AFFILIATE_URL_<PROVIDER>).
-const GATEWAY_AFFILIATE_PROVIDERS = ["syncpay", "buckpay", "nexuspag", "wiinpay"] as const;
-type GatewayAffiliateProvider = (typeof GATEWAY_AFFILIATE_PROVIDERS)[number];
+// União explícita (não derivada via `(typeof X)[number]`): o parser estático
+// do Encore (usado pra gerar o schema da API) não suporta indexed access type
+// sobre um array const — quebra o build com "unsupported indexed access type
+// operation" mesmo passando limpo no tsc/vitest locais.
+type GatewayAffiliateProvider = "syncpay" | "buckpay" | "nexuspag" | "wiinpay";
+const GATEWAY_AFFILIATE_PROVIDERS: readonly GatewayAffiliateProvider[] =
+  ["syncpay", "buckpay", "nexuspag", "wiinpay"];
 
 function gatewayAffiliateConfigKey(provider: GatewayAffiliateProvider): string {
   return `GATEWAY_AFFILIATE_URL_${provider.toUpperCase()}`;
