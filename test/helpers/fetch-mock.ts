@@ -20,8 +20,10 @@ let originalFetch: typeof globalThis.fetch | undefined;
 // createChatInviteLink falhando) ou num gateway. errorCode opcional vira o
 // `error_code` da resposta (ex.: 401 = token revogado).
 const forcedErrors = new Map<string, number | undefined>();
-export function forceTelegramError(method: string, errorCode?: number): void {
+const forcedErrorDescriptions = new Map<string, string>();
+export function forceTelegramError(method: string, errorCode?: number, description?: string): void {
   forcedErrors.set(method, errorCode);
+  if (description !== undefined) forcedErrorDescriptions.set(method, description);
 }
 
 // Derruba um gateway PIX por trecho da URL (ex.: "realtechdev" = BuckPay), para
@@ -122,7 +124,7 @@ export function installFetchMock(): void {
         return jsonResponse({
           ok: false,
           ...(code ? { error_code: code } : {}),
-          description: code === 429 ? "Too Many Requests: retry after 7" : "forced error",
+          description: forcedErrorDescriptions.get(method) ?? (code === 429 ? "Too Many Requests: retry after 7" : "forced error"),
           // Shape real do 429 do Telegram: retry_after em parameters.
           ...(code === 429 ? { parameters: { retry_after: 7 } } : {}),
         });
@@ -165,6 +167,7 @@ export function resetFetchMock(): void {
   telegramCalls = [];
   otherCalls = [];
   forcedErrors.clear();
+  forcedErrorDescriptions.clear();
   forcedGatewayErrors.clear();
 }
 
