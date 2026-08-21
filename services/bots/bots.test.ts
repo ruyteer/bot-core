@@ -6,8 +6,8 @@ import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-web
 import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
 import { testDb } from "../../test/helpers/db.js";
-import { bots } from "../shared/schema/index.js";
-import { createProfile, createBot } from "../../test/helpers/seed.js";
+import { bots, payments } from "../shared/schema/index.js";
+import { createProfile, createBot, createGateway, createLead } from "../../test/helpers/seed.js";
 import { getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 import { setProfilePhoto, setChatPhoto, tgCallOrThrow } from "./application/telegram-profile.js";
 
@@ -168,5 +168,40 @@ describe("telegram-profile", () => {
   it("setChatPhoto propaga o erro do Telegram em vez de fingir sucesso", async () => {
     forceTelegramError("setChatPhoto");
     await expect(setChatPhoto("111:ABC", "-100123", "eA==")).rejects.toThrow(/setChatPhoto/);
+  });
+});
+
+// O bug relatado: a aba /bots mostrava 0 leads e 0 vendas em TODO bot, mesmo com
+// atividade real no banco. As subqueries correlacionadas de leadsCount/salesCount
+// comparavam `bot_id` com o `id` da própria tabela interna (o Drizzle emite as
+// colunas da lista de seleção sem prefixo de tabela numa select de tabela única),
+// então a condição nunca era verdadeira. Este teste roda no PGlite com as
+// migrações reais, ou seja, valida o SQL de verdade — não um mock.
+describe("BotDrizzleRepository.findByUserId", () => {
+  it("conta leads e vendas pagas do bot certo", async () => {
+    const { id: botId, userId } = await createBot();
+    const outro = await createBot({ userId });
+    const gatewayId = await createGateway({ userId });
+
+    await createLead(botId, 1n);
+    await createLead(botId, 2n);
+    await createLead(outro.id, 3n);
+
+    const db = await testDb();
+    await db.insert(payments).values([
+      { userId, botId, gatewayId, amount: 1000, status: "paid" },
+      { userId, botId, gatewayId, amount: 2000, status: "paid" },
+      { userId, botId, gatewayId, amount: 3000, status: "pending" },
+      { userId, botId: outro.id, gatewayId, amount: 4000, status: "paid" },
+    ]);
+
+    const rows = await repo.findByUserId(userId);
+    const bot = rows.find((b) => b.id === botId)!;
+    expect(bot.leadsCount).toBe(2);
+    expect(bot.salesCount).toBe(2);   // só as pagas
+
+    const vizinho = rows.find((b) => b.id === outro.id)!;
+    expect(vizinho.leadsCount).toBe(1);
+    expect(vizinho.salesCount).toBe(1);
   });
 });
