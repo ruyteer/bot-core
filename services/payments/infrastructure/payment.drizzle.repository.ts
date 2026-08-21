@@ -122,6 +122,7 @@ export class PaymentDrizzleRepository {
       .select({
         payment:      payments,
         botName:      bots.name,
+        botUsername:  bots.telegramUsername,
         leadFirst:    leads.firstName,
         leadLast:     leads.lastName,
         leadUsername: leads.telegramUsername,
@@ -139,6 +140,7 @@ export class PaymentDrizzleRepository {
     return rows.map((r) => ({
       ...this.toPayment(r.payment),
       botName:      r.botName ?? null,
+      botUsername:  r.botUsername ?? null,
       leadName:     [r.leadFirst, r.leadLast].filter(Boolean).join(" ") || null,
       leadUsername: r.leadUsername ?? null,
       leadChatId:   r.leadChatId ? r.leadChatId.toString() : null,

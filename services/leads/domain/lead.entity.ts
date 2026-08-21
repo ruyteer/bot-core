@@ -26,6 +26,7 @@ export interface LeadWithStats extends Lead {
   progress:        LeadProgress | null;
   conversionTimeMs: number | null;
   botName:         string | null;
+  botUsername:     string | null;
 }
 
 export interface LeadMessage {

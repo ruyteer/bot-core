@@ -45,6 +45,7 @@ export interface Payment {
 
 export interface PaymentWithMeta extends Payment {
   botName:         string | null;
+  botUsername:     string | null;
   leadName:        string | null;
   leadUsername:    string | null;
   leadChatId:      string | null;
