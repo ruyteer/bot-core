@@ -65,7 +65,10 @@ function offerHandleId(offer: Record<string, unknown>, i: number): string {
 // dedicado (content.offers) e blocos de oferta dentro de um nó `message`
 // (blocks[].offers, cujo fallback de handle é `offer_<blockIdx>_<offerIdx>`).
 // A ordem do retorno é o índice usado no callback `offer:<i>`.
-function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Record<string, unknown>; handleId: string }> {
+// Exportada porque `funnels.saveFlow` (services/funnels/funnels.api.ts) reusa
+// a mesma extração para validar ofertas antes de persistir o flow — em vez de
+// duplicar a lógica de onde uma oferta pode aparecer num node.
+export function collectNodeOffers(content: Record<string, unknown>): Array<{ offer: Record<string, unknown>; handleId: string }> {
   const out: Array<{ offer: Record<string, unknown>; handleId: string }> = [];
   const direct = content.offers as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(direct)) {
@@ -1807,6 +1810,14 @@ export class ExecuteFlowStepUseCase {
       return;
     }
     const url = offer.deliveryUrl ?? "";
+    if (!url) {
+      // Pagamento confirmado (dinheiro real) mas a oferta não tem nenhum
+      // mecanismo de entrega configurado (nem grupo, nem texto, nem link).
+      // Não há como saber aqui se isso é esperado — só logamos pra não ficar
+      // 100% silencioso; a oferta em si devia ter sido barrada antes de
+      // aceitar pagamento (ver assertOfferComplete em createOffer/Bulk).
+      console.warn(`[runner] deliverFunnelOffer: oferta ${offer.id} paga sem nenhuma entrega configurada (bot=${bot.id}, lead=${lead.id})`);
+    }
     await tg.sendMessage({ chatId, text: url ? `✅ Pagamento confirmado! Acesse seu produto: ${url}` : "✅ Pagamento confirmado!", protectContent: bot.protectContent });
   }
 
@@ -1882,7 +1893,15 @@ export class ExecuteFlowStepUseCase {
 
     if (type === "vip_group") {
       const groupId = (typeof offer.telegram_group_id === "string" ? offer.telegram_group_id : "").trim();
-      if (!groupId) return;
+      if (!groupId) {
+        // Pagamento confirmado (dinheiro real) mas a oferta embutida no nó
+        // está com tipo vip_group e sem grupo vinculado — antes isso retornava
+        // sem mandar mensagem NENHUMA pro comprador. Manda ao menos a
+        // confirmação genérica e loga, em vez de ficar 100% silencioso.
+        console.warn(`[runner] deliverOffer: oferta vip_group sem telegram_group_id (chatId=${chatId})`);
+        await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado!", protectContent: protect });
+        return;
+      }
       const accessDays = typeof offer.access_days === "number" ? offer.access_days : 0;
       const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
       try {
@@ -1901,6 +1920,9 @@ export class ExecuteFlowStepUseCase {
     }
 
     const url = typeof offer.delivery_url === "string" ? offer.delivery_url : "";
+    if (!url && type !== "text") {
+      console.warn(`[runner] deliverOffer: oferta tipo "${type}" paga sem delivery_url configurado (chatId=${chatId})`);
+    }
     const text = url
       ? `✅ Pagamento confirmado! Acesse seu produto: ${escapeHtml(interpolate(url, vars))}`
       : "✅ Pagamento confirmado!";
