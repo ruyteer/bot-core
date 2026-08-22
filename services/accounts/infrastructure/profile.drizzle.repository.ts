@@ -5,6 +5,15 @@ import type { Profile, ProfileWithRoles, UpsertProfileInput } from "../domain/pr
 import type { ProfileRepository } from "../domain/profile.repository.js";
 
 export class ProfileDrizzleRepository implements ProfileRepository {
+  // `name` só entra no INSERT (provisiona o nome do cadastro do Supabase na
+  // primeira vez que o usuário aparece). NÃO entra no `set` do conflito: este
+  // upsert roda no auth handler, em TODA requisição autenticada, com o nome
+  // vindo do `user_metadata` do JWT — que nunca muda depois do signup. Se
+  // `name` estivesse no `set`, qualquer troca de nome via PATCH /auth/profile
+  // era revertida de volta pro nome original do JWT na request seguinte
+  // (inclusive o próprio refetch de ["auth-me"] disparado pela invalidação
+  // depois do PATCH) — o usuário via "Perfil atualizado" mas o nome nunca
+  // ficava, silenciosamente.
   async upsert(input: UpsertProfileInput): Promise<Profile> {
     const [row] = await db
       .insert(profiles)
@@ -17,7 +26,6 @@ export class ProfileDrizzleRepository implements ProfileRepository {
         target: profiles.id,
         set: {
           email:     input.email,
-          name:      input.name,
           updatedAt: new Date(),
         },
       })
