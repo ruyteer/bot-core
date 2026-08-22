@@ -376,17 +376,41 @@ export const updateGroupInfo = api(
     const bot = await repo.findInternalById(id);
     if (!bot || bot.userId !== userId) throw APIError.notFound("bot not found");
 
-    const tasks: Promise<unknown>[] = [];
-    if (title !== undefined)       tasks.push(tgCallOrThrow(bot.telegramToken, "setChatTitle", { chat_id: chatId, title }));
-    if (description !== undefined) tasks.push(tgCallOrThrow(bot.telegramToken, "setChatDescription", { chat_id: chatId, description }));
+    // Cada task é rotulada pra saber, depois do allSettled, exatamente QUAL
+    // operação teve sucesso — sincronizar bot_groups.name não pode depender do
+    // resultado agregado (se título mudar com sucesso mas description/foto
+    // falhar, o card não pode voltar a ficar preso no nome antigo só porque a
+    // request como um todo virou erro 503 pro usuário).
+    const tasks: Array<{ kind: "title" | "other"; promise: Promise<unknown> }> = [];
+    if (title !== undefined)
+      tasks.push({ kind: "title", promise: tgCallOrThrow(bot.telegramToken, "setChatTitle", { chat_id: chatId, title }) });
+    if (description !== undefined)
+      tasks.push({ kind: "other", promise: tgCallOrThrow(bot.telegramToken, "setChatDescription", { chat_id: chatId, description }) });
 
     if (removePhoto) {
-      tasks.push(tgCallOrThrow(bot.telegramToken, "deleteChatPhoto", { chat_id: chatId }));
+      tasks.push({ kind: "other", promise: tgCallOrThrow(bot.telegramToken, "deleteChatPhoto", { chat_id: chatId }) });
     } else if (photoBase64) {
-      tasks.push(setChatPhoto(bot.telegramToken, chatId, photoBase64));
+      tasks.push({ kind: "other", promise: setChatPhoto(bot.telegramToken, chatId, photoBase64) });
     }
 
-    const results = await Promise.allSettled(tasks);
+    const results = await Promise.allSettled(tasks.map((t) => t.promise));
+    const titleSucceeded = tasks.some(
+      (t, i) => t.kind === "title" && results[i].status === "fulfilled",
+    );
+
+    // O card de /groups lê o nome de `bot_groups.name` (nossa tabela, populada
+    // quando o bot é adicionado ao grupo) — só chamar a API do Telegram acima
+    // não atualiza isso, então o card ficava com o nome antigo pra sempre
+    // (só o modal de edição mostrava o novo, porque busca direto do Telegram
+    // via getGroupInfo). Mantém as duas fontes em sincronia — e faz isso ANTES
+    // de decidir se lança erro, porque o título já mudou de verdade no
+    // Telegram mesmo que description/foto falhem na mesma chamada.
+    if (titleSucceeded) {
+      await db.update(botGroups)
+        .set({ name: title, updatedAt: new Date() })
+        .where(and(eq(botGroups.botId, id), eq(botGroups.telegramChatId, BigInt(chatId))));
+    }
+
     const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
     if (failed.length > 0) {
       const msg = failed.map((f) => (f.reason as Error)?.message || String(f.reason)).join("; ");
