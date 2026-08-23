@@ -107,6 +107,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
       })
       .where(and(eq(funnels.id, id), eq(funnels.userId, userId)))
       .returning();
+    if (!row) throw new Error("funnel not found");
     return this.toFunnel(row);
   }
 
