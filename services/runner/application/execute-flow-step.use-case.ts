@@ -51,13 +51,52 @@ function belongsToBot(botId: string) {
   );
 }
 
-// Handle de uma oferta dentro de um nó `offer`. O frontend usa exatamente
-// `offer.callback || offer.product_name || offer_<i>` como id dos conectores
-// (`<handle>__paid|__pending`) — replicamos para casar na retomada.
-function offerHandleId(offer: Record<string, unknown>, i: number): string {
+// Base do handle de uma oferta dentro de um nó `offer`: o frontend usa
+// exatamente `offer.callback || offer.product_name || offer_<i>`.
+function offerHandleBase(offer: Record<string, unknown>, i: number): string {
   const callback = typeof offer.callback === "string" ? offer.callback : "";
   const name     = typeof offer.product_name === "string" ? offer.product_name : "";
   return callback || name || `offer_${i}`;
+}
+
+// Ids dos conectores (`<handle>__paid|__pending|__no_action`) para TODAS as
+// ofertas de um nó, na mesma ordem do array `offers` (a mesma que
+// `offers.map((offer, i) => ...)` usa em OfferNode.tsx).
+//
+// Duas ofertas do mesmo nó com o mesmo callback/nome (ou ambos vazios, caindo
+// no mesmo fallback `offer_<i>`... o que só acontecia por ELAS terem índices
+// diferentes, mas callback/nome IGUAIS entre si) geravam a MESMA base — e o
+// editor só deixava conectar uma das duas. Desempatamos igual ao frontend: a
+// 1ª ocorrência de uma base usa o id direto, as seguintes ganham sufixo
+// `#2`, `#3`... determinístico dentro do nó (a ORDEM do array não muda:
+// `content.offers` é editado só por inserção/remoção no editor, nunca
+// reordenado por esta função).
+//
+// Rastreamos um Set de ids JÁ ATRIBUÍDOS (não só uma contagem por base):
+// contar só ocorrências da base deixava passar uma colisão de 2ª ordem — se
+// uma oferta C tiver callback LITERAL igual ao sufixo que a função geraria
+// pra outra ("promo#2", coincidência ou copy-paste de alguém que não sabia do
+// algoritmo interno), contar por base via um Map<base, count> tratava essa
+// string como "1ª ocorrência da base 'promo#2'" e devolvia o MESMO id que já
+// tinha sido dado à 2ª ocorrência de "promo" — duas ofertas diferentes com o
+// mesmo handleId, exatamente o bug que esta função existe pra evitar (e
+// `handlePaidOffer` pega a PRIMEIRA que bater por `.find()`, então quem pagou
+// C podia receber a entrega configurada pra B). Verificando contra TODOS os
+// ids já usados até aquele ponto — literais ou gerados — cada novo id só é
+// aceito se ainda não existir, incrementando o sufixo até achar um livre.
+function offerHandleIds(offers: Array<Record<string, unknown>>): string[] {
+  const used = new Set<string>();
+  return offers.map((offer, i) => {
+    const base = offerHandleBase(offer, i);
+    let id = base;
+    let n  = 2;
+    while (used.has(id)) {
+      id = `${base}#${n}`;
+      n++;
+    }
+    used.add(id);
+    return id;
+  });
 }
 
 // Coleta as ofertas "compráveis" de um nó com o handleId EXATO que o frontend usa
@@ -72,7 +111,8 @@ export function collectNodeOffers(content: Record<string, unknown>): Array<{ off
   const out: Array<{ offer: Record<string, unknown>; handleId: string }> = [];
   const direct = content.offers as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(direct)) {
-    direct.forEach((offer, i) => out.push({ offer, handleId: offerHandleId(offer, i) }));
+    const handleIds = offerHandleIds(direct);
+    direct.forEach((offer, i) => out.push({ offer, handleId: handleIds[i] }));
   }
   const blocks = content.blocks as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(blocks)) {
@@ -1494,17 +1534,24 @@ export class ExecuteFlowStepUseCase {
   }
 
   // ── Agenda timeouts de oferta (__no_action ao apresentar, __pending após PIX) ─
-  // "Sem ação" (nunca clicou) e "Não pago" (clicou, gerou PIX, não pagou) saem
-  // pelo MESMO handle __pending — a UI só expõe uma linha/conexão por oferta
-  // (ver OfferNode.tsx). O que difere entre os dois casos é só a DURAÇÃO do
-  // timeout: `kind` escolhe entre `no_action_timeout` (com fallback pra
-  // `unpaid_timeout`) e `unpaid_timeout` puro. Antes disso, eram dois handles
-  // separados (__no_action/__pending) — dava pra configurar destinos
-  // diferentes, mas na prática 100% dos funis publicados usavam o mesmo
-  // destino nos dois (ou só configuravam um dos dois), então unificar não
-  // muda o roteamento de ninguém, só simplifica o editor.
-  // Agenda um delay por oferta cujo handle (`<handleId>__pending`) tenha
-  // conexão. `onlyHandleId`: só a oferta que o lead clicou (kind="unpaid").
+  // "Sem ação" (nunca clicou) tem handle PRÓPRIO de novo (`__no_action`) — a UI
+  // voltou a expor as duas linhas/conexões por oferta (ver OfferNode.tsx). O
+  // que difere entre os dois casos continua sendo a DURAÇÃO do timeout: `kind`
+  // escolhe entre `no_action_timeout` (com fallback pra `unpaid_timeout`) e
+  // `unpaid_timeout` puro.
+  //
+  // Um commit anterior (e8657f94) tinha removido a linha "sem ação" da UI e
+  // migrado os dados de produção trocando o sufixo `__no_action` por
+  // `__pending` nas edges já salvas — unificando os dois casos no mesmo
+  // handle. Trazer "sem ação" de volta não pode quebrar esses funis já
+  // migrados: pra `kind === "no_action"`, tentamos `__no_action` primeiro e só
+  // caímos pra `__pending` quando não existe aresta com esse source_handle
+  // (funil antigo, editado antes desta correção, cujos dados a migração já
+  // reescreveu). `kind === "unpaid"` (PIX gerado, não pago) nunca mudou: é
+  // sempre `__pending`, próprio ou não.
+  //
+  // Agenda um delay por oferta cujo handle resolvido tenha conexão.
+  // `onlyHandleId`: só a oferta que o lead clicou (kind="unpaid").
   private async scheduleOfferTimeouts(
     funnelId:     string,
     node:         typeof funnelNodes.$inferSelect,
@@ -1524,7 +1571,10 @@ export class ExecuteFlowStepUseCase {
 
     for (const { handleId } of offersList) {
       if (onlyHandleId !== undefined && handleId !== onlyHandleId) continue;
-      const target = await nextNode(funnelId, node.id, `${handleId}__pending`);
+      let target = kind === "no_action"
+        ? await nextNode(funnelId, node.id, `${handleId}__no_action`)
+        : null;
+      if (!target) target = await nextNode(funnelId, node.id, `${handleId}__pending`);
       if (!target) continue;
       await db.insert(scheduledDelays).values({
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
