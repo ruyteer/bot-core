@@ -58,9 +58,27 @@ describe("simplified — welcome e CTA", () => {
     await simplified.handle({ bot: r.bot, lead: r.lead, chatId: chatId.toString(), funnel: r.funnel, text: "/start", callbackData: null, callbackMessageId: null, tg });
     let kb = lastKeyboard();
     expect(kb[0][0].callback_data).toBe(`sc_accept_${funnelId}`);
+    expect(kb[0][1].callback_data).toBe(`sc_decline_${funnelId}`);
     await simplified.handle({ bot: r.bot, lead: r.lead, chatId: chatId.toString(), funnel: r.funnel, text: null, callbackData: `sc_accept_${funnelId}`, callbackMessageId: 5, tg });
     kb = lastKeyboard();
     expect(kb.some((row) => row[0].callback_data === "sp_p1")).toBe(true);
+  });
+
+  it("/start com CTA e decline_enabled=false envia só o botão de aceitar", async () => {
+    const { bot, funnelId, chatId } = await baseFunnel({ cta: { enabled: true, text: "Quer ver?", decline_enabled: false } });
+    const r = await rows(bot.id, funnelId, chatId);
+    await simplified.handle({ bot: r.bot, lead: r.lead, chatId: chatId.toString(), funnel: r.funnel, text: "/start", callbackData: null, callbackMessageId: null, tg });
+    const kb = lastKeyboard();
+    expect(kb[0].length).toBe(1);
+    expect(kb[0][0].callback_data).toBe(`sc_accept_${funnelId}`);
+  });
+
+  it("callback sc_decline antigo (keyboard em cache) ainda é tratado mesmo com decline_enabled=false", async () => {
+    const { bot, funnelId, chatId } = await baseFunnel({ cta: { enabled: true, text: "Quer ver?", decline_enabled: false, decline_message: "Sem problema!" } });
+    const r = await rows(bot.id, funnelId, chatId);
+    const handled = await simplified.handle({ bot: r.bot, lead: r.lead, chatId: chatId.toString(), funnel: r.funnel, text: null, callbackData: `sc_decline_${funnelId}`, callbackMessageId: 5, tg });
+    expect(handled).toBe(true);
+    expect(getSentMessages().some((m) => m.includes("Sem problema!"))).toBe(true);
   });
 });
 
