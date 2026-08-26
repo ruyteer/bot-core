@@ -227,6 +227,20 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
     return f.id;
   }
 
+  it("funil flow: rejeita ativação com oferta iniciada só com nome — falta preço e entrega", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { offers: [{ product_name: "Produto" }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*preço/i);
+  });
+
   it("funil flow: rejeita ativação com oferta iniciada e incompleta num nó offer", async () => {
     const id = await newFlowFunnel();
     await saveFlow({
@@ -279,6 +293,62 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
     await expect(activate({ id })).resolves.toEqual({ ok: true });
   });
 
+  it("funil flow: rejeita ativação com oferta incompleta escondida num bloco de oferta dentro de um nó message", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "message",
+        content: { blocks: [{ type: "offer", offers: [{ product_name: "Produto", price: 0 }] }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*preço/i);
+  });
+
+  it("funil flow: aceita ativação com oferta completa num bloco de oferta dentro de um nó message", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "message",
+        content: { blocks: [{ type: "offer", offers: [{ product_name: "Produto", price: 1000, delivery_url: "https://exemplo.com/produto" }] }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  it("funil flow: rejeita ativação com shape legado de oferta única (product_id direto em content, sem array offers) quando incompleto", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { product_id: "legacy-1", product_name: "Produto legado", price: 1000 },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*URL de entrega/i);
+  });
+
+  it("funil flow: aceita ativação com shape legado de oferta única quando completo", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { product_id: "legacy-1", product_name: "Produto legado", price: 1000, delivery_url: "https://x.com" },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
   it("funil simplificado: rejeita ativação com plano iniciado sem entrega", async () => {
     const id = await newSimplifiedFunnel();
     await update({ id, simplifiedConfig: { plans: [{ name: "Plano Básico", price: 1000 }] } });
@@ -294,6 +364,23 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
     const id = await newSimplifiedFunnel();
     await update({ id, simplifiedConfig: { plans: [{ name: "Plano VIP", price: 1000, vip_group_id: "-100987" }] } });
     await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  // Regressão do achado de revisão de segurança: `deliveryTypeOf` (runtime)
+  // só cai pra inferir de `vip_group_id` quando `delivery_type` é FALSY —
+  // um `delivery_type` truthy não-reconhecido (aqui, um número por engano)
+  // vence e vira "content" mesmo com `vip_group_id` preenchido. Uma versão
+  // anterior da validação checava `typeof === "string"` antes de aceitar
+  // `delivery_type`, então um valor truthy não-string caía no fallback de
+  // `vip_group_id` e liberava a ativação — só que em produção o item seria
+  // tratado como "content" sem `delivery_url`, e nada seria entregue.
+  it("funil simplificado: rejeita ativação quando delivery_type é truthy mas não reconhecido (mesmo com vip_group_id preenchido)", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({
+      id,
+      simplifiedConfig: { plans: [{ name: "Plano Bugado", price: 1000, delivery_type: 1, vip_group_id: "-100987" }] },
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*URL de entrega/i);
   });
 
   it("funil simplificado: rejeita ativação com upsell vip_group sem vip_group_id", async () => {

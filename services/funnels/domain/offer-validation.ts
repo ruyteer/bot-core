@@ -157,14 +157,17 @@ export function assertSimplifiedOfferComplete(item: RawSimplifiedOfferItem, labe
     label,
   );
 
-  // Espelha `deliveryTypeOf` em `execute-simplified-funnel.use-case.ts`: sem
-  // `delivery_type` explícito, um `vip_group_id` preenchido já basta pra
-  // inferir "vip_group" (shape legado/da UI que nunca grava `delivery_type`
-  // sozinho). Sem essa mesma inferência aqui, um item que entrega certinho em
-  // produção seria rejeitado na ativação pedindo "URL de entrega".
-  const type = typeof item.delivery_type === "string" && item.delivery_type
-    ? item.delivery_type
-    : item.vip_group_id ? "vip_group" : "content";
+  // Espelha `deliveryTypeOf` em `execute-simplified-funnel.use-case.ts` — bit a
+  // bit, não só a intenção: QUALQUER `delivery_type` truthy vence e cai pra
+  // "content" se não for "vip_group"/"text" reconhecido; só cai pra inferir de
+  // `vip_group_id` quando `delivery_type` é falsy (ausente/""/0/null). Uma
+  // versão anterior daqui exigia `typeof === "string"` antes de aceitar
+  // `delivery_type`, o que divergia do runtime pra um `delivery_type` truthy
+  // não-string (ex.: `1`): a validação inferia "vip_group" via `vip_group_id`
+  // e liberava a ativação, mas em produção o runtime calculava "content" e
+  // `deliverItem` não entregava nada — silenciosamente. Ver achado de revisão.
+  const dt = (item.delivery_type as unknown) || (item.vip_group_id ? "vip_group" : "content");
+  const type = dt === "vip_group" ? "vip_group" : dt === "text" ? "text" : "content";
   if (type === "vip_group") {
     const groupId = typeof item.vip_group_id === "string" ? item.vip_group_id.trim() : "";
     if (!groupId) {

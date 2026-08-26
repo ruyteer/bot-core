@@ -96,11 +96,10 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     return this.toFunnel(row);
   }
 
-  async update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "isActive" | "simplifiedConfig" | "botId">>): Promise<Funnel> {
+  async update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig" | "botId">>): Promise<Funnel> {
     const [row] = await db.update(funnels)
       .set({
         ...(data.name !== undefined && { name: data.name }),
-        ...(data.isActive !== undefined && { isActive: data.isActive }),
         ...(data.simplifiedConfig !== undefined && { simplifiedConfig: data.simplifiedConfig }),
         ...(data.botId !== undefined && { botId: data.botId }),
         updatedAt: new Date(),

@@ -102,14 +102,17 @@ function assertFunnelReadyToActivate(detail: FunnelDetail): void {
 
   for (const node of detail.nodes) {
     const content = (node.content ?? {}) as Record<string, unknown>;
+    // Mesmo fallback de rótulo usado em `nodeStats` (linha ~433) — o id do nó é
+    // um uuid interno, não ajuda o usuário a achar o nó na UI do editor.
+    const nodeLabel = (content.label as string | undefined) ?? node.type;
     const offers = collectNodeOffers(content);
     for (const { offer, handleId } of offers) {
-      assertRawOfferComplete(offer as RawNodeOffer, `não é possível ativar: a oferta "${handleId}" no nó "${node.id}"`);
+      assertRawOfferComplete(offer as RawNodeOffer, `não é possível ativar: a oferta "${handleId}" no nó "${nodeLabel}"`);
     }
     // Shape legado de oferta única — ver mesmo comentário em `saveFlow` (git
     // blame / histórico): collectNodeOffers só lê `content.offers`/`content.blocks`.
     if (!Array.isArray(content.offers) && typeof content.product_id === "string") {
-      assertRawOfferComplete(content as RawNodeOffer, `não é possível ativar: a oferta no nó "${node.id}"`);
+      assertRawOfferComplete(content as RawNodeOffer, `não é possível ativar: a oferta no nó "${nodeLabel}"`);
     }
   }
 }
@@ -185,6 +188,10 @@ export const activate = api(
     const { userID: userId } = getAuthData()!;
     const detail = await repo.findByIdOwned(id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
+    // Sem transação/lock entre a leitura acima e o UPDATE em repo.activate: um
+    // saveFlow/update concorrente que torne uma oferta incompleta nessa janela
+    // passaria despercebido. Aceitável por ora (exige corrida real editando e
+    // ativando ao mesmo tempo); revisitar se isso virar um problema de verdade.
     assertFunnelReadyToActivate(detail);
     await repo.activate(id, userId);
     return { ok: true };
