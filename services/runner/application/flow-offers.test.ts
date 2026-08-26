@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
+import { ExecuteFlowStepUseCase, collectNodeOffers } from "./execute-flow-step.use-case.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { processPendingDelays } from "../runner.js";
 import { testDb } from "../../../test/helpers/db.js";
@@ -35,13 +35,16 @@ async function setupOffer(opts: { offer: Record<string, unknown>; extraConns?: A
 }
 
 describe("offer node — apresentação e compra", () => {
-  // "Sem ação" (nunca clicou) e "Não pago" (clicou, não pagou) saem pelo MESMO
-  // handle __pending hoje — a UI só expõe uma linha/conexão por oferta
-  // (OfferNode.tsx). O que muda entre os dois casos é só a duração do timeout
-  // (no_action_timeout vs unpaid_timeout), não o destino.
-  it("apresenta botão de compra offer:0 e agenda o timeout de sem ação via __pending", async () => {
+  // "Sem ação" (nunca clicou) tem handle PRÓPRIO (__no_action) de novo — a UI
+  // voltou a expor as duas linhas/conexões por oferta (OfferNode.tsx). Um
+  // funil salvo ANTES dessa correção (commit e8657f94 migrou os dados de
+  // produção trocando __no_action por __pending) só tem a conexão __pending —
+  // por isso `scheduleOfferTimeouts` tenta __no_action primeiro e cai pra
+  // __pending quando não encontra aresta com esse handle. Este teste cobre
+  // justamente o funil "antigo" (só __pending salvo).
+  it("apresenta botão de compra offer:0 e agenda o timeout de sem ação via __pending (funil antigo, sem __no_action salvo)", async () => {
     const handle = "promo";
-    const { bot } = await setupOffer({
+    const { bot, nodeIds } = await setupOffer({
       offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
       extraConns: [{ from: "off", to: "pending", handle: `${handle}__pending` }],
     });
@@ -55,7 +58,25 @@ describe("offer node — apresentação e compra", () => {
 
     const db = await testDb();
     const delays = await db.select().from(scheduledDelays);
-    expect(delays.length).toBe(1); // timeout de "sem ação" agendado pro handle __pending
+    expect(delays.length).toBe(1); // timeout de "sem ação" agendado, via fallback __pending
+    expect(delays[0].nextNodeId).toBe(nodeIds.pending);
+  });
+
+  it("com __no_action e __pending conectados, o timeout de sem ação usa __no_action (handle próprio tem prioridade)", async () => {
+    const handle = "promo";
+    const { bot, nodeIds } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      extraConns: [
+        { from: "off", to: "noact", handle: `${handle}__no_action` },
+        { from: "off", to: "pending", handle: `${handle}__pending` },
+      ],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(706) });
+
+    const db = await testDb();
+    const delays = await db.select().from(scheduledDelays);
+    expect(delays.length).toBe(1);
+    expect(delays[0].nextNodeId).toBe(nodeIds.noact); // __no_action, não __pending
   });
 
   it("clique gera PIX em CENTAVOS, persiste payment e envia QR + copia-e-cola", async () => {
@@ -438,6 +459,103 @@ describe("ofertas embutidas em nó message (block.type=offer)", () => {
     const db = await testDb();
     const [pay] = await db.select().from(payments);
     expect(pay.amount).toBe(1000);
+  });
+});
+
+// Bug do backlog: duas ofertas do mesmo nó com o mesmo callback/product_name
+// (ou ambos vazios) derivavam o MESMO handleId — o editor só deixava conectar
+// uma das duas. collectNodeOffers precisa desempatar exatamente como
+// OfferNode.tsx: 1ª ocorrência usa a base direto, ocorrências seguintes
+// ganham sufixo `#2`, `#3`...
+describe("collectNodeOffers — desempate de handleId entre ofertas do mesmo nó", () => {
+  it("callbacks iguais: a 2ª ocorrência ganha sufixo #2", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { product_name: "Curso A", callback: "promo" },
+        { product_name: "Curso B", callback: "promo" },
+      ],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["promo", "promo#2"]);
+  });
+
+  it("nomes iguais (sem callback): a 2ª ocorrência ganha sufixo #2", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { product_name: "Curso" },
+        { product_name: "Curso" },
+      ],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["Curso", "Curso#2"]);
+  });
+
+  it("ambos vazios: cai no fallback offer_<i>, já único por índice — sem sufixo", () => {
+    const list = collectNodeOffers({
+      offers: [{}, {}],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["offer_0", "offer_1"]);
+  });
+
+  it("mistura vazio/preenchido: só as bases realmente repetidas ganham sufixo", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { callback: "promo" },     // "promo"
+        {},                        // "offer_1" (fallback por índice, não colide)
+        { product_name: "promo" }, // "promo" de novo → repetida
+      ],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["promo", "offer_1", "promo#2"]);
+  });
+
+  it("3+ ofertas com a mesma base: sufixos incrementam #2, #3, #4", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { callback: "vip" },
+        { callback: "vip" },
+        { callback: "vip" },
+        { callback: "vip" },
+      ],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["vip", "vip#2", "vip#3", "vip#4"]);
+  });
+
+  it("preserva a ordem do array `offers` (mesma ordem que offers.map usa no frontend)", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { callback: "z" },
+        { callback: "a" },
+        { callback: "m" },
+      ],
+    });
+    expect(list.map((o) => o.handleId)).toEqual(["z", "a", "m"]);
+  });
+
+  // Achado da auditoria de segurança: contar ocorrências só da BASE ("promo")
+  // deixava passar uma colisão de 2ª ordem. A: "promo" → id "promo". B: "promo"
+  // duplicada → auto-sufixo "promo#2". C: callback LITERAL "promo#2"
+  // (coincidência, ou alguém digitou isso sem saber do algoritmo interno) —
+  // contando por base, C seria "1ª ocorrência da base 'promo#2'" e ganharia o
+  // MESMO id já dado a B. Duas ofertas diferentes com o mesmo handleId é
+  // exatamente o bug que a dedupe existe pra evitar — handlePaidOffer resolve
+  // a oferta a entregar por `.find()` no array (pega a PRIMEIRA que bater), e
+  // quem pagasse por C receberia a entrega configurada pra B. O algoritmo
+  // correto verifica contra TODOS os ids já atribuídos (literais ou gerados),
+  // não só contra a base, e incrementa o sufixo até achar um livre.
+  it("callback literal igual ao sufixo auto-gerado não colide com a oferta que gerou esse sufixo", () => {
+    const list = collectNodeOffers({
+      offers: [
+        { product_name: "A", callback: "promo" },      // "promo"
+        { product_name: "B", callback: "promo" },       // "promo" repetida → "promo#2"
+        { product_name: "C", callback: "promo#2" },     // literal igual ao sufixo de B
+      ],
+    });
+    const ids = list.map((o) => o.handleId);
+    expect(ids).toEqual(["promo", "promo#2", "promo#2#2"]);
+    expect(new Set(ids).size).toBe(3); // nenhum handleId repetido entre ofertas diferentes
+
+    // A oferta certa continua recuperável por handleId (é o que handlePaidOffer
+    // usa pra decidir o que entregar quando o pagamento confirma).
+    expect(list.find((o) => o.handleId === "promo#2")?.offer.product_name).toBe("B");
+    expect(list.find((o) => o.handleId === "promo#2#2")?.offer.product_name).toBe("C");
   });
 });
 
