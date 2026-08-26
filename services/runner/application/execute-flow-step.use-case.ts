@@ -1550,7 +1550,17 @@ export class ExecuteFlowStepUseCase {
   // reescreveu). `kind === "unpaid"` (PIX gerado, não pago) nunca mudou: é
   // sempre `__pending`, próprio ou não.
   //
-  // Agenda um delay por oferta cujo handle resolvido tenha conexão.
+  // Agenda um delay por DESTINO resolvido (não por oferta) — dedupe por
+  // `target`. Incidente real em produção: um nó com N ofertas cujos handles
+  // __pending/__no_action apontavam TODAS pro mesmo nó de downsell (padrão
+  // comum: "um downsell só, pra qualquer oferta não paga") inseria N linhas
+  // IDÊNTICAS em `scheduled_delays` (mesmo progressId+nextNodeId+executeAt).
+  // O worker processa cada linha independente e reexecuta o nó de destino
+  // uma vez por linha; como esse destino também tinha ofertas, cada
+  // execução agendava mais N — fan-out exponencial (3^k a cada ciclo) até
+  // ~700+ mensagens/hora pra um único lead. Resolver os targets num Set
+  // antes de inserir garante no máximo 1 delay por destino distinto, não
+  // importa quantas ofertas apontem pra ele.
   // `onlyHandleId`: só a oferta que o lead clicou (kind="unpaid").
   private async scheduleOfferTimeouts(
     funnelId:     string,
@@ -1569,6 +1579,7 @@ export class ExecuteFlowStepUseCase {
       : unpaidMin;
     const executeAt  = new Date(Date.now() + Math.max(60, timeoutMin * 60) * 1000);
 
+    const targets = new Set<string>();
     for (const { handleId } of offersList) {
       if (onlyHandleId !== undefined && handleId !== onlyHandleId) continue;
       let target = kind === "no_action"
@@ -1576,6 +1587,9 @@ export class ExecuteFlowStepUseCase {
         : null;
       if (!target) target = await nextNode(funnelId, node.id, `${handleId}__pending`);
       if (!target) continue;
+      targets.add(target);
+    }
+    for (const target of targets) {
       await db.insert(scheduledDelays).values({
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
       });
