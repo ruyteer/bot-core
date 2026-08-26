@@ -6,13 +6,16 @@ import {
   normalizeNexuspagWebhook, normalizeWiinpayWebhook,
   __resetSyncpayWebhookCacheForTests,
 } from "./application/gateway-clients.js";
+import { resolveEffectiveSplit } from "./application/split-config.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { processWebhookEvent } from "./webhooks.js";
 import { testDb } from "../../test/helpers/db.js";
-import { payments, processedWebhooks, paymentWebhookLogs } from "../shared/schema/index.js";
+import {
+  payments, processedWebhooks, paymentWebhookLogs, platformConfig,
+  paymentRevenueCredits, referrals, referralCommissions, userRoles,
+} from "../shared/schema/index.js";
 import { createBot, createGateway, createLead, createProfile } from "../../test/helpers/seed.js";
-import { userRoles } from "../shared/schema/index.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
 import { forceGatewayError, getOtherCalls } from "../../test/helpers/fetch-mock.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
@@ -97,76 +100,211 @@ describe("syncpay — registro automático do webhook", () => {
   });
 });
 
-// ── Split de monetização (40c da plataforma) ────────────────────────────────
-describe("split por provider", () => {
+// ── Split de monetização — repasse do objeto resolvido pro body do provider ──
+// createPix não decide mais split sozinho (era a causa raiz do bug: cada
+// consumidor tinha sua própria lógica); ele só repassa o split já resolvido.
+// A decisão em si (precedência admin/USER_SPLIT_FEE_CENTS/<GW>_SPLIT_*/secret)
+// é coberta abaixo em "resolveEffectiveSplit — precedência do split efetivo".
+describe("createPix — split efetivo (repasse pro body do provider)", () => {
   const CASES = [
-    { p: "syncpay",  env: "SYNCPAY_SPLIT_USER_ID",  recv: "rc-sync",       urlPart: "cash-in" },
-    { p: "nexuspag", env: "NEXUSPAG_SPLIT_USER_ID", recv: "rc-nex",        urlPart: "nexuspag" },
-    { p: "wiinpay",  env: "WIINPAY_SPLIT_USER_ID",  recv: "rc-wiin",       urlPart: "wiinpay" },
-    { p: "buckpay",  env: "BUCKPAY_SPLIT_EMAIL",    recv: "x@orion.app",   urlPart: "realtechdev" },
+    { p: "syncpay",  recv: "rc-sync",     urlPart: "cash-in" },
+    { p: "nexuspag", recv: "rc-nex",      urlPart: "nexuspag" },
+    { p: "wiinpay",  recv: "rc-wiin",     urlPart: "wiinpay" },
+    { p: "buckpay",  recv: "x@orion.app", urlPart: "realtechdev" },
   ] as const;
 
   for (const c of CASES) {
-    it(`${c.p}: sem secret NÃO envia split`, async () => {
+    it(`${c.p}: sem split (omitido) NÃO envia split`, async () => {
       await createPix(c.p as any, "client", "secret", 600, "P", "https://wh");
       const call = getOtherCalls().find((x) => x.url.includes(c.urlPart));
       expect(call?.body?.split ?? call?.body?.splits).toBeUndefined();
     });
 
-    it(`${c.p}: com secret envia split para o recebedor`, async () => {
-      process.env[`TEST_SECRET_${c.env}`] = c.recv;
-      try {
-        await createPix(c.p as any, "client", "secret", 600, "P", "https://wh");
-        const call = getOtherCalls().find((x) => x.url.includes(c.urlPart));
-        const split = call?.body?.split ?? call?.body?.splits;
-        expect(split).toBeDefined();
-        expect(JSON.stringify(split)).toContain(c.recv);
-      } finally {
-        delete process.env[`TEST_SECRET_${c.env}`];
-      }
+    it(`${c.p}: com split resolvido envia para o recebedor`, async () => {
+      await createPix(c.p as any, "client", "secret", 600, "P", "https://wh", { split: { receiver: c.recv, cents: 40 } });
+      const call = getOtherCalls().find((x) => x.url.includes(c.urlPart));
+      const split = call?.body?.split ?? call?.body?.splits;
+      expect(split).toBeDefined();
+      expect(JSON.stringify(split)).toContain(c.recv);
     });
   }
 
-  it("syncpay: percentual inteiro arredonda pra cima (600c → 7%)", async () => {
-    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc";
+  it("syncpay: percentual inteiro arredonda pra cima (600c, alvo 40c → 7%)", async () => {
+    await createPix("syncpay", "c", "s", 600, "P", "https://wh", { split: { receiver: "rc", cents: 40 } });
+    const call = getOtherCalls().find((x) => x.url.includes("cash-in"));
+    expect((call!.body!.split as any)[0].percentage).toBe(7); // ceil(40/600*100)=7
+  });
+
+  it("syncpay: percentual recalcula pro valor efetivo (600c, alvo 150c → 25%)", async () => {
+    await createPix("syncpay", "c", "s", 600, "P", "https://wh", { split: { receiver: "rc", cents: 150 } });
+    const call = getOtherCalls().find((x) => x.url.includes("cash-in"));
+    expect((call!.body!.split as any)[0].percentage).toBe(25); // ceil(150/600*100)=25
+  });
+
+  it("buckpay: split em valor fixo, exatamente os centavos resolvidos", async () => {
+    await createPix("buckpay", "c", "s", 600, "P", "https://wh", { split: { receiver: "x@y.com", cents: 40 } });
+    const call = getOtherCalls().find((x) => x.url.includes("realtechdev"));
+    expect((call!.body!.splits as any)[0].amount_cents).toBe(40);
+  });
+
+  it("nexuspag/wiinpay: valor fixo em reais = centavos resolvidos / 100", async () => {
+    await createPix("nexuspag", "c", "s", 600, "P", "https://wh", { split: { receiver: "rc", cents: 40 } });
+    await createPix("wiinpay", "c", "s", 600, "P", "https://wh", { split: { receiver: "rc", cents: 40 } });
+    const nx = getOtherCalls().find((x) => x.url.includes("nexuspag"));
+    const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
+    expect((nx!.body!.split as any)[0].amount).toBe(0.4);
+    expect((wp!.body!.split as any).value).toBe(0.4);
+  });
+
+  it("split null (resolvido fora como admin) NÃO envia split mesmo com secret configurado", async () => {
+    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
     try {
-      await createPix("syncpay", "c", "s", 600, "P", "https://wh");
-      const call = getOtherCalls().find((x) => x.url.includes("cash-in"));
-      expect((call!.body!.split as any)[0].percentage).toBe(7); // ceil(40/600*100)=7
+      await createPix("wiinpay", "c", "s", 600, "P", "https://wh", { split: null });
+      const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
+      expect(wp!.body!.split).toBeUndefined();
+    } finally { delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID; }
+  });
+});
+
+// ── resolveEffectiveSplit — a decisão em si (precedência) ───────────────────
+// Fonte única de verdade que faltava: o admin escrevia USER_SPLIT_FEE_CENTS_*
+// e <GW>_SPLIT_ENABLED/_USER_ID/_FEE_CENTS em platform_config, mas nada disso
+// era lido — o PIX real só olhava os secrets do Encore. Ver
+// services/payments/application/split-config.ts para a precedência completa.
+describe("resolveEffectiveSplit — precedência do split efetivo", () => {
+  const PROVIDERS = ["syncpay", "buckpay", "nexuspag", "wiinpay"] as const;
+  const RECEIVER_ENV: Record<(typeof PROVIDERS)[number], string> = {
+    syncpay:  "SYNCPAY_SPLIT_USER_ID",
+    nexuspag: "NEXUSPAG_SPLIT_USER_ID",
+    wiinpay:  "WIINPAY_SPLIT_USER_ID",
+    buckpay:  "BUCKPAY_SPLIT_EMAIL",
+  };
+
+  it("sem nenhuma config no painel: cai no secret + PLATFORM_SPLIT_CENTS (comportamento antigo)", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-fallback";
+    try {
+      const seller = await createProfile();
+      expect(await resolveEffectiveSplit("syncpay", seller)).toEqual({ receiver: "rc-fallback", cents: 40 });
     } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
   });
 
-  it("buckpay: split em valor fixo de 40 centavos", async () => {
-    process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL = "x@y.com";
-    try {
-      await createPix("buckpay", "c", "s", 600, "P", "https://wh");
-      const call = getOtherCalls().find((x) => x.url.includes("realtechdev"));
-      expect((call!.body!.splits as any)[0].amount_cents).toBe(40);
-    } finally { delete process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL; }
+  it("sem secret e sem config nenhuma: sem split", async () => {
+    const seller = await createProfile();
+    expect(await resolveEffectiveSplit("syncpay", seller)).toBeNull();
   });
 
-  it("nexuspag/wiinpay: valor fixo de 40 centavos", async () => {
-    process.env.TEST_SECRET_NEXUSPAG_SPLIT_USER_ID = "rc";
-    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
-    try {
-      await createPix("nexuspag", "c", "s", 600, "P", "https://wh");
-      await createPix("wiinpay", "c", "s", 600, "P", "https://wh");
-      const nx = getOtherCalls().find((x) => x.url.includes("nexuspag"));
-      const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
-      expect((nx!.body!.split as any)[0].amount).toBe(0.4);
-      expect((wp!.body!.split as any).value).toBe(0.4);
-    } finally {
-      delete process.env.TEST_SECRET_NEXUSPAG_SPLIT_USER_ID;
-      delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID;
-    }
+  it("admin da plataforma: sempre sem split, mesmo com <GW>_SPLIT_ENABLED=true configurado", async () => {
+    const db = await testDb();
+    const admin = await createProfile();
+    await db.insert(userRoles).values({ userId: admin, role: "admin" });
+    await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_ENABLED", value: "true" });
+    await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_USER_ID", value: "rc" });
+    expect(await resolveEffectiveSplit("syncpay", admin)).toBeNull();
   });
 
-  it("skipSplit NÃO envia split mesmo com o secret configurado (admin)", async () => {
-    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc";
+  for (const p of PROVIDERS) {
+    it(`${p}: USER_SPLIT_FEE_CENTS_<user>=0 → taxa zerada explicitamente, sem split`, async () => {
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: `USER_SPLIT_FEE_CENTS_${seller}`, value: "0" });
+      expect(await resolveEffectiveSplit(p, seller)).toBeNull();
+    });
+
+    it(`${p}: <GW>_SPLIT_ENABLED=false desliga o split desse gateway mesmo com secret configurado`, async () => {
+      process.env[`TEST_SECRET_${RECEIVER_ENV[p]}`] = "rc";
+      try {
+        const db = await testDb();
+        const seller = await createProfile();
+        await db.insert(platformConfig).values({ key: `${p.toUpperCase()}_SPLIT_ENABLED`, value: "false" });
+        expect(await resolveEffectiveSplit(p, seller)).toBeNull();
+      } finally { delete process.env[`TEST_SECRET_${RECEIVER_ENV[p]}`]; }
+    });
+  }
+
+  it("<GW>_SPLIT_FEE_CENTS custom sobrescreve o valor do secret/default", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-secret";
     try {
-      await createPix("wiinpay", "c", "s", 600, "P", "https://wh", { skipSplit: true });
-      const wp = getOtherCalls().find((x) => x.url.includes("wiinpay"));
-      expect(wp!.body!.split).toBeUndefined();
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_FEE_CENTS", value: "150" });
+      expect(await resolveEffectiveSplit("syncpay", seller)).toEqual({ receiver: "rc-secret", cents: 150 });
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
+  });
+
+  it("<GW>_SPLIT_USER_ID custom sobrescreve o recebedor do secret", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-secret";
+    try {
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_USER_ID", value: "rc-painel" });
+      expect(await resolveEffectiveSplit("syncpay", seller)).toEqual({ receiver: "rc-painel", cents: 40 });
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
+  });
+
+  it("USER_SPLIT_FEE_CENTS_<user> custom vale mesmo com <GW>_SPLIT_ENABLED=false (usuário tem precedência sobre gateway)", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-secret";
+    try {
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_ENABLED", value: "false" });
+      await db.insert(platformConfig).values({ key: `USER_SPLIT_FEE_CENTS_${seller}`, value: "70" });
+      expect(await resolveEffectiveSplit("syncpay", seller)).toEqual({ receiver: "rc-secret", cents: 70 });
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
+  });
+});
+
+// ── Fluxo completo até o body do PIX (createPixWithFallback) ────────────────
+describe("split efetivo — fluxo completo createPixWithFallback → body do PIX", () => {
+  const PROVIDERS = ["syncpay", "buckpay", "nexuspag", "wiinpay"] as const;
+  const URL_PART: Record<(typeof PROVIDERS)[number], string> = {
+    syncpay: "cash-in", buckpay: "realtechdev", nexuspag: "nexuspag", wiinpay: "wiinpay",
+  };
+
+  for (const p of PROVIDERS) {
+    it(`${p}: taxa zerada (USER_SPLIT_FEE_CENTS_<user>=0) → PIX sem split/splits no body`, async () => {
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: `USER_SPLIT_FEE_CENTS_${seller}`, value: "0" });
+      const gwId = await createGateway({ userId: seller, provider: p });
+      const gw = (await gwRepo.findByIdOwned(gwId, seller))!;
+
+      await createPixWithFallback([gw], {
+        amountCents: 1000, description: "P", webhookUrl: () => `https://wh/${p}`, ownerUserId: seller,
+      });
+      const call = getOtherCalls().filter((x) => x.url.includes(URL_PART[p])).at(-1);
+      expect(call?.body?.split ?? call?.body?.splits).toBeUndefined();
+    });
+  }
+
+  it("<GW>_SPLIT_ENABLED=false → PIX sem split", async () => {
+    const db = await testDb();
+    const seller = await createProfile();
+    await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_ENABLED", value: "false" });
+    const gwId = await createGateway({ userId: seller, provider: "syncpay" });
+    const gw = (await gwRepo.findByIdOwned(gwId, seller))!;
+
+    await createPixWithFallback([gw], {
+      amountCents: 1000, description: "P", webhookUrl: () => "https://wh/syncpay", ownerUserId: seller,
+    });
+    const call = getOtherCalls().filter((x) => x.url.includes("cash-in")).at(-1);
+    expect(call?.body?.split).toBeUndefined();
+  });
+
+  it("<GW>_SPLIT_FEE_CENTS custom → PIX sai com o valor certo no body", async () => {
+    process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID = "rc-secret";
+    try {
+      const db = await testDb();
+      const seller = await createProfile();
+      await db.insert(platformConfig).values({ key: "WIINPAY_SPLIT_FEE_CENTS", value: "150" });
+      const gwId = await createGateway({ userId: seller, provider: "wiinpay" });
+      const gw = (await gwRepo.findByIdOwned(gwId, seller))!;
+
+      await createPixWithFallback([gw], {
+        amountCents: 1000, description: "P", webhookUrl: () => "https://wh/wiinpay", ownerUserId: seller,
+      });
+      const call = getOtherCalls().filter((x) => x.url.includes("wiinpay")).at(-1);
+      expect((call!.body!.split as any).value).toBe(1.5); // 150 centavos = R$ 1,50
+      expect((call!.body!.split as any).user_id).toBe("rc-secret");
     } finally { delete process.env.TEST_SECRET_WIINPAY_SPLIT_USER_ID; }
   });
 });
@@ -341,6 +479,64 @@ describe("processWebhookEvent", () => {
     const [log] = await db.select().from(paymentWebhookLogs)
       .where(eq(paymentWebhookLogs.externalId, "id-de-outro-lugar"));
     expect(log.errorMessage).toContain("não corresponde a nenhum pagamento");
+  });
+});
+
+// ── processWebhookEvent — receita e comissão seguem o MESMO split efetivo ───
+// Regressão do bug: creditPlatformRevenue já checava se havia split real, mas
+// accrueReferralCommission não — acumulava comissão mesmo quando o gateway
+// tinha o split desligado no painel (<GW>_SPLIT_ENABLED=false), divergindo do
+// que de fato foi cobrado no PIX.
+describe("processWebhookEvent — receita e comissão seguem o split efetivo", () => {
+  it("gateway com split desligado: venda é aprovada, mas SEM receita da plataforma e SEM comissão de indicação", async () => {
+    const db = await testDb();
+    const referrer = await createProfile();
+    const bot = await createBot();
+    const seller = bot.userId;
+    await db.insert(referrals).values({ referredUserId: seller, referrerUserId: referrer });
+    await db.insert(platformConfig).values({ key: "BUCKPAY_SPLIT_ENABLED", value: "false" });
+    const gwId = await createGateway({ userId: seller, provider: "buckpay" });
+    const p = await payRepo.create({
+      userId: seller, botId: bot.id, gatewayId: gwId,
+      amount: 1990, status: "pending", externalId: "wh-no-split", pixCode: "PIX", leadId: null,
+    });
+
+    await processWebhookEvent({ externalId: "wh-no-split", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, {});
+
+    expect((await payRepo.findById(p.id))!.status).toBe("paid"); // venda aprovada normalmente
+
+    const revenue = await db.select().from(paymentRevenueCredits).where(eq(paymentRevenueCredits.paymentId, p.id));
+    expect(revenue).toHaveLength(0);
+
+    const commissions = await db.select().from(referralCommissions).where(eq(referralCommissions.paymentId, p.id));
+    expect(commissions).toHaveLength(0);
+  });
+
+  it("gateway com split ativo (secret configurado): venda paga credita receita E comissão de indicação", async () => {
+    process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL = "plataforma@orion.app";
+    try {
+      const db = await testDb();
+      const referrer = await createProfile();
+      const bot = await createBot();
+      const seller = bot.userId;
+      await db.insert(referrals).values({ referredUserId: seller, referrerUserId: referrer });
+      const gwId = await createGateway({ userId: seller, provider: "buckpay" });
+      const p = await payRepo.create({
+        userId: seller, botId: bot.id, gatewayId: gwId,
+        amount: 1990, status: "pending", externalId: "wh-with-split", pixCode: "PIX", leadId: null,
+      });
+
+      await processWebhookEvent({ externalId: "wh-with-split", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, {});
+
+      const revenue = await db.select().from(paymentRevenueCredits).where(eq(paymentRevenueCredits.paymentId, p.id));
+      expect(revenue).toHaveLength(1);
+      expect(revenue[0].amount).toBe(40); // PLATFORM_SPLIT_CENTS fallback
+
+      const commissions = await db.select().from(referralCommissions).where(eq(referralCommissions.paymentId, p.id));
+      expect(commissions).toHaveLength(1);
+      expect(commissions[0].baseFeeCents).toBe(40);
+      expect(commissions[0].amountCents).toBe(8); // 20% de 40
+    } finally { delete process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL; }
   });
 });
 

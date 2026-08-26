@@ -4,7 +4,7 @@ import { encoreExternalUrl } from "../config/secrets.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { createPix } from "./application/gateway-clients.js";
-import { isPlatformAdmin } from "../shared/roles.js";
+import { resolveEffectiveSplit } from "./application/split-config.js";
 import { db } from "../shared/database.js";
 import { leads } from "../shared/schema/index.js";
 import { inArray } from "drizzle-orm";
@@ -235,11 +235,13 @@ export const testGateway = api(
     const externalUrl = encoreExternalUrl();
     const webhookUrl  = `${externalUrl}/payments/webhook/${gw.provider}`;
 
-    // Admin testando não paga a taxa da plataforma → PIX de teste sem split.
-    const skipSplit = await isPlatformAdmin(userId);
+    // Mesma resolução de split usada no PIX real, pra o teste refletir
+    // exatamente o que uma venda de verdade faria (admin, taxa custom, gateway
+    // com split desligado etc.).
+    const split = await resolveEffectiveSplit(gw.provider, userId);
 
     try {
-      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl, { skipSplit });
+      const result = await createPix(gw.provider, clientId, clientSecret, 1000, "Teste OrionBot R$ 10,00", webhookUrl, { split });
       return { success: true, ...result };
     } catch (err) {
       // Sem isso o Encore converte o Error em "internal error" genérico e o
