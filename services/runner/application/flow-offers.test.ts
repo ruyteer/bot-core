@@ -122,6 +122,71 @@ describe("offer node — apresentação e compra", () => {
   });
 });
 
+// Incidente real de produção: um nó com N ofertas cujos handles __pending
+// apontavam TODAS pro mesmo nó de downsell inseria N linhas idênticas em
+// scheduled_delays; o worker reexecutava o destino uma vez por linha e, como
+// esse destino também tinha ofertas, cada execução agendava mais N — fan-out
+// exponencial (3^k por ciclo) até ~700+ mensagens/hora pra um único lead.
+describe("scheduleOfferTimeouts — dedupe por destino (fan-out exponencial)", () => {
+  it("3 ofertas cujo __pending aponta pro MESMO destino agendam só 1 delay (dedupe por destino, não por oferta)", async () => {
+    const bot = await createBot();
+    const gwId = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const offers = ["a", "b", "c"].map((h) => ({
+      gateway_id: gwId, product_name: `Plano ${h}`, price: 19.9, callback: h, button_text: "Comprar",
+    }));
+    const { nodeIds } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "off", type: "offer", content: { offers, unpaid_timeout: 5 } },
+        { key: "downsell", type: "message", content: { message: "DOWNSELL-UNICO" } },
+      ],
+      connections: [
+        { from: "t", to: "off" },
+        { from: "off", to: "downsell", handle: "a__pending" },
+        { from: "off", to: "downsell", handle: "b__pending" },
+        { from: "off", to: "downsell", handle: "c__pending" },
+      ],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(710) });
+
+    const db = await testDb();
+    const delays = await db.select().from(scheduledDelays);
+    expect(delays.length).toBe(1); // não 3 — dedupe pelo mesmo nextNodeId
+    expect(delays[0].nextNodeId).toBe(nodeIds.downsell);
+  });
+
+  it("3 ofertas com destinos DIFERENTES continuam agendando 3 delays (dedupe não é agressivo demais)", async () => {
+    const bot = await createBot();
+    const gwId = await createGateway({ userId: bot.userId, provider: "buckpay" });
+    const offers = ["a", "b", "c"].map((h) => ({
+      gateway_id: gwId, product_name: `Plano ${h}`, price: 19.9, callback: h, button_text: "Comprar",
+    }));
+    const { nodeIds } = await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "off", type: "offer", content: { offers, unpaid_timeout: 5 } },
+        { key: "downsellA", type: "message", content: { message: "DOWNSELL-A" } },
+        { key: "downsellB", type: "message", content: { message: "DOWNSELL-B" } },
+        { key: "downsellC", type: "message", content: { message: "DOWNSELL-C" } },
+      ],
+      connections: [
+        { from: "t", to: "off" },
+        { from: "off", to: "downsellA", handle: "a__pending" },
+        { from: "off", to: "downsellB", handle: "b__pending" },
+        { from: "off", to: "downsellC", handle: "c__pending" },
+      ],
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(711) });
+
+    const db = await testDb();
+    const delays = await db.select().from(scheduledDelays);
+    const targets = delays.map((d) => d.nextNodeId).sort();
+    expect(targets).toEqual([nodeIds.downsellA, nodeIds.downsellB, nodeIds.downsellC].sort());
+  });
+});
+
 // Resolução reversa de escopo: o clique num botão de OFERTA antigo (teclado já
 // entregue antes de o timeout "sem ação" mover o lead pra outro nó) deve
 // resolver contra o nó de ORIGEM (achado pelo escopo embutido no callback), em
