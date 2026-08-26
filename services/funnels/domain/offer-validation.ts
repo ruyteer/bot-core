@@ -115,3 +115,70 @@ export function assertRawOfferComplete(offer: RawNodeOffer, label = "a oferta"):
     }
   }
 }
+
+/**
+ * Shape de um item de oferta do funil simplificado (`plans`/`upsells`/
+ * `downsells`/`order_bumps` dentro de `funnels.simplified_config`) — ver
+ * `DeliveryConfig`/`PlanItem`/`UpsellItem`/... em `src/types/simpleFunnel.ts`
+ * no repo `ui`. Mesmos 3 conceitos de `RawNodeOffer` (nome, preço, entrega),
+ * mas com nomes de campo diferentes (`name`/`price` direto, sem prefixo
+ * `product_`) e um terceiro tipo de entrega (`delivery_type: "text"`, via
+ * `delivery_text`) que o funil flow não tem.
+ */
+export interface RawSimplifiedOfferItem {
+  name?:          unknown;
+  price?:         unknown;
+  delivery_type?: unknown;
+  delivery_url?:  unknown;
+  delivery_text?: unknown;
+  vip_group_id?:  unknown;
+}
+
+/** Espelha `isOfferStarted` do frontend para o shape do funil simplificado. */
+export function isSimplifiedOfferStarted(item: RawSimplifiedOfferItem): boolean {
+  const hasName  = typeof item.name === "string" && item.name.trim().length > 0;
+  const hasPrice = typeof item.price === "number" && Number.isFinite(item.price) && item.price > 0;
+  return hasName || hasPrice;
+}
+
+/**
+ * Espelha `validateOfferListItem` do frontend (`src/lib/offerValidation.ts`
+ * no repo `ui`): só valida quando o item está "iniciado" (ver
+ * `isSimplifiedOfferStarted`), e `delivery_type` decide qual campo de entrega
+ * é obrigatório (`vip_group` → `vip_group_id`, `text` → `delivery_text`,
+ * `content`/default → `delivery_url`).
+ */
+export function assertSimplifiedOfferComplete(item: RawSimplifiedOfferItem, label = "a oferta"): void {
+  if (!isSimplifiedOfferStarted(item)) return;
+
+  assertNameAndPrice(
+    typeof item.name === "string" ? item.name : null,
+    typeof item.price === "number" ? item.price : null,
+    label,
+  );
+
+  // Espelha `deliveryTypeOf` em `execute-simplified-funnel.use-case.ts`: sem
+  // `delivery_type` explícito, um `vip_group_id` preenchido já basta pra
+  // inferir "vip_group" (shape legado/da UI que nunca grava `delivery_type`
+  // sozinho). Sem essa mesma inferência aqui, um item que entrega certinho em
+  // produção seria rejeitado na ativação pedindo "URL de entrega".
+  const type = typeof item.delivery_type === "string" && item.delivery_type
+    ? item.delivery_type
+    : item.vip_group_id ? "vip_group" : "content";
+  if (type === "vip_group") {
+    const groupId = typeof item.vip_group_id === "string" ? item.vip_group_id.trim() : "";
+    if (!groupId) {
+      throw APIError.invalidArgument(`${label} precisa de um grupo VIP do Telegram selecionado`);
+    }
+  } else if (type === "text") {
+    const text = typeof item.delivery_text === "string" ? item.delivery_text.trim() : "";
+    if (!text) {
+      throw APIError.invalidArgument(`${label} precisa de um texto de entrega`);
+    }
+  } else {
+    const url = typeof item.delivery_url === "string" ? item.delivery_url.trim() : "";
+    if (!url) {
+      throw APIError.invalidArgument(`${label} precisa de uma URL de entrega`);
+    }
+  }
+}

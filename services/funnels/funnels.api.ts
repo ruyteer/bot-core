@@ -2,7 +2,10 @@ import { api, APIError } from "encore.dev/api";
 import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { FunnelDrizzleRepository } from "./infrastructure/funnel.drizzle.repository.js";
-import { assertOfferComplete, assertRawOfferComplete, type RawNodeOffer } from "./domain/offer-validation.js";
+import {
+  assertOfferComplete, assertRawOfferComplete, assertSimplifiedOfferComplete,
+  type RawNodeOffer, type RawSimplifiedOfferItem,
+} from "./domain/offer-validation.js";
 import { collectNodeOffers } from "../runner/application/execute-flow-step.use-case.js";
 import type { FunnelWithBots, FunnelDetail, SaveFlowInput } from "./domain/funnel.entity.js";
 import { db } from "../shared/database.js";
@@ -68,6 +71,47 @@ function toDetailResponse(f: FunnelDetail): FunnelDetailResponse {
       sourceHandle: c.sourceHandle, targetNodeId: c.targetNodeId,
     })),
   };
+}
+
+// Um funil só pode ficar ATIVO (recebendo clientes de verdade) com todas as
+// ofertas "iniciadas" (nome ou preço preenchidos) completas — nome, preço e
+// entrega configurada. Rascunho (salvar/editar) NÃO passa mais por essa
+// checagem (ver `saveFlow`/`update` abaixo); só `activate`, pra não bloquear
+// edição mas ainda impedir "paga e não entrega, silenciosamente" em produção
+// (achado de revisão de segurança — ver `offer-validation.ts`).
+function assertFunnelReadyToActivate(detail: FunnelDetail): void {
+  if (detail.kind === "simplified") {
+    const cfg = (detail.simplifiedConfig ?? {}) as Record<string, unknown>;
+    const sections: Array<{ key: string; article: string }> = [
+      { key: "plans",       article: "o plano" },
+      { key: "upsells",     article: "o upsell" },
+      { key: "downsells",   article: "o downsell" },
+      { key: "order_bumps", article: "o order bump" },
+    ];
+    for (const { key, article } of sections) {
+      const items = cfg[key];
+      if (!Array.isArray(items)) continue;
+      items.forEach((item, i) => {
+        const raw = (item ?? {}) as RawSimplifiedOfferItem;
+        const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : `#${i + 1}`;
+        assertSimplifiedOfferComplete(raw, `não é possível ativar: ${article} "${name}"`);
+      });
+    }
+    return;
+  }
+
+  for (const node of detail.nodes) {
+    const content = (node.content ?? {}) as Record<string, unknown>;
+    const offers = collectNodeOffers(content);
+    for (const { offer, handleId } of offers) {
+      assertRawOfferComplete(offer as RawNodeOffer, `não é possível ativar: a oferta "${handleId}" no nó "${node.id}"`);
+    }
+    // Shape legado de oferta única — ver mesmo comentário em `saveFlow` (git
+    // blame / histórico): collectNodeOffers só lê `content.offers`/`content.blocks`.
+    if (!Array.isArray(content.offers) && typeof content.product_id === "string") {
+      assertRawOfferComplete(content as RawNodeOffer, `não é possível ativar: a oferta no nó "${node.id}"`);
+    }
+  }
 }
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────
@@ -139,6 +183,9 @@ export const activate = api(
   { method: "POST", path: "/funnels/:id/activate", expose: true, auth: true },
   async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
+    const detail = await repo.findByIdOwned(id, userId);
+    if (!detail) throw APIError.notFound("funnel not found");
+    assertFunnelReadyToActivate(detail);
     await repo.activate(id, userId);
     return { ok: true };
   },
@@ -157,32 +204,15 @@ export const deactivate = api(
 // PUT /funnels/:id/flow — save nodes + connections (full replace)
 //
 // Autosave genérico: dispara a cada edição (mover nó, conectar aresta, editar
-// texto), não só quando uma oferta é "finalizada" — por isso a validação
-// abaixo é tolerante a rascunho (assertRawOfferComplete só reprova uma oferta
-// "iniciada", nome ou preço preenchidos; vazia dos dois passa como rascunho
-// legítimo). Sem isso dava pra publicar um funil flow com uma oferta sem
-// entrega configurada dentro de um nó — diferente do funil simplificado, que
-// já bloqueia isso.
+// texto), não só quando uma oferta é "finalizada" — por isso NÃO valida mais
+// completude de oferta aqui (bloqueava até o autosave de um rascunho legítimo
+// — ver backlog `bug-ao-exportar-funis-97h57c`). A checagem foi movida para
+// `activate`: um funil só pode ficar ATIVO com todas as ofertas "iniciadas"
+// completas — ver `assertFunnelReadyToActivate` acima.
 export const saveFlow = api(
   { method: "PUT", path: "/funnels/:id/flow", expose: true, auth: true },
   async ({ id, nodes, connections }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
-    for (const node of nodes) {
-      const content = (node.content ?? {}) as Record<string, unknown>;
-      const offers = collectNodeOffers(content);
-      for (const { offer, handleId } of offers) {
-        assertRawOfferComplete(offer as RawNodeOffer, `a oferta "${handleId}" no nó "${node.id}"`);
-      }
-      // Shape legado de oferta única (sem array `content.offers`, campos soltos
-      // direto em `content` — `product_id`/`product_name`/...): collectNodeOffers
-      // (compartilhado com a entrega em runtime, não mexido aqui de propósito)
-      // só lê `content.offers`/`content.blocks`, então esse shape passa
-      // despercebido por ele. Valida separadamente só aqui, na validação —
-      // sem risco de afetar o casamento de callback/entrega em produção.
-      if (!Array.isArray(content.offers) && typeof content.product_id === "string") {
-        assertRawOfferComplete(content as RawNodeOffer, `a oferta no nó "${node.id}"`);
-      }
-    }
     await repo.saveFlow(id, userId, { nodes, connections });
     scanSourceAsync("funnel", id);
     return { ok: true };

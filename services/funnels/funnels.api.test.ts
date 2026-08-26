@@ -15,7 +15,7 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { createOffer, createOffersBulk, saveFlow } = await import("./funnels.api.js");
+const { createOffer, createOffersBulk, saveFlow, activate, update } = await import("./funnels.api.js");
 const repo = new FunnelDrizzleRepository();
 
 describe("assertOfferComplete", () => {
@@ -108,11 +108,11 @@ describe("createOffersBulk — validação server-side", () => {
   });
 });
 
-// Funil flow: `saveFlow` é autosave genérico (roda a cada edição de nó/aresta),
-// então a validação de oferta embutida num node precisa ser tolerante a
-// rascunho — só reprova quando nome OU preço já foi preenchido (oferta
-// "iniciada") e ainda assim falta algo. Ver services/funnels/domain/offer-validation.ts.
-describe("saveFlow — validação de oferta tolerante a rascunho", () => {
+// Funil flow: `saveFlow` é autosave genérico (roda a cada edição de nó/aresta)
+// e NÃO valida mais completude de oferta — bloqueava até o autosave de um
+// rascunho legítimo (backlog `bug-ao-exportar-funis-97h57c`). A checagem de
+// completude foi movida para `activate` (ver describe abaixo).
+describe("saveFlow — aceita qualquer oferta, completa ou não (validação movida pra activate)", () => {
   async function newFunnel(): Promise<string> {
     const bot = await createBot();
     const f = await repo.create({ userId: bot.userId, botId: bot.id, name: "F", kind: "flow" });
@@ -129,7 +129,7 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
     })).resolves.toEqual({ ok: true });
   });
 
-  it("rejeita oferta iniciada só com nome — falta preço e entrega", async () => {
+  it("aceita oferta iniciada só com nome — falta preço e entrega", async () => {
     const id = await newFunnel();
     await expect(saveFlow({
       id,
@@ -139,10 +139,10 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).rejects.toThrow(/preço/);
+    })).resolves.toEqual({ ok: true });
   });
 
-  it("rejeita oferta iniciada com nome e preço, mas sem entrega configurada", async () => {
+  it("aceita oferta iniciada com nome e preço, mas sem entrega configurada", async () => {
     const id = await newFunnel();
     await expect(saveFlow({
       id,
@@ -152,7 +152,7 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).rejects.toThrow(/entrega/);
+    })).resolves.toEqual({ ok: true });
   });
 
   it("aceita oferta completa num nó offer dedicado", async () => {
@@ -168,33 +168,7 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
     })).resolves.toEqual({ ok: true });
   });
 
-  it("aceita oferta completa num bloco de oferta dentro de um nó message", async () => {
-    const id = await newFunnel();
-    await expect(saveFlow({
-      id,
-      nodes: [{
-        id: crypto.randomUUID(), type: "message",
-        content: { blocks: [{ type: "offer", offers: [{ product_name: "Produto", price: 1000, delivery_url: "https://exemplo.com/produto" }] }] },
-        positionX: 0, positionY: 0,
-      }],
-      connections: [],
-    })).resolves.toEqual({ ok: true });
-  });
-
-  it("rejeita oferta incompleta escondida num bloco de oferta dentro de um nó message", async () => {
-    const id = await newFunnel();
-    await expect(saveFlow({
-      id,
-      nodes: [{
-        id: crypto.randomUUID(), type: "message",
-        content: { blocks: [{ type: "offer", offers: [{ product_name: "Produto", price: 0 }] }] },
-        positionX: 0, positionY: 0,
-      }],
-      connections: [],
-    })).rejects.toThrow(/preço/);
-  });
-
-  it("rejeita oferta vip_group com só delivery_url preenchido (backend não tem fallback entre campos, igual ao runtime de entrega)", async () => {
+  it("aceita oferta vip_group com só delivery_url preenchido (validação de tipo fica só pra activate)", async () => {
     const id = await newFunnel();
     await expect(saveFlow({
       id,
@@ -204,23 +178,10 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).rejects.toThrow(/grupo VIP/);
-  });
-
-  it("aceita oferta vip_group com telegram_group_id preenchido", async () => {
-    const id = await newFunnel();
-    await expect(saveFlow({
-      id,
-      nodes: [{
-        id: crypto.randomUUID(), type: "offer",
-        content: { offers: [{ product_name: "Produto", price: 1000, product_type: "vip_group", telegram_group_id: "-1001234567890" }] },
-        positionX: 0, positionY: 0,
-      }],
-      connections: [],
     })).resolves.toEqual({ ok: true });
   });
 
-  it("rejeita shape legado de oferta única (product_id direto em content, sem array offers) quando incompleto", async () => {
+  it("aceita shape legado de oferta única (product_id direto em content, sem array offers) mesmo incompleto", async () => {
     const id = await newFunnel();
     await expect(saveFlow({
       id,
@@ -230,7 +191,7 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).rejects.toThrow(/URL de entrega/);
+    })).resolves.toEqual({ ok: true });
   });
 
   it("não afeta funil sem nenhuma oferta (nós de trigger/mensagem comuns)", async () => {
@@ -244,5 +205,131 @@ describe("saveFlow — validação de oferta tolerante a rascunho", () => {
       ],
       connections: [{ id: crypto.randomUUID(), sourceNodeId: n1, sourceHandle: null, targetNodeId: n2 }],
     })).resolves.toEqual({ ok: true });
+  });
+});
+
+// `activate` é o gate real de completude agora: rascunho pode ser salvo
+// incompleto (ver describe acima), mas o funil só liga se todas as ofertas
+// "iniciadas" (nome ou preço preenchidos) estiverem completas — pra ambos os
+// tipos de funil (paridade flow/simplificado, ver CLAUDE.md).
+describe("activate — bloqueia funil com oferta incompleta (rascunho vazio passa)", () => {
+  async function newFlowFunnel(): Promise<string> {
+    const bot = await createBot();
+    const f = await repo.create({ userId: bot.userId, botId: bot.id, name: "F", kind: "flow" });
+    authUserId = bot.userId;
+    return f.id;
+  }
+
+  async function newSimplifiedFunnel(): Promise<string> {
+    const bot = await createBot();
+    const f = await repo.create({ userId: bot.userId, botId: bot.id, name: "F", kind: "simplified" });
+    authUserId = bot.userId;
+    return f.id;
+  }
+
+  it("funil flow: rejeita ativação com oferta iniciada e incompleta num nó offer", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { offers: [{ product_name: "Produto", price: 1000 }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*entrega/i);
+  });
+
+  it("funil flow: rejeita ativação com oferta vip_group sem telegram_group_id", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { offers: [{ product_name: "Produto", price: 1000, product_type: "vip_group", delivery_url: "https://exemplo.com" }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*grupo VIP/i);
+  });
+
+  it("funil flow: aceita ativação com oferta completa", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{
+        id: crypto.randomUUID(), type: "offer",
+        content: { offers: [{ product_name: "Produto", price: 1000, delivery_url: "https://x.com" }] },
+        positionX: 0, positionY: 0,
+      }],
+      connections: [],
+    });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  it("funil flow: aceita ativação quando a oferta está totalmente vazia (rascunho legítimo, não 'iniciada')", async () => {
+    const id = await newFlowFunnel();
+    await saveFlow({
+      id,
+      nodes: [{ id: crypto.randomUUID(), type: "offer", content: { offers: [{}] }, positionX: 0, positionY: 0 }],
+      connections: [],
+    });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  it("funil simplificado: rejeita ativação com plano iniciado sem entrega", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({ id, simplifiedConfig: { plans: [{ name: "Plano Básico", price: 1000 }] } });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*entrega/i);
+  });
+
+  // `deliveryTypeOf` em execute-simplified-funnel.use-case.ts infere "vip_group"
+  // quando `vip_group_id` está preenchido mesmo sem `delivery_type` explícito
+  // (shape legado/da UI). A validação de ativação precisa da mesma inferência
+  // — senão rejeitaria (pedindo "URL de entrega") um item que entrega certinho
+  // em produção.
+  it("funil simplificado: aceita plano com vip_group_id preenchido mesmo sem delivery_type explícito", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({ id, simplifiedConfig: { plans: [{ name: "Plano VIP", price: 1000, vip_group_id: "-100987" }] } });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  it("funil simplificado: rejeita ativação com upsell vip_group sem vip_group_id", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({
+      id,
+      simplifiedConfig: { upsells: [{ name: "Upsell VIP", price: 2000, delivery_type: "vip_group" }] },
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*grupo VIP/i);
+  });
+
+  it("funil simplificado: rejeita ativação com order bump de entrega tipo texto sem delivery_text", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({
+      id,
+      simplifiedConfig: { order_bumps: [{ name: "Bump", price: 500, delivery_type: "text" }] },
+    });
+    await expect(activate({ id })).rejects.toThrow(/não é possível ativar.*texto de entrega/i);
+  });
+
+  it("funil simplificado: aceita ativação quando plans/upsells/downsells/order_bumps estão completos", async () => {
+    const id = await newSimplifiedFunnel();
+    await update({
+      id,
+      simplifiedConfig: {
+        plans: [{ name: "Plano", price: 1000, delivery_type: "content", delivery_url: "https://x.com" }],
+        upsells: [{ name: "Upsell", price: 2000, delivery_type: "text", delivery_text: "acesse assim" }],
+        downsells: [{ name: "Downsell", price: 500, delivery_type: "vip_group", vip_group_id: "-100123" }],
+        order_bumps: [{ name: "Bump", price: 300, delivery_type: "content", delivery_url: "https://x.com/bump" }],
+      },
+    });
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
+  });
+
+  it("funil simplificado: aceita ativação quando não há nenhum item cadastrado (rascunho vazio)", async () => {
+    const id = await newSimplifiedFunnel();
+    await expect(activate({ id })).resolves.toEqual({ ok: true });
   });
 });
