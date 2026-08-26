@@ -634,7 +634,17 @@ export const referralWithdrawals = pgTable("referral_withdrawals", {
   processedBy: uuid("processed_by").references(() => profiles.id, { onDelete: "set null" }),
   processedAt: timestamp("processed_at", { withTimezone: true }),
   createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (t) => [index("referral_withdrawals_status_idx").on(t.status)]);
+}, (t) => [
+  index("referral_withdrawals_status_idx").on(t.status),
+  // Fecha a janela de corrida do saque de comissão: requestWithdrawal fazia
+  // check-then-act sem lock/transação entre o SELECT de "já existe pendente"
+  // e o INSERT — duas requisições concorrentes do mesmo usuário geravam dois
+  // saques "pending". Só um "pending" por user_id por vez — pago/rejeitado
+  // libera pra um novo saque.
+  uniqueIndex("referral_withdrawals_pending_user_unique")
+    .on(t.userId)
+    .where(sql`${t.status} = 'pending'`),
+]);
 
 // ─── COMPLIANCE ───────────────────────────────────────────────────────────────
 // Detecção passiva de conteúdo proibido. NÃO bloqueia salvar/enviar/cobrar — só

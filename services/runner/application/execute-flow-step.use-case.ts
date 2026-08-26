@@ -7,6 +7,7 @@ import {
 } from "../../shared/schema/index.js";
 import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
+import { isUniqueViolation } from "../../shared/db-errors.js";
 import { interpolate, mergeLeadFields } from "./interpolate.js";
 import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
 // Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
@@ -389,16 +390,6 @@ function saleTypeFromNodeContent(content: Record<string, unknown> | null | undef
 // ter chegado — seria reenviado pro lead pra sempre).
 function unpaidTimeoutMinutes(content: Record<string, unknown> & { unpaid_timeout?: number }): number {
   return typeof content.unpaid_timeout === "number" && content.unpaid_timeout > 0 ? content.unpaid_timeout : 5;
-}
-
-// SQLSTATE 23505 (unique_violation) — tanto o driver de produção (pg/
-// node-postgres) quanto o PGlite dos testes expõem o código e o nome da
-// constraint violada em `err.code`/`err.constraint`. Confere o NOME também,
-// pra não tratar qualquer unique_violation da tabela como "corrida do PIX".
-function isUniqueViolation(err: unknown, constraintName: string): boolean {
-  const e = err as { code?: string; constraint?: string; message?: string } | null | undefined;
-  if (!e || e.code !== "23505") return false;
-  return e.constraint === constraintName || (typeof e.message === "string" && e.message.includes(constraintName));
 }
 
 interface ExecutionContext {

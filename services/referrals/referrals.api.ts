@@ -3,6 +3,7 @@ import { getAuthData } from "~encore/auth";
 import { and, desc, eq, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import { db } from "../shared/database.js";
+import { isUniqueViolation } from "../shared/db-errors.js";
 import {
   profiles, userRoles, referralCodes, referrals,
   referralCommissions, referralWithdrawals,
@@ -185,19 +186,33 @@ export const requestWithdrawal = api(
       throw APIError.invalidArgument(`o saque mínimo é R$ ${(minW / 100).toFixed(2).replace(".", ",")}`);
     }
 
-    const [openRow] = await db.select({ id: referralWithdrawals.id })
-      .from(referralWithdrawals)
-      .where(and(eq(referralWithdrawals.userId, userId), eq(referralWithdrawals.status, "pending")))
-      .limit(1);
-    if (openRow) throw APIError.failedPrecondition("você já tem um saque pendente — aguarde o processamento");
-
     const { balance } = await balanceCentsFor(userId);
     if (amountCents > balance) throw APIError.failedPrecondition("saldo insuficiente");
 
-    const [row] = await db.insert(referralWithdrawals)
-      .values({ userId, amountCents, pixKey: key })
-      .returning({ id: referralWithdrawals.id });
-    return { id: row.id };
+    // Checagem + insert numa transação: reduz a janela da corrida, mas a barreira
+    // AUTORITATIVA é o índice único parcial (referral_withdrawals_pending_user_unique,
+    // migration 0015) — duas requisições concorrentes ainda podem passar pelo SELECT
+    // antes de qualquer INSERT completar, e é o catch abaixo que fecha essa janela.
+    try {
+      const row = await db.transaction(async (tx) => {
+        const [openRow] = await tx.select({ id: referralWithdrawals.id })
+          .from(referralWithdrawals)
+          .where(and(eq(referralWithdrawals.userId, userId), eq(referralWithdrawals.status, "pending")))
+          .limit(1);
+        if (openRow) throw APIError.failedPrecondition("você já tem um saque pendente — aguarde o processamento");
+
+        const [inserted] = await tx.insert(referralWithdrawals)
+          .values({ userId, amountCents, pixKey: key })
+          .returning({ id: referralWithdrawals.id });
+        return inserted;
+      });
+      return { id: row.id };
+    } catch (err) {
+      if (isUniqueViolation(err, "referral_withdrawals_pending_user_unique")) {
+        throw APIError.failedPrecondition("você já tem um saque pendente — aguarde o processamento");
+      }
+      throw err;
+    }
   },
 );
 
@@ -357,12 +372,36 @@ export const adminProcessWithdrawal = api(
     if (!row) throw APIError.notFound("saque não encontrado");
     if (row.status !== "pending") throw APIError.failedPrecondition("saque já processado");
 
-    await db.update(referralWithdrawals).set({
+    if (action === "paid") {
+      // Recheck bruta de saldo antes de marcar pago: NÃO usar balanceCentsFor
+      // aqui — ela já desconta pending+paid, o que incluiria ESTE saque (ainda
+      // pending) como já descontado e a checagem sempre falharia. A conta certa
+      // é bruta: quanto já foi EFETIVAMENTE pago (status='paid', ignora outros
+      // pending) precisa deixar espaço pra cobrir este saque dentro do total ganho.
+      const [sums] = await exec<{ earned: number; paid: number }>(sql`
+        SELECT
+          coalesce((SELECT sum(amount_cents) FROM referral_commissions WHERE referrer_user_id = ${row.userId}), 0)::int AS earned,
+          coalesce((SELECT sum(amount_cents) FROM referral_withdrawals WHERE user_id = ${row.userId} AND status = 'paid'), 0)::int AS paid
+      `);
+      const earned = sums?.earned ?? 0;
+      const alreadyPaid = sums?.paid ?? 0;
+      if (earned - alreadyPaid < row.amountCents) {
+        throw APIError.failedPrecondition("saldo do indicador não cobre mais este saque");
+      }
+    }
+
+    // WHERE status='pending' explícito + confere linhas afetadas: se vier 0,
+    // outra aprovação concorrente já processou este mesmo saque entre o SELECT
+    // acima e este UPDATE.
+    const updated = await db.update(referralWithdrawals).set({
       status:      action,
       notes:       notes?.trim() || null,
       processedBy: userID,
       processedAt: new Date(),
-    }).where(eq(referralWithdrawals.id, id));
+    }).where(and(eq(referralWithdrawals.id, id), eq(referralWithdrawals.status, "pending")))
+      .returning({ id: referralWithdrawals.id });
+    if (updated.length === 0) throw APIError.failedPrecondition("saque já processado");
+
     return { ok: true };
   },
 );

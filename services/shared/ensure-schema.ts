@@ -247,6 +247,15 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "payments_pending_offer_unique"
      ON "payments" USING btree ("lead_id", "node_id", "paid_handle")
      WHERE "status" = 'pending'`,
+
+  // 0015_referral_withdrawals_pending_unique.sql — fecha a janela de corrida
+  // do saque de comissão: requestWithdrawal fazia check-then-act sem
+  // lock/transação entre o SELECT de "já existe pendente" e o INSERT — duas
+  // requisições concorrentes do mesmo usuário geravam dois saques "pending".
+  // Só um "pending" por user_id por vez.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "referral_withdrawals_pending_user_unique"
+     ON "referral_withdrawals" USING btree ("user_id")
+     WHERE "status" = 'pending'`,
 ];
 
 export async function ensureSchema(): Promise<void> {
