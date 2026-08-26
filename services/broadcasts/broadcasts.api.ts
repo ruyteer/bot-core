@@ -4,6 +4,7 @@ import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { scheduledMessages, bots, broadcastRuns } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
+import { assertBotOwnership } from "../shared/bot-ownership.js";
 import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
 import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 
@@ -103,11 +104,6 @@ function sanitizeAdvancedFilters(input: unknown): unknown {
 async function getUserBotIds(userId: string): Promise<string[]> {
   const rows = await db.select({ id: bots.id }).from(bots).where(eq(bots.userId, userId));
   return rows.map((b) => b.id);
-}
-
-async function assertBotOwnership(botId: string, userId: string): Promise<void> {
-  const row = await db.select({ id: bots.id }).from(bots).where(and(eq(bots.id, botId), eq(bots.userId, userId))).limit(1);
-  if (!row.length) throw APIError.notFound("bot not found");
 }
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────

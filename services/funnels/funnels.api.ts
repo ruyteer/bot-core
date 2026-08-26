@@ -9,6 +9,7 @@ import { db } from "../shared/database.js";
 import { funnelOffers, leadProgress, payments, funnelNodes, bots } from "../shared/schema/index.js";
 import type { SQL } from "drizzle-orm";
 import { eq, and, inArray, sql } from "drizzle-orm";
+import { assertBotOwnership, assertBotsOwnership } from "../shared/bot-ownership.js";
 
 const repo = new FunnelDrizzleRepository();
 
@@ -98,9 +99,7 @@ export const create = api(
   { method: "POST", path: "/funnels", expose: true, auth: true },
   async (req: { name: string; botId: string; kind?: string }): Promise<FunnelResponse> => {
     const { userID: userId } = getAuthData()!;
-    const botRow = await db.select({ id: bots.id }).from(bots)
-      .where(and(eq(bots.id, req.botId), eq(bots.userId, userId))).limit(1);
-    if (!botRow.length) throw APIError.notFound("bot not found");
+    await assertBotOwnership(req.botId, userId);
     const funnel = await repo.create({
       userId,
       botId: req.botId,
@@ -117,6 +116,7 @@ export const update = api(
   { method: "PATCH", path: "/funnels/:id", expose: true, auth: true },
   async ({ id, ...req }: { id: string; name?: string; botId?: string | null; simplifiedConfig?: Record<string, unknown> }): Promise<FunnelResponse> => {
     const { userID: userId } = getAuthData()!;
+    if (req.botId !== undefined && req.botId !== null) await assertBotOwnership(req.botId, userId);
     const funnel = await repo.update(id, userId, req);
     const detail = await repo.findByIdOwned(funnel.id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
@@ -194,6 +194,7 @@ export const duplicate = api(
   { method: "POST", path: "/funnels/:id/duplicate", expose: true, auth: true },
   async ({ id, targetBotId }: { id: string; targetBotId: string }): Promise<FunnelResponse> => {
     const { userID: userId } = getAuthData()!;
+    await assertBotOwnership(targetBotId, userId);
     const funnel = await repo.duplicate(id, userId, targetBotId);
     const detail = await repo.findByIdOwned(funnel.id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
@@ -476,8 +477,7 @@ export const createOffer = api(
     isActive?:        boolean;
   }): Promise<{ id: string; name: string; price: number; botId: string; externalRef: string | null }> => {
     const { userID: userId } = getAuthData()!;
-    const bot = await db.select({ id: bots.id }).from(bots).where(and(eq(bots.id, req.botId), eq(bots.userId, userId))).limit(1);
-    if (!bot.length) throw APIError.notFound("bot not found");
+    await assertBotOwnership(req.botId, userId);
 
     assertOfferComplete(req);
 
@@ -507,9 +507,7 @@ export const createOffersBulk = api(
     const { userID: userId } = getAuthData()!;
     if (offers.length === 0) return { offers: [] };
 
-    const userBots = await db.select({ id: bots.id }).from(bots).where(eq(bots.userId, userId));
-    const allowedIds = new Set(userBots.map((b) => b.id));
-    if (!offers.every((o) => allowedIds.has(o.botId))) throw APIError.permissionDenied("bot not owned");
+    await assertBotsOwnership(offers.map((o) => o.botId), userId);
 
     offers.forEach((o, i) => assertOfferComplete(o, `a oferta ${i + 1}`));
 
@@ -539,6 +537,7 @@ export const assignBots = api(
   { method: "PUT", path: "/funnels/:id/bots", expose: true, auth: true },
   async ({ id, botIds }: { id: string; botIds: string[] }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
+    await assertBotsOwnership(botIds, userId);
     await repo.assignBots(id, userId, botIds);
     return { ok: true };
   },
