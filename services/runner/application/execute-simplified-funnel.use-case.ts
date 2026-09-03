@@ -305,11 +305,15 @@ export class ExecuteSimplifiedFunnelUseCase {
 
     if (ctaEnabled) {
       const acceptStyle = telegramButtonStyle(cta.accept_style);
-      const declineStyle = telegramButtonStyle(cta.decline_style);
-      const ctaKeyboard = [[
+      const declineEnabled = cta.decline_enabled !== false;
+      const ctaRow: Array<Record<string, unknown>> = [
         { text: String(cta.accept_label || "Quero ver os planos"), callback_data: `sc_accept_${funnel.id}`, ...(acceptStyle ? { style: acceptStyle } : {}) },
-        { text: String(cta.decline_label || "Agora não"), callback_data: `sc_decline_${funnel.id}`, ...(declineStyle ? { style: declineStyle } : {}) },
-      ]];
+      ];
+      if (declineEnabled) {
+        const declineStyle = telegramButtonStyle(cta.decline_style);
+        ctaRow.push({ text: String(cta.decline_label || "Agora não"), callback_data: `sc_decline_${funnel.id}`, ...(declineStyle ? { style: declineStyle } : {}) });
+      }
+      const ctaKeyboard = [ctaRow];
       await sendMediaBlock({
         tg, chatId, media: readSimpleMediaList(cta), caption: itp(String(cta.text || "").trim()),
         replyMarkup: { inline_keyboard: ctaKeyboard }, protect,
