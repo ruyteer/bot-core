@@ -7,7 +7,6 @@ import { accrueReferralCommission } from "../referrals/application/accrue-commis
 import { enqueuePixelEvents } from "../bots/application/pixel-events.js";
 import { db } from "../shared/database.js";
 import { paymentRevenueCredits, bots } from "../shared/schema/index.js";
-import { isPlatformAdmin } from "../shared/roles.js";
 import type { Provider } from "./domain/gateway.entity.js";
 import type { Payment } from "./domain/payment.entity.js";
 import {
@@ -16,9 +15,9 @@ import {
   normalizeNexuspagWebhook,
   normalizeWiinpayWebhook,
   platformSplitCents,
-  splitConfiguredFor,
   type NormalizedWebhookEvent,
 } from "./application/gateway-clients.js";
+import { resolveEffectiveSplit, type EffectiveSplit } from "./application/split-config.js";
 
 // Valor em centavos -> "R$ 12,34"
 function formatBRL(cents: number): string {
@@ -31,20 +30,28 @@ const payRepo = new PaymentDrizzleRepository();
 // O split é aplicado NO PROVEDOR na criação do PIX (createPix) e nunca voltava
 // pra cá — `payment_revenue_credits` ficava vazia e o card "Taxas" do admin
 // mostrava R$ 0,00 pra sempre. Aqui reconstruímos o mesmo valor que o split
-// carregou, na confirmação do pagamento, usando a mesma fonte da verdade de
-// `application/gateway-clients.ts` (splitConfiguredFor/platformSplitCents).
+// carregou, na confirmação do pagamento, usando a mesma fonte da verdade da
+// criação do PIX: split-config.ts#resolveEffectiveSplit.
+
+// resolveEffectiveSplit não pode derrubar a confirmação da venda — mesmo
+// espírito de isPlatformAdmin (roles.ts): falha silenciosa vira "sem split".
+async function safeResolveSplit(provider: Provider, ownerUserId: string): Promise<EffectiveSplit | null> {
+  try {
+    return await resolveEffectiveSplit(provider, ownerUserId);
+  } catch (err) {
+    console.error("[payments] falha ao resolver split efetivo:", err);
+    return null;
+  }
+}
 
 // Lança o crédito de receita da plataforma. Idempotente pela PK composta
 // (payment_id, user_id) — o webhook pode ser reentregue. Nunca derruba a
 // confirmação da venda.
-async function creditPlatformRevenue(payment: Payment, provider: Provider): Promise<void> {
+async function creditPlatformRevenue(payment: Payment, provider: Provider, split: EffectiveSplit | null): Promise<void> {
   try {
-    // Admin da plataforma gera PIX sem split (createPixWithFallback -> skipSplit),
-    // então não há taxa nenhuma a creditar.
-    if (await isPlatformAdmin(payment.userId)) return;
-    if (!splitConfiguredFor(provider)) return;
+    if (!split) return; // admin, gateway com split desligado, ou taxa zerada — nada a creditar
     // Base = o mesmo amountCents passado ao createPix na criação da cobrança.
-    const fee = platformSplitCents(provider, payment.amount);
+    const fee = platformSplitCents(provider, payment.amount, split.cents);
     if (fee <= 0) return;
     await db.insert(paymentRevenueCredits).values({
       paymentId: payment.id,
@@ -127,16 +134,26 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
     if (event.status === "paid") {
       await payRepo.markPaid(payment.id, event.amount ?? undefined);
 
+      // Split efetivo desta venda — MESMO resolver usado na criação do PIX
+      // (split-config.ts), calculado uma vez e reusado abaixo. Sem isso, a
+      // receita da plataforma e a comissão de indicação podiam divergir do
+      // que de fato foi cobrado no gateway (ex.: acumular comissão mesmo com
+      // o split desligado pro gateway no painel).
+      const split = await safeResolveSplit(event.provider, payment.userId);
+
       // Receita da plataforma (card "Taxas" do admin): persiste o valor que o
       // split reteve nesta transação. Idempotente; trata os próprios erros.
-      await creditPlatformRevenue(payment, event.provider);
+      await creditPlatformRevenue(payment, event.provider, split);
 
       // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
       await paymentPaid.publish({ paymentId: payment.id });
 
-      // Indique e Ganhe: credita a comissão do indicador do seller (se houver).
-      // Trata os próprios erros — nunca bloqueia a confirmação da venda.
-      await accrueReferralCommission(payment.id, payment.userId);
+      // Indique e Ganhe: credita a comissão do indicador do seller (se houver
+      // split real nesta venda — sem split, não há taxa da plataforma sobre a
+      // qual comissionar). Trata os próprios erros — nunca bloqueia a venda.
+      if (split) {
+        await accrueReferralCommission(payment.id, payment.userId, split.cents);
+      }
 
       // Pixels: Purchase para cada pixel ativo do bot (enviado pelo tick do
       // runner). Idempotente pelo processedWebhooks — este bloco roda uma vez.

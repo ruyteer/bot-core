@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { PixPaymentResult, Provider } from "../domain/gateway.entity.js";
 import { syncpaySplitUserId, nexuspagSplitUserId, wiinpaySplitUserId, buckpaySplitEmail } from "../../config/secrets.js";
+import type { EffectiveSplit } from "./split-config.js";
 
-// Split de monetização da plataforma: R$0,40 por transação. O `receiverId` é a
+// Split de monetização da plataforma: R$0,40 por transação, fallback quando
+// nada foi configurado no painel (ver split-config.ts). O `receiverId` é a
 // conta da plataforma no PSP (secret por provider); quando null, sem split.
 export const PLATFORM_SPLIT_CENTS = 40;
 
@@ -24,7 +26,9 @@ function errMsg(...cands: unknown[]): string {
 // Recebedor do split por provider, vindo dos secrets da plataforma. Vazio (secret
 // não configurado) = split desligado nesse gateway, e o PIX segue sem split.
 // SyncPay/NexusPag/WiinPay: user_id/client_id. BuckPay: e-mail cadastrado na Buck.
-function splitReceiverFor(provider: Provider): string | null {
+// Exportado: é o fallback de mais baixa precedência do resolver de split
+// efetivo (split-config.ts), reusado de lá em vez de duplicar a leitura do secret.
+export function splitReceiverFor(provider: Provider): string | null {
   const read = (fn: () => string): string | null => {
     try { return (fn() || "").trim() || null; } catch { return null; }
   };
@@ -37,35 +41,31 @@ function splitReceiverFor(provider: Provider): string | null {
   }
 }
 
-// Fonte da verdade para "o split está configurado pra esse provider?" — usada
-// tanto na criação do PIX (createPix) quanto na reconstrução do crédito de
-// receita da plataforma no webhook (creditPlatformRevenue).
-export function splitConfiguredFor(provider: Provider): boolean {
-  return splitReceiverFor(provider) !== null;
-}
-
 // SyncPay só aceita split em PERCENTUAL INTEIRO. Escolhe o menor % cujo valor
-// atinja ou passe os 40c (min 1%, cap 99%). Em ticket > R$40, 1% já passa de 40c
-// — limitação da SyncPay, aceita (o valor fixo exato só existe em wiinpay/nexuspag).
-function syncpaySplitPercentage(amountCents: number): number {
-  const p = Math.ceil((PLATFORM_SPLIT_CENTS * 100) / amountCents);
+// atinja ou passe os `targetCents` (min 1%, cap 99%). Em ticket alto, 1% já
+// passa do valor alvo — limitação da SyncPay, aceita (o valor fixo exato só
+// existe em wiinpay/nexuspag).
+function syncpaySplitPercentage(amountCents: number, targetCents: number): number {
+  const p = Math.ceil((targetCents * 100) / amountCents);
   return Math.max(1, Math.min(99, p));
 }
 
 // Fonte da verdade para "quanto a plataforma efetivamente retém, em centavos,
-// nesse provider, pra esse valor bruto" — reusa os MESMOS helpers usados pra
-// montar o split enviado ao gateway (syncpaySplitPercentage/PLATFORM_SPLIT_CENTS),
-// pra nunca divergir do que é de fato enviado.
+// nesse provider, pra esse valor bruto" — reusa o MESMO helper usado pra montar
+// o split enviado ao gateway (syncpaySplitPercentage), pra nunca divergir do que
+// é de fato enviado. `targetCents` é o valor efetivo resolvido por
+// split-config.ts#resolveEffectiveSplit — nunca mais PLATFORM_SPLIT_CENTS fixo,
+// senão diverge de taxa custom (USER_SPLIT_FEE_CENTS/<GW>_SPLIT_FEE_CENTS).
 // SyncPay só aceita percentual, então aqui reconstruímos o valor retido
 // aplicando esse percentual de volta sobre o amountCents. BuckPay/NexusPag/
 // WiinPay enviam um valor fixo em centavos/reais.
-export function platformSplitCents(provider: Provider, amountCents: number): number {
-  if (amountCents <= 0) return 0;
+export function platformSplitCents(provider: Provider, amountCents: number, targetCents: number): number {
+  if (amountCents <= 0 || targetCents <= 0) return 0;
   switch (provider) {
     case "syncpay":
-      return Math.round((amountCents * syncpaySplitPercentage(amountCents)) / 100);
+      return Math.round((amountCents * syncpaySplitPercentage(amountCents, targetCents)) / 100);
     default:
-      return Math.min(PLATFORM_SPLIT_CENTS, amountCents);
+      return Math.min(targetCents, amountCents);
   }
 }
 
@@ -156,7 +156,7 @@ async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl:
 export async function syncpayCashIn(
   clientId: string, clientSecret: string,
   amountCents: number, description: string, webhookUrl: string,
-  splitReceiverId?: string | null,
+  split?: EffectiveSplit | null,
 ): Promise<PixPaymentResult> {
   const token = await syncpayToken(clientId, clientSecret);
   await ensureSyncpayWebhook(token, clientId, webhookUrl);
@@ -165,8 +165,8 @@ export async function syncpayCashIn(
     description,
     webhook_url: webhookUrl,
   };
-  if (splitReceiverId) {
-    body.split = [{ percentage: syncpaySplitPercentage(amountCents), user_id: splitReceiverId }];
+  if (split) {
+    body.split = [{ percentage: syncpaySplitPercentage(amountCents, split.cents), user_id: split.receiver }];
   }
   const res = await fetch(`${SYNCPAY_BASE}/api/partner/v1/cash-in`, {
     method:  "POST",
@@ -195,7 +195,7 @@ const BUCKPAY_USER_AGENT = "Buckpay API"; // valor fornecido pelo gerente de con
 export async function buckpayCashIn(
   apiToken: string,
   amountCents: number, description: string, webhookUrl: string,
-  splitReceiverEmail?: string | null,
+  split?: EffectiveSplit | null,
 ): Promise<PixPaymentResult> {
   const body: Record<string, unknown> = {
     external_id:    randomUUID(),
@@ -203,13 +203,13 @@ export async function buckpayCashIn(
     amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
     postbackUrl:    webhookUrl,
   };
-  if (splitReceiverEmail) {
+  if (split) {
     // Split por e-mail + valor fixo em centavos (`amount_cents`, min. 1 centavo)
     // — a Buck passou a suportar valor fixo além do percentual em bps, o que
     // elimina a aproximação que antes convertia os 40c fixos pra um percentual
     // (bug: não bate exato pra cada ticket). O recebedor precisa estar
     // cadastrado na Buck.
-    body.splits = [{ email: splitReceiverEmail, amount_cents: PLATFORM_SPLIT_CENTS }];
+    body.splits = [{ email: split.receiver, amount_cents: split.cents }];
   }
   const res = await fetch(`${BUCKPAY_BASE_URL}/v1/transactions`, {
     method:  "POST",
@@ -250,7 +250,7 @@ const NEXUSPAG_BASE = "https://nexuspag.com";
 export async function nexuspagCashIn(
   apiKey: string,
   amountCents: number, description: string, webhookUrl: string,
-  splitReceiverId?: string | null,
+  split?: EffectiveSplit | null,
 ): Promise<PixPaymentResult> {
   const body: Record<string, unknown> = {
     amount:      amountCents / 100, // reais
@@ -258,9 +258,9 @@ export async function nexuspagCashIn(
     external_id: randomUUID(),
     webhook_url: webhookUrl,
   };
-  if (splitReceiverId) {
+  if (split) {
     // Valor fixo em reais (split user-to-user entre contas da plataforma).
-    body.split = [{ user_id: splitReceiverId, amount: PLATFORM_SPLIT_CENTS / 100 }];
+    body.split = [{ user_id: split.receiver, amount: split.cents / 100 }];
   }
   const res = await fetch(`${NEXUSPAG_BASE}/api/pix/create`, {
     method:  "POST",
@@ -295,7 +295,7 @@ const WIINPAY_BASE = "https://api-v2.wiinpay.com.br";
 export async function wiinpayCashIn(
   apiKey: string,
   amountCents: number, description: string, webhookUrl: string,
-  splitReceiverId?: string | null,
+  split?: EffectiveSplit | null,
 ): Promise<PixPaymentResult> {
   const body: Record<string, unknown> = {
     api_key:     apiKey,
@@ -306,9 +306,9 @@ export async function wiinpayCashIn(
     description,
     webhook_url: webhookUrl,
   };
-  if (splitReceiverId) {
+  if (split) {
     // Objeto (não array), valor fixo em reais.
-    body.split = { value: PLATFORM_SPLIT_CENTS / 100, user_id: splitReceiverId };
+    body.split = { value: split.cents / 100, user_id: split.receiver };
   }
   const res = await fetch(`${WIINPAY_BASE}/payment/create`, {
     method:  "POST",
@@ -338,8 +338,11 @@ export async function wiinpayCashIn(
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 export interface CreatePixOpts {
-  // Admin não paga a taxa da plataforma: pula o split (o PIX vira 100% do vendedor).
-  skipSplit?: boolean;
+  // Split efetivo já resolvido (ver payments/application/split-config.ts —
+  // resolveEffectiveSplit). null/omitido = PIX sem split (100% do vendedor).
+  // createPix não decide mais split por conta própria: quem chama resolve
+  // antes, senão volta a ter fontes de verdade divergentes (o bug original).
+  split?: EffectiveSplit | null;
 }
 
 export async function createPix(
@@ -351,7 +354,7 @@ export async function createPix(
   webhookUrl: string,
   opts?: CreatePixOpts,
 ): Promise<PixPaymentResult> {
-  const split = opts?.skipSplit ? null : splitReceiverFor(provider);
+  const split = opts?.split ?? null;
   switch (provider) {
     case "syncpay":  return syncpayCashIn(clientId, clientSecret, amountCents, description, webhookUrl, split);
     case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl, split);

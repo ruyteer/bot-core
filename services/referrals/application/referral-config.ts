@@ -12,17 +12,34 @@ export const DEFAULT_REFERRAL_PERCENT = 20;
 // Saque mínimo (centavos). Sobrescrevível via REFERRAL_MIN_WITHDRAWAL_CENTS.
 export const DEFAULT_MIN_WITHDRAWAL_CENTS = 1000;
 
-async function configNumber(key: string): Promise<number | null> {
+// Leitura crua (string) de uma chave de platform_config; null se não existir.
+// Fonte compartilhada de leitura — reusada tanto pelas regras de indicação
+// quanto pelo resolver de split efetivo dos gateways de pagamento
+// (payments/application/split-config.ts), pra não duplicar esse parsing.
+export async function configValue(key: string): Promise<string | null> {
   const [row] = await db.select({ value: platformConfig.value })
     .from(platformConfig).where(eq(platformConfig.key, key)).limit(1);
-  if (!row) return null;
-  const v = Number(row.value);
-  return Number.isFinite(v) ? v : null;
+  return row ? row.value : null;
+}
+
+async function configNumber(key: string): Promise<number | null> {
+  const v = await configValue(key);
+  if (v === null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Override individual de taxa (centavos) configurado pelo admin pro seller
+// (USER_SPLIT_FEE_CENTS_<sellerUserId>). null = sem override — separado de
+// platformFeeCentsFor pra permitir distinguir "sem override" de "override
+// igual ao fallback", que o resolver de split efetivo precisa saber.
+export async function userSplitFeeOverrideCents(sellerUserId: string): Promise<number | null> {
+  return configNumber(`USER_SPLIT_FEE_CENTS_${sellerUserId}`);
 }
 
 /** Taxa da plataforma (centavos) cobrada nas vendas deste seller — base da comissão. */
 export async function platformFeeCentsFor(sellerUserId: string): Promise<number> {
-  const override = await configNumber(`USER_SPLIT_FEE_CENTS_${sellerUserId}`);
+  const override = await userSplitFeeOverrideCents(sellerUserId);
   return override !== null && override >= 0 ? override : PLATFORM_SPLIT_CENTS;
 }
 
