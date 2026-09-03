@@ -115,3 +115,73 @@ export function assertRawOfferComplete(offer: RawNodeOffer, label = "a oferta"):
     }
   }
 }
+
+/**
+ * Shape de um item de oferta do funil simplificado (`plans`/`upsells`/
+ * `downsells`/`order_bumps` dentro de `funnels.simplified_config`) — ver
+ * `DeliveryConfig`/`PlanItem`/`UpsellItem`/... em `src/types/simpleFunnel.ts`
+ * no repo `ui`. Mesmos 3 conceitos de `RawNodeOffer` (nome, preço, entrega),
+ * mas com nomes de campo diferentes (`name`/`price` direto, sem prefixo
+ * `product_`) e um terceiro tipo de entrega (`delivery_type: "text"`, via
+ * `delivery_text`) que o funil flow não tem.
+ */
+export interface RawSimplifiedOfferItem {
+  name?:          unknown;
+  price?:         unknown;
+  delivery_type?: unknown;
+  delivery_url?:  unknown;
+  delivery_text?: unknown;
+  vip_group_id?:  unknown;
+}
+
+/** Espelha `isOfferStarted` do frontend para o shape do funil simplificado. */
+export function isSimplifiedOfferStarted(item: RawSimplifiedOfferItem): boolean {
+  const hasName  = typeof item.name === "string" && item.name.trim().length > 0;
+  const hasPrice = typeof item.price === "number" && Number.isFinite(item.price) && item.price > 0;
+  return hasName || hasPrice;
+}
+
+/**
+ * Espelha `validateOfferListItem` do frontend (`src/lib/offerValidation.ts`
+ * no repo `ui`): só valida quando o item está "iniciado" (ver
+ * `isSimplifiedOfferStarted`), e `delivery_type` decide qual campo de entrega
+ * é obrigatório (`vip_group` → `vip_group_id`, `text` → `delivery_text`,
+ * `content`/default → `delivery_url`).
+ */
+export function assertSimplifiedOfferComplete(item: RawSimplifiedOfferItem, label = "a oferta"): void {
+  if (!isSimplifiedOfferStarted(item)) return;
+
+  assertNameAndPrice(
+    typeof item.name === "string" ? item.name : null,
+    typeof item.price === "number" ? item.price : null,
+    label,
+  );
+
+  // Espelha `deliveryTypeOf` em `execute-simplified-funnel.use-case.ts` — bit a
+  // bit, não só a intenção: QUALQUER `delivery_type` truthy vence e cai pra
+  // "content" se não for "vip_group"/"text" reconhecido; só cai pra inferir de
+  // `vip_group_id` quando `delivery_type` é falsy (ausente/""/0/null). Uma
+  // versão anterior daqui exigia `typeof === "string"` antes de aceitar
+  // `delivery_type`, o que divergia do runtime pra um `delivery_type` truthy
+  // não-string (ex.: `1`): a validação inferia "vip_group" via `vip_group_id`
+  // e liberava a ativação, mas em produção o runtime calculava "content" e
+  // `deliverItem` não entregava nada — silenciosamente. Ver achado de revisão.
+  const dt = (item.delivery_type as unknown) || (item.vip_group_id ? "vip_group" : "content");
+  const type = dt === "vip_group" ? "vip_group" : dt === "text" ? "text" : "content";
+  if (type === "vip_group") {
+    const groupId = typeof item.vip_group_id === "string" ? item.vip_group_id.trim() : "";
+    if (!groupId) {
+      throw APIError.invalidArgument(`${label} precisa de um grupo VIP do Telegram selecionado`);
+    }
+  } else if (type === "text") {
+    const text = typeof item.delivery_text === "string" ? item.delivery_text.trim() : "";
+    if (!text) {
+      throw APIError.invalidArgument(`${label} precisa de um texto de entrega`);
+    }
+  } else {
+    const url = typeof item.delivery_url === "string" ? item.delivery_url.trim() : "";
+    if (!url) {
+      throw APIError.invalidArgument(`${label} precisa de uma URL de entrega`);
+    }
+  }
+}

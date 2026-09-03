@@ -5,7 +5,11 @@ export interface FunnelRepository {
   findById(id: string): Promise<FunnelDetail | null>;
   findByIdOwned(id: string, userId: string): Promise<FunnelDetail | null>;
   create(input: CreateFunnelInput): Promise<Funnel>;
-  update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "isActive" | "simplifiedConfig">>): Promise<Funnel>;
+  // `isActive` de propósito FORA deste Pick: a única forma de ligar um funil
+  // precisa passar por `activate()`, que valida completude de oferta antes
+  // (ver `assertFunnelReadyToActivate` em `funnels.api.ts`) — permitir setar
+  // isActive aqui reabriria esse bypass sem nenhum erro de compilação avisando.
+  update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig">>): Promise<Funnel>;
   delete(id: string, userId: string): Promise<void>;
   saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<void>;
   activate(id: string, userId: string): Promise<void>;
