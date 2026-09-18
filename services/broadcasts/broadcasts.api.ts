@@ -277,8 +277,9 @@ export const send = api(
     await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
     if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
+    let row: typeof scheduledMessages.$inferSelect;
     try {
-      await db.insert(scheduledMessages).values({
+      [row] = await db.insert(scheduledMessages).values({
         userId,
         botId:           req.botIds[0],
         botIds:          req.botIds,
@@ -299,7 +300,7 @@ export const send = api(
         recurrenceRule:  null,
         recurrenceCount: 0,
         clientRequestId: req.clientRequestId ?? null,
-      });
+      }).returning();
     } catch (err) {
       // Clique duplo com o mesmo clientRequestId: o disparo já foi aceito na
       // primeira chamada — responde igual sem criar um segundo.
@@ -309,6 +310,9 @@ export const send = api(
       throw err;
     }
 
+    // Mesma varredura de conteúdo que POST /broadcasts já faz — send() só
+    // enfileira mensagem instantânea, mas o texto/mídia é igualmente livre.
+    scanSourceAsync("broadcast", row.id);
     return { accepted: true };
   },
 );
