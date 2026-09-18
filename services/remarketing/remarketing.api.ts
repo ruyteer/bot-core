@@ -3,7 +3,7 @@ import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
 import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments, funnelOffers } from "../shared/schema/index.js";
-import { eq, and, inArray, desc, sql } from "drizzle-orm";
+import { eq, and, or, inArray, desc, sql } from "drizzle-orm";
 import { sanitizeButtonStyle, sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 import { assertBotOwnership, assertBotsOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
 import { resumeLeadsAfterReactivation } from "./application/process-remarketing.use-case.js";
@@ -444,22 +444,44 @@ export const enroll = api(
       eligibleLeads = allLeads.filter((l) => buyerSet.has(l.id));
     }
 
-    // Exclude already-enrolled leads (active or paused)
-    const alreadyEnrolled = await db.select({ leadId: remarketingLeadState.leadId })
+    // Exclude leads já inscritos (active ou paused) e os que NUNCA devem
+    // reiniciar do zero:
+    //   - stopped/purchased:      já comprou — reinscrever voltaria a mandar
+    //                             mensagem de régua pra quem já converteu.
+    //   - blocked:                3+ falhas de envio seguidas (send_failed_repeatedly)
+    //                             é o proxy que este processador tem pra "o lead
+    //                             bloqueou o bot no Telegram" — reinscrever manda
+    //                             pro mesmo buraco de novo.
+    //   - stopped/bot_not_owned:  campanha "suja" com bot de outro dono — nunca
+    //                             volta a enviar por ele (ver defesa em
+    //                             profundidade em processDueRemarketing).
+    // completed (sem compra) e os demais estados terminais (ex.: lead_not_found,
+    // not_a_user, error/bot_missing) continuam reinscritos normalmente — mantém
+    // o comportamento atual pra eles.
+    const nonReenrollable = await db.select({ leadId: remarketingLeadState.leadId })
       .from(remarketingLeadState)
-      .where(and(eq(remarketingLeadState.campaignId, id), inArray(remarketingLeadState.status, ["active", "paused"])));
-    const enrolledSet = new Set(alreadyEnrolled.map((r) => r.leadId));
+      .where(and(
+        eq(remarketingLeadState.campaignId, id),
+        or(
+          inArray(remarketingLeadState.status, ["active", "paused", "blocked"]),
+          and(eq(remarketingLeadState.status, "stopped"), inArray(remarketingLeadState.pauseReason, ["purchased", "bot_not_owned"])),
+        ),
+      ));
+    const enrolledSet = new Set(nonReenrollable.map((r) => r.leadId));
     const toEnroll = eligibleLeads.filter((l) => !enrolledSet.has(l.id));
 
     if (toEnroll.length > 0) {
       const now = new Date();
       // Upsert: leads nunca inscritos viram um INSERT normal; leads com estado
-      // terminal (completed/stopped/blocked/error) já têm uma linha para este
-      // (campaign_id, lead_id) e são reinscritos via UPDATE dessa mesma linha,
-      // reiniciando a sequência do zero — nunca um segundo INSERT (constraint
-      // única em campaign_id+lead_id). A cláusula WHERE é uma trava extra contra
-      // a corrida: se a linha virou active/paused entre o SELECT acima e este
-      // INSERT, o conflito não atualiza nada (não reinicia um lead em andamento).
+      // terminal reinscrevível (completed, error/bot_missing, stopped por
+      // lead_not_found/not_a_user) já têm uma linha para este (campaign_id,
+      // lead_id) e são reinscritos via UPDATE dessa mesma linha, reiniciando a
+      // sequência do zero — nunca um segundo INSERT (constraint única em
+      // campaign_id+lead_id). A cláusula WHERE é uma trava extra contra a
+      // corrida: se a linha virou active/paused/blocked (ou stopped por
+      // purchased/bot_not_owned) entre o SELECT acima e este INSERT, o conflito
+      // não atualiza nada (não reinicia um lead em andamento nem um que nunca
+      // deveria reiniciar).
       await db.insert(remarketingLeadState).values(
         toEnroll.map((l) => ({
           leadId:     l.id,
@@ -479,7 +501,8 @@ export const enroll = api(
           consecutiveErrors: 0,
           updatedAt:         now,
         },
-        where: sql`${remarketingLeadState.status} NOT IN ('active', 'paused')`,
+        where: sql`${remarketingLeadState.status} NOT IN ('active', 'paused', 'blocked')
+          AND NOT (${remarketingLeadState.status} = 'stopped' AND ${remarketingLeadState.pauseReason} IN ('purchased', 'bot_not_owned'))`,
       });
     }
 

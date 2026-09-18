@@ -14,7 +14,7 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { saveMessages, update } = await import("./remarketing.api.js");
+const { saveMessages, update, enroll } = await import("./remarketing.api.js");
 
 async function campaign(botId: string, over: Partial<typeof remarketingCampaigns.$inferInsert> = {}) {
   const db = await testDb();
@@ -154,5 +154,68 @@ describe("update — reativar campanha (isActive false→true) retoma leads paus
     // Não passou por false→true, então não é a rota de resumo desta subtask —
     // o estado continua como estava.
     expect(row.status).toBe("paused");
+  });
+});
+
+describe("enroll — não reinicia do zero quem comprou, foi bloqueado, ou é bot_not_owned", () => {
+  it("não reinscreve lead stopped/purchased", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const lead = await createLead(bot.id, 6600n);
+    const c = await campaign(bot.id, { filterType: "all" });
+    await state(c.id, bot.id, lead, { status: "stopped", pauseReason: "purchased" });
+
+    const res = await enroll({ id: c.id });
+    expect(res.enrolled).toBe(0);
+
+    const db = await testDb();
+    const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
+    expect(row.status).toBe("stopped");
+  });
+
+  it("não reinscreve lead com status blocked", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const lead = await createLead(bot.id, 6601n);
+    const c = await campaign(bot.id, { filterType: "all" });
+    await state(c.id, bot.id, lead, { status: "blocked", pauseReason: "send_failed_repeatedly" });
+
+    const res = await enroll({ id: c.id });
+    expect(res.enrolled).toBe(0);
+
+    const db = await testDb();
+    const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
+    expect(row.status).toBe("blocked");
+  });
+
+  it("não reinscreve lead stopped/bot_not_owned", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const lead = await createLead(bot.id, 6602n);
+    const c = await campaign(bot.id, { filterType: "all" });
+    await state(c.id, bot.id, lead, { status: "stopped", pauseReason: "bot_not_owned" });
+
+    const res = await enroll({ id: c.id });
+    expect(res.enrolled).toBe(0);
+
+    const db = await testDb();
+    const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
+    expect(row.status).toBe("stopped");
+  });
+
+  it("reinscreve normalmente lead completed (sem compra) — comportamento mantido", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const lead = await createLead(bot.id, 6603n);
+    const c = await campaign(bot.id, { filterType: "all" });
+    await state(c.id, bot.id, lead, { status: "completed", pauseReason: "max_cycles", cyclesCompleted: 3 });
+
+    const res = await enroll({ id: c.id });
+    expect(res.enrolled).toBe(1);
+
+    const db = await testDb();
+    const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
+    expect(row.status).toBe("active");
+    expect(row.cyclesCompleted).toBe(0);
   });
 });
