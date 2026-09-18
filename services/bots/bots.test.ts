@@ -5,6 +5,7 @@ import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook
 import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
 import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
+import { MAX_BOTS_PER_USER } from "./domain/bot.entity.js";
 import { testDb } from "../../test/helpers/db.js";
 import { bots, payments } from "../shared/schema/index.js";
 import { createProfile, createBot, createGateway, createLead } from "../../test/helpers/seed.js";
@@ -63,6 +64,60 @@ describe("CreateBotUseCase", () => {
     const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
     expect(row.isActive).toBe(false);
     expect(row.telegramUsername).toBe("testbot"); // o bot existe e é utilizável
+  });
+});
+
+// Furo: só a UI antiga impunha o limite de MAX_BOTS_PER_USER bots por conta —
+// client-side, então qualquer chamada direta à API (ou a UI nova) criava sem
+// limite. A checagem agora mora no repositório, dentro de uma transação com
+// advisory lock por usuário (ver BotDrizzleRepository.create).
+describe("CreateBotUseCase — limite de bots por conta", () => {
+  it("recusa o 21º bot com erro tipado, sem mexer no banco", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER; i++) {
+      await createBot({ userId });
+    }
+    await expect(new CreateBotUseCase(repo).execute({ userId, name: "Extra", telegramToken: "111:ABC" }))
+      .rejects.toThrow(new RegExp(`limite de ${MAX_BOTS_PER_USER}`));
+
+    const db = await testDb();
+    const rows = await db.select().from(bots).where(eq(bots.userId, userId));
+    expect(rows.length).toBe(MAX_BOTS_PER_USER);
+  });
+
+  it("usuários diferentes não se bloqueiam entre si (lock é por usuário)", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER; i++) {
+      await createBot({ userId });
+    }
+    const outroUserId = await createProfile();
+    // Outro usuário, com 0 bots, cria normalmente mesmo com o primeiro no limite.
+    const bot = await new CreateBotUseCase(repo).execute({ userId: outroUserId, name: "Bot", telegramToken: "111:ABC" });
+    expect(bot.userId).toBe(outroUserId);
+  });
+
+  it("corrida: dois POST simultâneos no 20º bot não criam os dois — só um passa, total fica em 20", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER - 1; i++) {
+      await createBot({ userId }); // 19 bots — o próximo é o 20º (último permitido)
+    }
+
+    const results = await Promise.allSettled([
+      new CreateBotUseCase(repo).execute({ userId, name: "A", telegramToken: "111:ABC" }),
+      new CreateBotUseCase(repo).execute({ userId, name: "B", telegramToken: "111:ABC" }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected  = results.filter((r) => r.status === "rejected");
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      message: expect.stringContaining(`limite de ${MAX_BOTS_PER_USER}`),
+    });
+
+    const db = await testDb();
+    const rows = await db.select().from(bots).where(eq(bots.userId, userId));
+    expect(rows.length).toBe(MAX_BOTS_PER_USER);
   });
 });
 
