@@ -37,3 +37,11 @@ export const mediaS3Region    = secret("MEDIA_S3_REGION");
 export const mediaS3Bucket    = secret("MEDIA_S3_BUCKET");
 export const mediaS3AccessKey = secret("MEDIA_S3_ACCESS_KEY");
 export const mediaS3SecretKey = secret("MEDIA_S3_SECRET_KEY");
+
+// Segredo compartilhado opcional: quando a UI nova chama GET /r do servidor
+// dela repassando o IP do visitante em X-Forwarded-For, ela também manda esse
+// valor num header próprio pra provar que é ela (e não qualquer chamador
+// externo forjando o header). Ver services/leads/tracking.api.ts. Vazio =
+// ninguém é tratado como proxy confiável (comportamento antigo, mais
+// conservador); não quebra o boot se não estiver setado.
+export const trustedProxySecret = secret("TRUSTED_PROXY_SECRET");
