@@ -1,8 +1,17 @@
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, asc, sql } from "drizzle-orm";
+import { APIError } from "encore.dev/api";
 import { db } from "../../shared/database.js";
-import { paymentGateways, botPaymentGateways, bots } from "../../shared/schema/index.js";
+import { paymentGateways, botPaymentGateways, bots, payments } from "../../shared/schema/index.js";
 import { encrypt, decrypt } from "../../shared/crypto.js";
 import type { PaymentGateway, GatewaySafe, CreateGatewayInput, UpdateGatewayInput, Provider } from "../domain/gateway.entity.js";
+
+// SQLSTATE de violação de foreign key (Postgres e PGlite usam o mesmo código).
+const FOREIGN_KEY_VIOLATION = "23503";
+
+function isForeignKeyViolation(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code ?? (err as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return code === FOREIGN_KEY_VIOLATION;
+}
 
 export class GatewayDrizzleRepository {
   private toGateway(row: typeof paymentGateways.$inferSelect): PaymentGateway {
@@ -132,8 +141,30 @@ export class GatewayDrizzleRepository {
   }
 
   async delete(id: string, userId: string): Promise<void> {
-    await db.delete(paymentGateways)
-      .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)));
+    // Checagem prévia: dá o erro tipado direto na maioria dos casos, sem
+    // depender de estourar a FK. `payments.gateway_id` não tem onDelete —
+    // apagar um gateway com pagamentos vinculados sem isto estourava violação
+    // de chave estrangeira crua (500) direto do driver.
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(payments)
+      .where(eq(payments.gatewayId, id));
+    if (count > 0) {
+      throw APIError.failedPrecondition("há pagamentos vinculados a este gateway — não é possível excluir");
+    }
+
+    // Rede de segurança para a corrida entre a checagem acima e este delete
+    // (ex.: um PIX sendo gerado nesse meio-tempo): se ainda assim bater na FK,
+    // vira o mesmo erro tipado em vez de propagar o erro cru do driver.
+    try {
+      await db.delete(paymentGateways)
+        .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)));
+    } catch (err) {
+      if (isForeignKeyViolation(err)) {
+        throw APIError.failedPrecondition("há pagamentos vinculados a este gateway — não é possível excluir");
+      }
+      throw err;
+    }
   }
 
   // Decrypt credentials for use in API calls
