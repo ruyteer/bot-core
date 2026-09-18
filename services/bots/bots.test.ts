@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { CreateBotUseCase } from "./application/use-cases/create-bot.use-case.js";
 import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook.use-case.js";
 import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
+import { DeleteBotUseCase } from "./application/use-cases/delete-bot.use-case.js";
 import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
 import { MAX_BOTS_PER_USER } from "./domain/bot.entity.js";
@@ -155,6 +156,42 @@ describe("DeregisterWebhookUseCase", () => {
     forceTelegramError("deleteWebhook", 500);
     await expect(new DeregisterWebhookUseCase(repo).execute(bot.id, bot.userId))
       .rejects.toThrow(/forced error/);
+  });
+});
+
+// Furo: DELETE /bots/:id só fazia `DELETE FROM bots` — sem avisar o Telegram
+// antes, o webhook continuava configurado e o Telegram seguia mandando update
+// pra um bot que não existe mais aqui. Agora desregistra antes de excluir, e
+// uma falha do Telegram nessa etapa (token já revogado, bot já removido no
+// BotFather, timeout, etc.) NUNCA pode travar a exclusão.
+describe("DeleteBotUseCase", () => {
+  it("exclui o bot e desregistra o webhook no Telegram antes", async () => {
+    const bot = await createBot();
+    await new DeleteBotUseCase(repo).execute(bot.id, bot.userId);
+
+    expect(getTelegramCalls("deleteWebhook").length).toBe(1);
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(0);
+  });
+
+  it("Telegram falhando ao desregistrar (erro real, não 401/404) não impede a exclusão", async () => {
+    const bot = await createBot();
+    forceTelegramError("deleteWebhook", 500);
+
+    await expect(new DeleteBotUseCase(repo).execute(bot.id, bot.userId)).resolves.toBeUndefined();
+
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(0);
+  });
+
+  it("bot de outro usuário → not found, nada é chamado no Telegram nem apagado", async () => {
+    const bot = await createBot();
+    const outroUserId = await createProfile();
+    await expect(new DeleteBotUseCase(repo).execute(bot.id, outroUserId)).rejects.toThrow();
+
+    expect(getTelegramCalls("deleteWebhook").length).toBe(0);
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(1);
   });
 });
 

@@ -18,9 +18,9 @@ import type { BotWithStats } from "./domain/bot.entity.js";
 const repo              = new BotDrizzleRepository();
 const createBot         = new CreateBotUseCase(repo);
 const updateBot         = new UpdateBotUseCase(repo);
-const deleteBot         = new DeleteBotUseCase(repo);
 const registerWebhook   = new RegisterWebhookUseCase(repo);
 const deregisterWebhook = new DeregisterWebhookUseCase(repo);
+const deleteBot         = new DeleteBotUseCase(repo, deregisterWebhook);
 const syncBotProfile    = new SyncBotProfileUseCase(repo);
 
 // ─── Request / Response shapes ───────────────────────────────────────────────
