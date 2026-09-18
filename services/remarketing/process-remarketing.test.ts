@@ -118,6 +118,66 @@ describe("remarketing — oferta anexada renderiza botão de compra", () => {
   });
 });
 
+describe("defesa em profundidade — campanha 'suja' com bot de outro dono", () => {
+  // Estes testes gravam a campanha/estado DIRETO no banco via Drizzle (não pelo
+  // endpoint da API), simulando dados que já existiam antes da checagem de posse
+  // em remarketing.api.ts existir. O objetivo é confirmar que o PROCESSADOR
+  // também recusa, mesmo que uma linha inválida já esteja gravada.
+  it("enrollRemarketingTriggers: não inscreve leads do bot de outro dono mesmo listado em bot_ids", async () => {
+    const owner = await createBot();
+    const foreignBot = await createBot(); // outro dono
+    const gw = await createGateway({ userId: owner.userId });
+    const ownLead = await createLead(owner.id, 6300n);
+    const foreignLead = await createLead(foreignBot.id, 6301n);
+    const foreignGw = await createGateway({ userId: foreignBot.userId });
+    const db = await testDb();
+    await db.insert(payments).values([
+      { userId: owner.userId, botId: owner.id, leadId: ownLead, gatewayId: gw, amount: 1000, status: "paid", paidAt: new Date(Date.now() - 60_000) },
+      { userId: foreignBot.userId, botId: foreignBot.id, leadId: foreignLead, gatewayId: foreignGw, amount: 1000, status: "paid", paidAt: new Date(Date.now() - 60_000) },
+    ]);
+    // Campanha "suja": bot_ids inclui o bot de outro dono (nunca deveria ter sido
+    // gravado assim, mas simula dado pré-existente a uma corrupção/bug anterior).
+    await campaign(owner.id, { botIds: [owner.id, foreignBot.id], triggerType: "buyers", triggerConfig: { wait_minutes: 0 } as Record<string, unknown> });
+
+    const n = await enrollRemarketingTriggers();
+    expect(n).toBe(1);
+    const states = await db.select().from(remarketingLeadState);
+    expect(states.map((s) => s.leadId)).toEqual([ownLead]);
+  });
+
+  it("processDueRemarketing: não envia por um bot que não pertence ao dono da campanha, mesmo com lead_state já gravado", async () => {
+    const owner = await createBot();
+    const foreignBot = await createBot(); // outro dono
+    const lead = await createLead(foreignBot.id, 6302n);
+    const c = await campaign(owner.id, { botIds: [owner.id, foreignBot.id] });
+    await message(c.id);
+    // lead_state gravado direto com bot_id do bot ALHEIO (ex.: enroll manual antes
+    // da checagem existir, ou linha corrompida) — processDueRemarketing não pode
+    // usar o token desse bot pra enviar.
+    const st = await state(c.id, foreignBot.id, lead);
+
+    const n = await processDueRemarketing();
+    expect(n).toBe(0);
+    expect(getSentMessages()).toHaveLength(0);
+    const db = await testDb();
+    const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
+    expect(after.status).toBe("stopped");
+    expect(after.pauseReason).toBe("bot_not_owned");
+  });
+
+  it("processDueRemarketing: envia normalmente quando o bot do estado pertence ao mesmo dono e está em bot_ids", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6303n);
+    const c = await campaign(bot.id, { botIds: [bot.id] });
+    await message(c.id);
+    await state(c.id, bot.id, lead);
+
+    const n = await processDueRemarketing();
+    expect(n).toBe(1);
+    expect(getSentMessages().length).toBeGreaterThan(0);
+  });
+});
+
 describe("remarketing — cor do botão (style)", () => {
   type Btn = { text?: string; callback_data?: string; url?: string; style?: string };
 

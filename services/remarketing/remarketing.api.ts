@@ -2,9 +2,15 @@ import { api, APIError } from "encore.dev/api";
 import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
-import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments } from "../shared/schema/index.js";
+import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, leads, payments, funnelOffers } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, sql } from "drizzle-orm";
 import { sanitizeButtonStyle, sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
+import { assertBotOwnership, assertBotsOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
+
+// Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts —
+// evita "invalid input syntax for type uuid" cru do driver quando um id vindo do cliente é
+// malformado, trocando por um APIError.notFound limpo.
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ─── Response shapes ─────────────────────────────────────────────────────────
 
@@ -204,8 +210,15 @@ export const create = api(
     isActive?: boolean;
   }): Promise<CampaignResponse> => {
     const { userID: userId } = getAuthData()!;
-    const botRows = await db.select({ id: bots.id }).from(bots).where(and(eq(bots.id, req.botId), eq(bots.userId, userId))).limit(1);
-    if (!botRows.length) throw APIError.notFound("bot not found");
+    await assertBotOwnership(req.botId, userId);
+    // botId é sempre incluído na checagem em lote, mesmo que o cliente mande um botIds
+    // que não o contenha — nunca confie em nenhum dos dois sem revalidar contra o dono.
+    const allBotIds = [...new Set([req.botId, ...(req.botIds ?? [])])];
+    if (req.botIds !== undefined && req.botIds.length === 0) {
+      throw APIError.invalidArgument("botIds não pode ser uma lista vazia");
+    }
+    await assertBotsOwnership(allBotIds, userId);
+    await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
 
     const [c] = await db.insert(remarketingCampaigns).values({
       botId:           req.botId,
@@ -246,6 +259,15 @@ export const update = api(
   }): Promise<CampaignResponse> => {
     const { userID: userId } = getAuthData()!;
     await assertCampaignOwnership(id, userId);
+
+    if (req.botIds !== undefined) {
+      // Vazio deixaria a campanha sem nenhum bot pra inscrever/enviar (órfã) — mesmo
+      // risco de silenciosamente "desligar" a campanha que aceitar sem avisar, então
+      // tratamos como entrada inválida em vez de gravar uma lista vazia.
+      if (req.botIds.length === 0) throw APIError.invalidArgument("botIds não pode ser uma lista vazia");
+      await assertBotsOwnership(req.botIds, userId);
+    }
+    if (req.targetGroupIds !== undefined) await assertGroupsOwnership(req.targetGroupIds, userId);
 
     const patch: Partial<typeof remarketingCampaigns.$inferInsert> = { updatedAt: new Date() };
     if (req.name !== undefined)            patch.name = req.name;
@@ -324,7 +346,20 @@ export const saveMessages = api(
   { method: "PUT", path: "/remarketing/:id/messages", expose: true, auth: true },
   async ({ id, messages }: { id: string; messages: Array<{ message: string; media?: unknown; inlineButtons?: unknown; offerId?: string | null; offerStyle?: unknown; delayValue: number; delayUnit: string; orderIndex: number }> }): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
-    await assertCampaignOwnership(id, userId);
+    const campaign = await assertCampaignOwnership(id, userId);
+
+    // offerId é uma FK pra funnel_offers vinda do cliente: precisa ser de um dos bots
+    // DESTA campanha, senão o botão de compra apontaria pra oferta de outro dono (o
+    // processador (process-remarketing.use-case.ts) já filtra por bot na hora de montar
+    // o botão, mas não confiamos nisso sozinho — validamos também na escrita).
+    const offerIds = [...new Set(messages.map((m) => m.offerId).filter((v): v is string => !!v))];
+    if (offerIds.length > 0) {
+      if (offerIds.some((oid) => !UUID_REGEX.test(oid))) throw APIError.notFound("offer not found");
+      const campaignBotIds = [...new Set([campaign.botId, ...((campaign.botIds as string[]) ?? [])])];
+      const validOffers = await db.select({ id: funnelOffers.id }).from(funnelOffers)
+        .where(and(inArray(funnelOffers.id, offerIds), inArray(funnelOffers.botId, campaignBotIds)));
+      if (validOffers.length !== offerIds.length) throw APIError.notFound("offer not found");
+    }
 
     await db.delete(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
     if (messages.length > 0) {
@@ -353,7 +388,15 @@ export const enroll = api(
   async ({ id }: { id: string }): Promise<{ enrolled: number; total: number }> => {
     const { userID: userId } = getAuthData()!;
     const campaign = await assertCampaignOwnership(id, userId);
-    const campaignBotIds = (campaign.botIds as string[]) ?? [campaign.botId];
+    const rawBotIds = [...new Set([campaign.botId, ...((campaign.botIds as string[]) ?? [])])];
+    // Defesa em profundidade: assertCampaignOwnership só garante que o BOT PRINCIPAL
+    // (campaign.botId) é do usuário autenticado — se a campanha foi gravada (ou
+    // corrompida) com um bot alheio dentro de botIds, nunca inscrevemos leads desse
+    // bot. Reduz rawBotIds ao subconjunto realmente pertencente a este usuário.
+    const ownedBotRows = await db.select({ id: bots.id }).from(bots)
+      .where(and(inArray(bots.id, rawBotIds), eq(bots.userId, userId)));
+    const campaignBotIds = ownedBotRows.map((b) => b.id);
+    if (campaignBotIds.length === 0) return { enrolled: 0, total: 0 };
 
     // Get all leads for the campaign's bots
     const allLeads = await db.select({ id: leads.id, botId: leads.botId })

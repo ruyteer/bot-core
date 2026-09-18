@@ -2,11 +2,23 @@ import { api, APIError } from "encore.dev/api";
 import { scanSourceAsync } from "../compliance/application/scan.js";
 import { getAuthData } from "~encore/auth";
 import { db } from "../shared/database.js";
-import { scheduledMessages, bots, broadcastRuns } from "../shared/schema/index.js";
+import { scheduledMessages, bots, broadcastRuns, funnels } from "../shared/schema/index.js";
 import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
-import { assertBotOwnership } from "../shared/bot-ownership.js";
+import { assertBotOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
 import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
 import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
+
+// Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts.
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// funnels não tem um helper de posse compartilhado (é 1:1 com o dono, sem lote) — checagem
+// local, mesmo padrão de assertBotOwnership.
+async function assertFunnelOwnership(funnelId: string, userId: string): Promise<void> {
+  if (!UUID_REGEX.test(funnelId)) throw APIError.notFound("funnel not found");
+  const rows = await db.select({ id: funnels.id }).from(funnels)
+    .where(and(eq(funnels.id, funnelId), eq(funnels.userId, userId))).limit(1);
+  if (!rows.length) throw APIError.notFound("funnel not found");
+}
 
 // ─── Ingestão de datas ────────────────────────────────────────────────────────
 // Strings ISO-8601 COM offset/Z são um instante inequívoco e podem ser parseadas
@@ -180,6 +192,8 @@ export const create = api(
     if (!userBotIdSet.has(req.botId)) throw APIError.notFound("bot not found");
     const allBotIds = req.botIds ?? [req.botId];
     if (!allBotIds.every((id) => userBotIdSet.has(id))) throw APIError.permissionDenied("bot not owned");
+    await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
+    if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
     const tz = extractTz(req.recurrenceRule);
     const [row] = await db.insert(scheduledMessages).values({
@@ -226,6 +240,8 @@ export const send = api(
     if (!req.botIds.length) throw APIError.invalidArgument("botIds must not be empty");
     const userBotIdSet = new Set(await getUserBotIds(userId));
     if (!req.botIds.every((id) => userBotIdSet.has(id))) throw APIError.permissionDenied("bot not owned");
+    await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
+    if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
     await db.insert(scheduledMessages).values({
       userId,
@@ -273,6 +289,7 @@ export const update = api(
     const existing = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, id)).limit(1);
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
+    if (req.targetGroupIds !== undefined) await assertGroupsOwnership(req.targetGroupIds, userId);
 
     // tz efetivo: usa a recurrenceRule enviada no patch (se houver), senão a já persistida —
     // garante que scheduledAt/recurrenceEndAt sejam interpretados no mesmo fuso da recorrência.
