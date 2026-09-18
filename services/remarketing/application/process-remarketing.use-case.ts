@@ -1,4 +1,4 @@
-import { eq, and, inArray, lte, lt, ne } from "drizzle-orm";
+import { eq, and, inArray, lte, lt, ne, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   remarketingCampaigns, remarketingMessages, remarketingLeadState,
@@ -106,6 +106,39 @@ export async function enrollRemarketingTriggers(): Promise<number> {
     }
   }
   return enrolled;
+}
+
+// ── Reativação de campanha: retoma leads pausados por ela ter sido desligada ────
+// Só os estados pausados com pause_reason='campaign_inactive' voltam a 'active' —
+// nunca os pausados por outro motivo (ex.: no_messages, que precisa de mensagens
+// cadastradas antes de voltar a rodar) nem os já 'stopped'/'blocked'/'completed'
+// (esses têm as próprias regras, ou nenhuma retomada — ver reinscrição manual).
+//
+// Reagendamento: espalha o nextSendAt em vez de marcar now() pra todo mundo de
+// uma vez (uma campanha pausada há semanas pode ter milhares de leads acumulados
+// e uma reativação não pode virar uma rajada só porque todos ficaram "devidos" no
+// mesmo instante). Escalona 15s por lead via row_number() — mesma técnica usada
+// em requeueIncidentFailedDelays (runner.ts) para o mesmo tipo de problema. Isso
+// soma-se ao limite de 50 estados por chamada em processDueRemarketing: mesmo uma
+// reativação enorme nunca compete de golpe com o tráfego normal de outras
+// campanhas, e o próprio claim já limita quantos saem por tick de qualquer forma.
+export async function resumeLeadsAfterReactivation(campaignId: string): Promise<number> {
+  // Conta por RETURNING (res.rows), não por res.rowCount: o driver de produção
+  // (node-postgres) preenche rowCount, mas o PGlite usado nos testes só expõe
+  // affectedRows — RETURNING + rows.length funciona igual nos dois.
+  const res = await db.execute(sql`
+    WITH p AS (
+      SELECT id, row_number() OVER (ORDER BY updated_at) AS rn
+      FROM remarketing_lead_state
+      WHERE campaign_id = ${campaignId} AND status = 'paused' AND pause_reason = 'campaign_inactive'
+    )
+    UPDATE remarketing_lead_state rls
+    SET status = 'active', pause_reason = NULL, updated_at = now(),
+        next_send_at = now() + (p.rn * interval '15 seconds')
+    FROM p WHERE rls.id = p.id
+    RETURNING rls.id
+  `);
+  return res.rows.length;
 }
 
 // ── Processa estados vencidos (envia a próxima mensagem da sequência) ───────────

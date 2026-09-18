@@ -6,6 +6,7 @@ import { remarketingCampaigns, remarketingMessages, remarketingLeadState, bots, 
 import { eq, and, inArray, desc, sql } from "drizzle-orm";
 import { sanitizeButtonStyle, sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 import { assertBotOwnership, assertBotsOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
+import { resumeLeadsAfterReactivation } from "./application/process-remarketing.use-case.js";
 
 // Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts —
 // evita "invalid input syntax for type uuid" cru do driver quando um id vindo do cliente é
@@ -258,7 +259,7 @@ export const update = api(
     botIds?: string[];
   }): Promise<CampaignResponse> => {
     const { userID: userId } = getAuthData()!;
-    await assertCampaignOwnership(id, userId);
+    const existing = await assertCampaignOwnership(id, userId);
 
     if (req.botIds !== undefined) {
       // Vazio deixaria a campanha sem nenhum bot pra inscrever/enviar (órfã) — mesmo
@@ -284,6 +285,15 @@ export const update = api(
 
     const [updated] = await db.update(remarketingCampaigns).set(patch).where(eq(remarketingCampaigns.id, id)).returning();
     scanSourceAsync("remarketing", id);
+
+    // Reativação: campanha estava desligada e voltou a ligar agora — retoma só
+    // os leads que ELA pausou por estar inativa (ver resumeLeadsAfterReactivation
+    // pra regra de reagendamento). Não há endpoint dedicado de "ativar": é sempre
+    // este PATCH que faz a transição isActive false → true.
+    if (existing.isActive === false && updated.isActive === true) {
+      await resumeLeadsAfterReactivation(id);
+    }
+
     const msgCount = await db.select({ count: sql<number>`count(*)::int` }).from(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
     const counters = (await getCampaignCounters([id])).get(id);
     return toCampaignResponse(updated, msgCount[0]?.count ?? 0, undefined, counters);

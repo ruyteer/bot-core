@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
-import { processDueRemarketing, enrollRemarketingTriggers } from "./application/process-remarketing.use-case.js";
+import { processDueRemarketing, enrollRemarketingTriggers, resumeLeadsAfterReactivation } from "./application/process-remarketing.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
 import { remarketingCampaigns, remarketingMessages, remarketingLeadState, payments, leads, funnelOffers } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
@@ -265,5 +265,80 @@ describe("remarketing — cor do botão (style)", () => {
     const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
     const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
     expect(btn?.style).toBeUndefined();
+  });
+});
+
+describe("resumeLeadsAfterReactivation — reativar campanha retoma leads pausados por ela", () => {
+  it("volta paused/campaign_inactive para active, com nextSendAt no futuro (não dispara tudo de uma vez)", async () => {
+    const bot = await createBot();
+    const lead1 = await createLead(bot.id, 6400n);
+    const lead2 = await createLead(bot.id, 6401n);
+    const c = await campaign(bot.id, { isActive: false });
+    const before = new Date(Date.now() - 1000);
+    const st1 = await state(c.id, bot.id, lead1, { status: "paused", pauseReason: "campaign_inactive", nextSendAt: before });
+    const st2 = await state(c.id, bot.id, lead2, { status: "paused", pauseReason: "campaign_inactive", nextSendAt: before });
+
+    const n = await resumeLeadsAfterReactivation(c.id);
+    expect(n).toBe(2);
+
+    const db = await testDb();
+    const rows = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.campaignId, c.id));
+    const after1 = rows.find((r) => r.id === st1.id)!;
+    const after2 = rows.find((r) => r.id === st2.id)!;
+    expect(after1.status).toBe("active");
+    expect(after1.pauseReason).toBeNull();
+    expect(after2.status).toBe("active");
+    // Escalonado: os dois não ficam com o mesmo nextSendAt, e nenhum volta a ficar
+    // devido imediatamente (nextSendAt no futuro) — evita rajada na reativação.
+    expect(after1.nextSendAt.getTime()).toBeGreaterThan(Date.now());
+    expect(after2.nextSendAt.getTime()).toBeGreaterThan(after1.nextSendAt.getTime());
+  });
+
+  it("não mexe em paused por outro motivo (ex.: no_messages)", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6402n);
+    const c = await campaign(bot.id, { isActive: false });
+    const st = await state(c.id, bot.id, lead, { status: "paused", pauseReason: "no_messages" });
+
+    const n = await resumeLeadsAfterReactivation(c.id);
+    expect(n).toBe(0);
+
+    const db = await testDb();
+    const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
+    expect(after.status).toBe("paused");
+    expect(after.pauseReason).toBe("no_messages");
+  });
+
+  it("não mexe em estados stopped/blocked mesmo que a campanha reative", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6403n);
+    const c = await campaign(bot.id, { isActive: false });
+    const st = await state(c.id, bot.id, lead, { status: "stopped", pauseReason: "purchased" });
+
+    const n = await resumeLeadsAfterReactivation(c.id);
+    expect(n).toBe(0);
+
+    const db = await testDb();
+    const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
+    expect(after.status).toBe("stopped");
+  });
+
+  it("depois de retomado, o lead é processado normalmente quando o nextSendAt chega", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6404n);
+    const c = await campaign(bot.id, { isActive: true });
+    await message(c.id);
+    await state(c.id, bot.id, lead, { status: "paused", pauseReason: "campaign_inactive", nextSendAt: new Date(Date.now() - 1000) });
+
+    await resumeLeadsAfterReactivation(c.id);
+    // Ainda não está devido (nextSendAt escalonado no futuro) — processDueRemarketing não pega.
+    const n1 = await processDueRemarketing();
+    expect(n1).toBe(0);
+
+    // Adianta o relógio manualmente pra simular a passagem do tempo até o nextSendAt.
+    const db = await testDb();
+    await db.update(remarketingLeadState).set({ nextSendAt: new Date(Date.now() - 1000) }).where(eq(remarketingLeadState.campaignId, c.id));
+    const n2 = await processDueRemarketing();
+    expect(n2).toBe(1);
   });
 });
