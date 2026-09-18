@@ -343,24 +343,30 @@ describe("resumeLeadsAfterReactivation — reativar campanha retoma leads pausad
   });
 });
 
-describe("gatilho 'buyers' nunca para em stopOnPurchase (defesa em profundidade no processador)", () => {
-  it("envia normalmente mesmo com stopOnPurchase=true numa campanha 'buyers' já gravada assim", async () => {
+describe("gatilho 'buyers' + stopOnPurchase=true já gravado: processador NÃO corrige por baixo", () => {
+  it("continua parando sem enviar (proposital — ver create/update pra correção na escrita)", async () => {
+    // Campanha "suja": triggerType='buyers' + stopOnPurchase=true, combinação que
+    // create/update em remarketing.api.ts passam a recusar a partir desta versão
+    // — mas uma campanha JÁ gravada assim antes disso (ativa e silenciosa em
+    // produção, possivelmente há semanas/meses) não deve ser "corrigida" por
+    // baixo dos panos pelo processador: o gatilho 'buyers' inscreve compradores
+    // HISTÓRICOS (sem piso de data — ver enrollRemarketingTriggers), então
+    // destravar o envio aqui mandaria mensagem de uma vez pra todo comprador
+    // antigo já inscrito, sem o dono ter mexido conscientemente na campanha.
     const bot = await createBot();
     const gw = await createGateway({ userId: bot.userId });
     const lead = await createLead(bot.id, 6500n);
     const db = await testDb();
     await db.insert(payments).values({ userId: bot.userId, botId: bot.id, leadId: lead, gatewayId: gw, amount: 1000, status: "paid" });
-    // Campanha "suja": gravada (ou criada antes desta trava existir) com o par
-    // perigoso triggerType='buyers' + stopOnPurchase=true, que travaria o envio
-    // pra sempre se o processador confiasse cegamente no campo.
     const c = await campaign(bot.id, { triggerType: "buyers", stopOnPurchase: true });
     await message(c.id);
     const st = await state(c.id, bot.id, lead);
 
     const n = await processDueRemarketing();
-    expect(n).toBe(1);
-    expect(getSentMessages().length).toBeGreaterThan(0);
+    expect(n).toBe(0);
+    expect(getSentMessages()).toHaveLength(0);
     const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
-    expect(after.status).toBe("active");
+    expect(after.status).toBe("stopped");
+    expect(after.pauseReason).toBe("purchased");
   });
 });
