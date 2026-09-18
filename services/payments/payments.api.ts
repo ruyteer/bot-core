@@ -139,11 +139,17 @@ export const listGateways = api(
 // POST /gateways
 export const createGateway = api(
   { method: "POST", path: "/gateways", expose: true, auth: true },
-  async (req: { provider: string; label: string; clientId: string; clientSecret: string }): Promise<GatewayResponse> => {
+  async (req: { provider: string; label: string; clientId: string; clientSecret?: string }): Promise<GatewayResponse> => {
     const { userID: userId } = getAuthData()!;
     const validProviders: Provider[] = ["syncpay", "buckpay", "nexuspag", "wiinpay"];
     if (!validProviders.includes(req.provider as Provider)) {
       throw APIError.invalidArgument("invalid provider");
+    }
+    // Só o SyncPay usa client secret de fato (ver gateway-clients.ts) — os
+    // demais provedores ficam ok sem, mas o SyncPay sem secret quebraria só na
+    // hora de gerar o PIX, então valida aqui.
+    if (req.provider === "syncpay" && !req.clientSecret) {
+      throw APIError.invalidArgument("clientSecret é obrigatório para o provider syncpay");
     }
     return gwRepo.create({
       userId,

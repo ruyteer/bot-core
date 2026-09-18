@@ -3,8 +3,10 @@ import { eq } from "drizzle-orm";
 import { CreateBotUseCase } from "./application/use-cases/create-bot.use-case.js";
 import { RegisterWebhookUseCase } from "./application/use-cases/register-webhook.use-case.js";
 import { DeregisterWebhookUseCase } from "./application/use-cases/deregister-webhook.use-case.js";
+import { DeleteBotUseCase } from "./application/use-cases/delete-bot.use-case.js";
 import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js";
+import { MAX_BOTS_PER_USER } from "./domain/bot.entity.js";
 import { testDb } from "../../test/helpers/db.js";
 import { bots, payments } from "../shared/schema/index.js";
 import { createProfile, createBot, createGateway, createLead } from "../../test/helpers/seed.js";
@@ -66,6 +68,60 @@ describe("CreateBotUseCase", () => {
   });
 });
 
+// Furo: só a UI antiga impunha o limite de MAX_BOTS_PER_USER bots por conta —
+// client-side, então qualquer chamada direta à API (ou a UI nova) criava sem
+// limite. A checagem agora mora no repositório, dentro de uma transação com
+// advisory lock por usuário (ver BotDrizzleRepository.create).
+describe("CreateBotUseCase — limite de bots por conta", () => {
+  it("recusa o 21º bot com erro tipado, sem mexer no banco", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER; i++) {
+      await createBot({ userId });
+    }
+    await expect(new CreateBotUseCase(repo).execute({ userId, name: "Extra", telegramToken: "111:ABC" }))
+      .rejects.toThrow(new RegExp(`limite de ${MAX_BOTS_PER_USER}`));
+
+    const db = await testDb();
+    const rows = await db.select().from(bots).where(eq(bots.userId, userId));
+    expect(rows.length).toBe(MAX_BOTS_PER_USER);
+  });
+
+  it("usuários diferentes não se bloqueiam entre si (lock é por usuário)", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER; i++) {
+      await createBot({ userId });
+    }
+    const outroUserId = await createProfile();
+    // Outro usuário, com 0 bots, cria normalmente mesmo com o primeiro no limite.
+    const bot = await new CreateBotUseCase(repo).execute({ userId: outroUserId, name: "Bot", telegramToken: "111:ABC" });
+    expect(bot.userId).toBe(outroUserId);
+  });
+
+  it("corrida: dois POST simultâneos no 20º bot não criam os dois — só um passa, total fica em 20", async () => {
+    const userId = await createProfile();
+    for (let i = 0; i < MAX_BOTS_PER_USER - 1; i++) {
+      await createBot({ userId }); // 19 bots — o próximo é o 20º (último permitido)
+    }
+
+    const results = await Promise.allSettled([
+      new CreateBotUseCase(repo).execute({ userId, name: "A", telegramToken: "111:ABC" }),
+      new CreateBotUseCase(repo).execute({ userId, name: "B", telegramToken: "111:ABC" }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected  = results.filter((r) => r.status === "rejected");
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      message: expect.stringContaining(`limite de ${MAX_BOTS_PER_USER}`),
+    });
+
+    const db = await testDb();
+    const rows = await db.select().from(bots).where(eq(bots.userId, userId));
+    expect(rows.length).toBe(MAX_BOTS_PER_USER);
+  });
+});
+
 describe("RegisterWebhookUseCase", () => {
   it("setWebhook ok → ativa o bot e chama allowed_updates com my_chat_member", async () => {
     const bot = await createBot();
@@ -100,6 +156,42 @@ describe("DeregisterWebhookUseCase", () => {
     forceTelegramError("deleteWebhook", 500);
     await expect(new DeregisterWebhookUseCase(repo).execute(bot.id, bot.userId))
       .rejects.toThrow(/forced error/);
+  });
+});
+
+// Furo: DELETE /bots/:id só fazia `DELETE FROM bots` — sem avisar o Telegram
+// antes, o webhook continuava configurado e o Telegram seguia mandando update
+// pra um bot que não existe mais aqui. Agora desregistra antes de excluir, e
+// uma falha do Telegram nessa etapa (token já revogado, bot já removido no
+// BotFather, timeout, etc.) NUNCA pode travar a exclusão.
+describe("DeleteBotUseCase", () => {
+  it("exclui o bot e desregistra o webhook no Telegram antes", async () => {
+    const bot = await createBot();
+    await new DeleteBotUseCase(repo).execute(bot.id, bot.userId);
+
+    expect(getTelegramCalls("deleteWebhook").length).toBe(1);
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(0);
+  });
+
+  it("Telegram falhando ao desregistrar (erro real, não 401/404) não impede a exclusão", async () => {
+    const bot = await createBot();
+    forceTelegramError("deleteWebhook", 500);
+
+    await expect(new DeleteBotUseCase(repo).execute(bot.id, bot.userId)).resolves.toBeUndefined();
+
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(0);
+  });
+
+  it("bot de outro usuário → not found, nada é chamado no Telegram nem apagado", async () => {
+    const bot = await createBot();
+    const outroUserId = await createProfile();
+    await expect(new DeleteBotUseCase(repo).execute(bot.id, outroUserId)).rejects.toThrow();
+
+    expect(getTelegramCalls("deleteWebhook").length).toBe(0);
+    const db = await testDb();
+    expect((await db.select().from(bots).where(eq(bots.id, bot.id))).length).toBe(1);
   });
 });
 

@@ -1,8 +1,9 @@
 import { eq, and, sql } from "drizzle-orm";
+import { APIError } from "encore.dev/api";
 import { db } from "../../shared/database.js";
 import { bots } from "../../shared/schema/index.js";
 import { decrypt } from "../../shared/crypto.js";
-import type { Bot, BotInternal, BotWithStats, CreateBotInput, UpdateBotInput } from "../domain/bot.entity.js";
+import { MAX_BOTS_PER_USER, type Bot, type BotInternal, type BotWithStats, type CreateBotInput, type UpdateBotInput } from "../domain/bot.entity.js";
 import type { BotRepository } from "../domain/bot.repository.js";
 
 function toPublic(row: typeof bots.$inferSelect): Bot {
@@ -23,15 +24,35 @@ export class BotDrizzleRepository implements BotRepository {
   async create(
     input: CreateBotInput & { webhookSecret: string; encryptedToken: string },
   ): Promise<Bot> {
-    const [row] = await db
-      .insert(bots)
-      .values({
-        userId:        input.userId,
-        name:          input.name,
-        telegramToken: input.encryptedToken,
-        webhookSecret: input.webhookSecret,
-      })
-      .returning();
+    // Limite de MAX_BOTS_PER_USER bots por conta, seguro contra corrida: o
+    // advisory lock é por transação (pg_advisory_xact_lock, liberado sozinho no
+    // commit/rollback) e escopado ao usuário via hashtext(userId) — duas
+    // transações do MESMO usuário serializam aqui, mas usuários diferentes não
+    // se bloqueiam. Sem isto, dois POST /bots simultâneos no 20º bot passavam os
+    // dois pela contagem antes de qualquer um inserir, criando um 21º.
+    const row = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.userId}))`);
+
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(bots)
+        .where(eq(bots.userId, input.userId));
+
+      if (count >= MAX_BOTS_PER_USER) {
+        throw APIError.resourceExhausted(`limite de ${MAX_BOTS_PER_USER} bots por conta atingido`);
+      }
+
+      const [inserted] = await tx
+        .insert(bots)
+        .values({
+          userId:        input.userId,
+          name:          input.name,
+          telegramToken: input.encryptedToken,
+          webhookSecret: input.webhookSecret,
+        })
+        .returning();
+      return inserted;
+    });
     return toPublic(row);
   }
 
