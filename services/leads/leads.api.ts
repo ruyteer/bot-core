@@ -12,6 +12,51 @@ import { TelegramClient, TelegramApiError } from "../runner/application/telegram
 
 const repo = new LeadDrizzleRepository();
 
+// ─── Foto de mensagem (data URL) ────────────────────────────────────────────
+//
+// A UI manda `mediaUrl` como data URL (`data:image/jpeg;base64,...`, gerada
+// por FileReader.readAsDataURL) quando o usuário anexa uma foto no chat — a
+// Bot API do Telegram NÃO aceita data URL no campo `photo` de um sendPhoto
+// via JSON (só file_id ou URL http/https), então esse envio nunca funcionou.
+// Decodifica e valida aqui para mandar por multipart (ver TelegramClient.sendPhotoFile).
+const ALLOWED_PHOTO_MIME_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png":  "png",
+  "image/webp": "webp",
+};
+
+// Mesma ordem de grandeza do bodyLimit default do Encore para este endpoint
+// (2 MiB, o endpoint não declara `bodyLimit` próprio) — o corpo JSON inteiro já
+// não passaria disso, mas a checagem explícita dá um erro claro em vez de
+// depender do body limit cru do framework.
+const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
+
+const PHOTO_DATA_URL_RE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/;
+
+function parsePhotoDataUrl(mediaUrl: string): { buffer: Buffer; mimeType: string; ext: string } {
+  const match = PHOTO_DATA_URL_RE.exec(mediaUrl);
+  if (!match) throw APIError.invalidArgument("foto: formato não suportado (use JPEG, PNG ou WEBP)");
+  const [, mimeType, base64] = match;
+
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(base64, "base64");
+  } catch {
+    throw APIError.invalidArgument("foto: dados em base64 inválidos");
+  }
+  // Buffer.from ignora silenciosamente caracteres fora do alfabeto base64 —
+  // reencodar e comparar pega padding/conteúdo inválido que o regex de charset
+  // sozinho deixaria passar.
+  if (buffer.toString("base64").replace(/=+$/, "") !== base64.replace(/=+$/, "")) {
+    throw APIError.invalidArgument("foto: dados em base64 inválidos");
+  }
+  if (buffer.length === 0 || buffer.length > MAX_PHOTO_BYTES) {
+    throw APIError.invalidArgument(`foto: arquivo excede o tamanho máximo permitido (${MAX_PHOTO_BYTES / (1024 * 1024)} MiB)`);
+  }
+
+  return { buffer, mimeType, ext: ALLOWED_PHOTO_MIME_EXT[mimeType] };
+}
+
 async function assertLeadOwnership(leadId: string, userId: string) {
   const lead = await repo.findById(leadId);
   if (!lead) throw APIError.notFound("lead not found");
@@ -187,7 +232,12 @@ export const sendMessage = api(
       if (kind === "text" && text) {
         await tg.sendMessage({ chatId, text });
       } else if (kind === "photo" && mediaUrl) {
-        await tg.sendPhoto({ chatId, photo: mediaUrl });
+        if (mediaUrl.startsWith("data:")) {
+          const { buffer, mimeType, ext } = parsePhotoDataUrl(mediaUrl);
+          await tg.sendPhotoFile({ chatId, buffer, mimeType, filename: `photo.${ext}` });
+        } else {
+          await tg.sendPhoto({ chatId, photo: mediaUrl });
+        }
       } else {
         throw APIError.invalidArgument("unsupported message kind or missing content");
       }
