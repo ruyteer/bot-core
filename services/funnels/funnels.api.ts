@@ -161,10 +161,10 @@ export const create = api(
 // PATCH /funnels/:id
 export const update = api(
   { method: "PATCH", path: "/funnels/:id", expose: true, auth: true },
-  async ({ id, ...req }: { id: string; name?: string; botId?: string | null; simplifiedConfig?: Record<string, unknown> }): Promise<FunnelResponse> => {
+  async ({ id, expectedUpdatedAt, ...req }: { id: string; name?: string; botId?: string | null; simplifiedConfig?: Record<string, unknown>; expectedUpdatedAt?: string }): Promise<FunnelResponse> => {
     const { userID: userId } = getAuthData()!;
     if (req.botId !== undefined && req.botId !== null) await assertBotOwnership(req.botId, userId);
-    const funnel = await repo.update(id, userId, req);
+    const funnel = await repo.update(id, userId, req, expectedUpdatedAt ? new Date(expectedUpdatedAt) : undefined);
     const detail = await repo.findByIdOwned(funnel.id, userId);
     if (!detail) throw APIError.notFound("funnel not found");
     scanSourceAsync("funnel", funnel.id);
@@ -218,9 +218,9 @@ export const deactivate = api(
 // completas — ver `assertFunnelReadyToActivate` acima.
 export const saveFlow = api(
   { method: "PUT", path: "/funnels/:id/flow", expose: true, auth: true },
-  async ({ id, nodes, connections }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
+  async ({ id, ...input }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
     const { userID: userId } = getAuthData()!;
-    await repo.saveFlow(id, userId, { nodes, connections });
+    await repo.saveFlow(id, userId, input);
     scanSourceAsync("funnel", id);
     return { ok: true };
   },

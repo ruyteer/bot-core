@@ -29,6 +29,7 @@ export class APIError extends Error {
   static failedPrecondition(m: string) { return new APIError("failed_precondition", m); }
   static resourceExhausted(m: string) { return new APIError("resource_exhausted", m); }
   static unavailable(m: string) { return new APIError("unavailable", m); }
+  static aborted(m: string) { return new APIError("aborted", m); }
 }
 
 export const ErrCode = {

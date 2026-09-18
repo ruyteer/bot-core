@@ -9,7 +9,10 @@ export interface FunnelRepository {
   // precisa passar por `activate()`, que valida completude de oferta antes
   // (ver `assertFunnelReadyToActivate` em `funnels.api.ts`) — permitir setar
   // isActive aqui reabriria esse bypass sem nenhum erro de compilação avisando.
-  update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig">>): Promise<Funnel>;
+  // `expectedUpdatedAt`: checagem otimista de concorrência opcional (mesma
+  // ideia do `saveFlow` — ver `FunnelDrizzleRepository`); sem ela, o
+  // comportamento é o mesmo de antes.
+  update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig" | "botId">>, expectedUpdatedAt?: Date): Promise<Funnel>;
   delete(id: string, userId: string): Promise<void>;
   saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<void>;
   activate(id: string, userId: string): Promise<void>;
