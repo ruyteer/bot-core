@@ -181,6 +181,31 @@ export class TelegramClient {
     }
   }
 
+  // Mesmo tratamento de erro/timeout de `call`, mas com corpo multipart (upload
+  // de arquivo) em vez de JSON — a Bot API espera multipart para binário.
+  private async callMultipart(method: string, form: FormData): Promise<unknown> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
+        method: "POST",
+        body:   form,
+        signal: controller.signal,
+      });
+      const json = await res.json() as {
+        ok: boolean; result?: unknown;
+        error_code?: number; description?: string;
+        parameters?: { retry_after?: number };
+      };
+      if (!json.ok) {
+        throw new TelegramApiError(method, json.error_code, json.description, json.parameters?.retry_after);
+      }
+      return json.result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async sendMessage(opts: SendMessageOptions): Promise<void> {
     await this.call("sendMessage", {
       chat_id:         opts.chatId,
@@ -199,6 +224,31 @@ export class TelegramClient {
       reply_markup:    opts.replyMarkup,
       protect_content: opts.protectContent ?? false,
     });
+  }
+
+  // Envia uma foto a partir de bytes já decodificados (ex.: data URL recebida
+  // da UI) via multipart — a Bot API não aceita data URL no campo `photo` de
+  // um corpo JSON, só `file_id` ou URL http(s) (mesma limitação resolvida para
+  // setChatPhoto/setMyProfilePhoto em telegram-profile.ts). Sem cache de
+  // file_id aqui: cada upload é um binário novo, não uma URL estável para
+  // servir de chave.
+  async sendPhotoFile(opts: {
+    chatId: string; buffer: Buffer; mimeType: string; filename: string;
+    caption?: string; parseMode?: "HTML" | "Markdown" | "MarkdownV2";
+    replyMarkup?: unknown; protectContent?: boolean;
+  }): Promise<void> {
+    const form = new FormData();
+    form.append("chat_id", opts.chatId);
+    if (opts.caption) form.append("caption", opts.caption);
+    form.append("parse_mode", opts.parseMode ?? "HTML");
+    if (opts.replyMarkup) form.append("reply_markup", JSON.stringify(opts.replyMarkup));
+    form.append("protect_content", String(opts.protectContent ?? false));
+    // Uint8Array.from (não o Buffer direto): @types/node tipa Buffer como
+    // Uint8Array<ArrayBufferLike> (aceita SharedArrayBuffer), e BlobPart exige
+    // um ArrayBuffer concreto — Buffer cru não bate com o tipo, mesmo sendo
+    // válido em runtime.
+    form.append("photo", new Blob([Uint8Array.from(opts.buffer)], { type: opts.mimeType }), opts.filename);
+    await this.callMultipart("sendPhoto", form);
   }
 
   async sendDocument(chatId: string, document: string, caption?: string, protectContent = false): Promise<void> {
