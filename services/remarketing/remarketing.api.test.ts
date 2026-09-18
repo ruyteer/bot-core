@@ -242,13 +242,6 @@ describe("create — defaults perigosos corrigidos", () => {
     expect(c.maxCycles).toBe(3);
   });
 
-  it("gatilho 'buyers' força stopOnPurchase=false mesmo se o cliente mandar true", async () => {
-    const bot = await createBot();
-    authUserId = bot.userId;
-    const c = await create({ botId: bot.id, name: "Camp", triggerType: "buyers", stopOnPurchase: true });
-    expect(c.stopOnPurchase).toBe(false);
-  });
-
   it("outros gatilhos preservam stopOnPurchase enviado", async () => {
     const bot = await createBot();
     authUserId = bot.userId;
@@ -257,22 +250,39 @@ describe("create — defaults perigosos corrigidos", () => {
   });
 });
 
-describe("update — força stopOnPurchase=false ao mudar/manter gatilho 'buyers'", () => {
-  it("PATCH triggerType para 'buyers' força stopOnPurchase=false mesmo mantendo o valor antigo", async () => {
+describe("stopOnPurchase — core NÃO força false pra gatilho 'buyers' (decisão revisada)", () => {
+  // Uma versão anterior desta correção forçava stopOnPurchase=false no core
+  // sempre que triggerType='buyers', em create e update. Revertido: como o
+  // gatilho 'buyers' inscreve compradores HISTÓRICOS (sem piso de data — ver
+  // enrollRemarketingTriggers), qualquer edição de uma campanha 'buyers' pela
+  // UI ANTIGA em produção (até renomear, já que o PATCH manda o objeto todo)
+  // ligaria esse envio silenciosamente, mandando mensagem pra todo comprador
+  // que o bot já teve, sem o usuário perceber ou decidir isso conscientemente.
+  // A UI NOVA vai tratar isso de forma explícita (força false com aviso e
+  // mostra quantos compradores seriam inscritos antes de ativar) — o core
+  // continua repassando o campo como o cliente mandou, sem decidir por ele.
+  it("create com triggerType='buyers' preserva stopOnPurchase=true enviado pelo cliente", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp", triggerType: "buyers", stopOnPurchase: true });
+    expect(c.stopOnPurchase).toBe(true);
+  });
+
+  it("PATCH triggerType para 'buyers' não mexe em stopOnPurchase existente", async () => {
     const bot = await createBot();
     authUserId = bot.userId;
     const c = await campaign(bot.id, { triggerType: "pix_unpaid", stopOnPurchase: true });
 
     const updated = await update({ id: c.id, triggerType: "buyers" });
-    expect(updated.stopOnPurchase).toBe(false);
+    expect(updated.stopOnPurchase).toBe(true);
   });
 
-  it("PATCH tentando ligar stopOnPurchase numa campanha já 'buyers' é ignorado", async () => {
+  it("PATCH ligando stopOnPurchase numa campanha já 'buyers' é respeitado (repassa o que o cliente mandou)", async () => {
     const bot = await createBot();
     authUserId = bot.userId;
     const c = await campaign(bot.id, { triggerType: "buyers", stopOnPurchase: false });
 
     const updated = await update({ id: c.id, stopOnPurchase: true });
-    expect(updated.stopOnPurchase).toBe(false);
+    expect(updated.stopOnPurchase).toBe(true);
   });
 });
