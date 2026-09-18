@@ -8,6 +8,7 @@ import { createBot, createFlowFunnel, textUpdate } from "../../test/helpers/seed
 import { getSentMessages } from "../../test/helpers/fetch-mock.js";
 import { leads, trackingClicks, bots } from "../shared/schema/index.js";
 import { registerTrackingClick, applyStartTracking } from "./application/tracking-click.js";
+import { CLICK_RATE_LIMIT, _resetClickRateLimiterForTests } from "./application/click-rate-limiter.js";
 import { ExecuteFlowStepUseCase } from "../runner/application/execute-flow-step.use-case.js";
 
 const runner = new ExecuteFlowStepUseCase();
@@ -66,6 +67,59 @@ describe("registerTrackingClick (/r)", () => {
 
   it("bot inexistente retorna null", async () => {
     expect(await registerTrackingClick({ botId: crypto.randomUUID() })).toBeNull();
+  });
+});
+
+describe("registerTrackingClick — limite de replay por IP+bot", () => {
+  it("acima do limite, reaproveita o token do último clique gravado em vez de inserir outro", async () => {
+    _resetClickRateLimiterForTests();
+    const bot = await botWithFunnel();
+    const ip = "203.0.113.9";
+
+    let lastUrl = "";
+    for (let i = 0; i < CLICK_RATE_LIMIT.maxPerWindow; i++) {
+      lastUrl = (await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook" }))!.url;
+    }
+
+    const db = await testDb();
+    const rowsBeforeOverflow = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
+    expect(rowsBeforeOverflow.length).toBe(CLICK_RATE_LIMIT.maxPerWindow);
+
+    // Um clique a mais estourando a janela: não grava linha nova, devolve a
+    // mesma URL (mesmo token) do último clique já gravado.
+    const overLimit = await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook" });
+    expect(overLimit!.url).toBe(lastUrl);
+
+    const rowsAfterOverflow = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
+    expect(rowsAfterOverflow.length).toBe(CLICK_RATE_LIMIT.maxPerWindow);
+  });
+
+  it("IPs diferentes no mesmo bot não competem pelo mesmo limite", async () => {
+    _resetClickRateLimiterForTests();
+    const bot = await botWithFunnel();
+
+    for (let i = 0; i < CLICK_RATE_LIMIT.maxPerWindow; i++) {
+      await registerTrackingClick({ botId: bot.id, clientIp: "198.51.100.1" });
+    }
+    // Outro IP no mesmo bot ainda grava normalmente — o limite é por (ip, botId).
+    const other = await registerTrackingClick({ botId: bot.id, clientIp: "198.51.100.2" });
+    expect(other).not.toBeNull();
+
+    const db = await testDb();
+    const rows = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
+    expect(rows.length).toBe(CLICK_RATE_LIMIT.maxPerWindow + 1);
+  });
+
+  it("sem IP (proxy que não repassa nada), não aplica rate limit", async () => {
+    _resetClickRateLimiterForTests();
+    const bot = await botWithFunnel();
+    for (let i = 0; i < CLICK_RATE_LIMIT.maxPerWindow + 2; i++) {
+      const res = await registerTrackingClick({ botId: bot.id });
+      expect(res).not.toBeNull();
+    }
+    const db = await testDb();
+    const rows = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
+    expect(rows.length).toBe(CLICK_RATE_LIMIT.maxPerWindow + 2);
   });
 });
 
