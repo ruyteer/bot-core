@@ -492,6 +492,18 @@ export const memberCounts = api(
 
 // ─── Tracking Pixels ──────────────────────────────────────────────────────────
 
+// Providers de pixel suportados. Antes qualquer string era aceita como
+// `provider` em upsert/get/delete/test — um valor inválido só ia quebrar mais
+// tarde, na hora do disparo do evento de conversão.
+type PixelProvider = "facebook" | "tiktok" | "kwai";
+const VALID_PIXEL_PROVIDERS: PixelProvider[] = ["facebook", "tiktok", "kwai"];
+
+function assertValidPixelProvider(provider: string): asserts provider is PixelProvider {
+  if (!VALID_PIXEL_PROVIDERS.includes(provider as PixelProvider)) {
+    throw APIError.invalidArgument(`provider inválido: ${provider} (use facebook, tiktok ou kwai)`);
+  }
+}
+
 interface PixelResponse {
   id:          string;
   provider:    string;
@@ -515,6 +527,7 @@ export const listPixels = api(
 export const upsertPixel = api(
   { method: "PUT", path: "/bots/:id/pixels/:provider", expose: true, auth: true },
   async ({ id, provider, pixelId, accessToken, isActive }: { id: string; provider: string; pixelId: string; accessToken?: string | null; isActive?: boolean }): Promise<PixelResponse> => {
+    assertValidPixelProvider(provider);
     const { userID: userId } = getAuthData()!;
     const bots = await repo.findByUserId(userId);
     if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
@@ -542,6 +555,7 @@ export const upsertPixel = api(
 export const getPixel = api(
   { method: "GET", path: "/bots/:id/pixels/:provider", expose: true, auth: true },
   async ({ id, provider }: { id: string; provider: string }): Promise<{ found: boolean; id: string; provider: string; pixelId: string; accessToken: string | null; isActive: boolean }> => {
+    assertValidPixelProvider(provider);
     const { userID: userId } = getAuthData()!;
     const bots = await repo.findByUserId(userId);
     if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
@@ -556,6 +570,7 @@ export const getPixel = api(
 export const deletePixel = api(
   { method: "DELETE", path: "/bots/:id/pixels/:provider", expose: true, auth: true },
   async ({ id, provider }: { id: string; provider: string }): Promise<void> => {
+    assertValidPixelProvider(provider);
     const { userID: userId } = getAuthData()!;
     const bots = await repo.findByUserId(userId);
     if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
@@ -592,6 +607,7 @@ export const listPixelEvents = api(
 export const testPixel = api(
   { method: "POST", path: "/bots/:id/pixels/:provider/test", expose: true, auth: true },
   async ({ id, provider }: { id: string; provider: string }): Promise<{ ok: boolean }> => {
+    assertValidPixelProvider(provider);
     const { userID: userId } = getAuthData()!;
     const bots = await repo.findByUserId(userId);
     if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
