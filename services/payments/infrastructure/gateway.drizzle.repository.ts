@@ -134,12 +134,20 @@ export class GatewayDrizzleRepository {
       updatedAt: new Date(),
     }).where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)))
       .returning({ id: paymentGateways.id, provider: paymentGateways.provider, label: paymentGateways.label, isActive: paymentGateways.isActive });
+    // Gateway de outro usuário (ou inexistente) casa 0 linhas no WHERE — sem
+    // isto, `row` vinha undefined e `row.provider` estourava um erro cru (500)
+    // em vez de um 404 limpo.
+    if (!row) throw APIError.notFound("gateway not found");
     return { ...row, provider: row.provider as Provider };
   }
 
   async toggle(id: string, userId: string, isActive: boolean): Promise<void> {
-    await db.update(paymentGateways).set({ isActive, updatedAt: new Date() })
-      .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)));
+    const [row] = await db.update(paymentGateways).set({ isActive, updatedAt: new Date() })
+      .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)))
+      .returning({ id: paymentGateways.id });
+    // Mesmo caso do update(): gateway de outro usuário não pode virar um "ok:
+    // true" silencioso que não mudou nada.
+    if (!row) throw APIError.notFound("gateway not found");
   }
 
   async delete(id: string, userId: string): Promise<void> {
@@ -158,15 +166,20 @@ export class GatewayDrizzleRepository {
     // Rede de segurança para a corrida entre a checagem acima e este delete
     // (ex.: um PIX sendo gerado nesse meio-tempo): se ainda assim bater na FK,
     // vira o mesmo erro tipado em vez de propagar o erro cru do driver.
+    let row: { id: string } | undefined;
     try {
-      await db.delete(paymentGateways)
-        .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)));
+      [row] = await db.delete(paymentGateways)
+        .where(and(eq(paymentGateways.id, id), eq(paymentGateways.userId, userId)))
+        .returning({ id: paymentGateways.id });
     } catch (err) {
       if (isForeignKeyViolation(err)) {
         throw APIError.failedPrecondition("há pagamentos vinculados a este gateway — não é possível excluir");
       }
       throw err;
     }
+    // Gateway de outro usuário (ou já excluído): 0 linhas afetadas, nada foi
+    // alterado — devolve 404 em vez de um "sucesso" silencioso.
+    if (!row) throw APIError.notFound("gateway not found");
   }
 
   // Decrypt credentials for use in API calls

@@ -61,12 +61,14 @@ describe("deleteGateway — pagamento vinculado", () => {
     const fakeDb = {
       select: realDb.select.bind(realDb),
       delete: () => ({
-        where: async () => {
-          throw Object.assign(
-            new Error('update or delete on table "payment_gateways" violates foreign key constraint "payments_gateway_id_fkey" on table "payments"'),
-            { code: "23503", constraint: "payments_gateway_id_fkey" },
-          );
-        },
+        where: () => ({
+          returning: async () => {
+            throw Object.assign(
+              new Error('update or delete on table "payment_gateways" violates foreign key constraint "payments_gateway_id_fkey" on table "payments"'),
+              { code: "23503", constraint: "payments_gateway_id_fkey" },
+            );
+          },
+        }),
       }),
     };
 
