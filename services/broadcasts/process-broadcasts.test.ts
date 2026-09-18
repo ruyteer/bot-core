@@ -46,6 +46,37 @@ describe("processDueBroadcasts", () => {
     expect(getSentMessages().filter((m) => m === "Oi Lead!").length).toBe(1);
   });
 
+  it("filterType 'product' com filterProductId de oferta de OUTRO bot não envia pra ninguém (nunca vaza pagamento cross-tenant)", async () => {
+    // filterProductId nunca é validado contra o dono na escrita (create/send/PATCH),
+    // mas getAudienceLeads sempre casa payments.botId=<bot do broadcast> E
+    // payments.offerId=filterProductId — um offerId de outro bot/dono nunca bate
+    // nenhum pagamento DESTE bot, então o filtro resulta em audiência vazia, nunca
+    // em leads de outro tenant. Ver services/broadcasts/application/process-broadcasts.use-case.ts:71-76.
+    const owner = await createBot();
+    const foreignBot = await createBot(); // outro dono
+    const gw = await createGateway({ userId: owner.userId });
+    const foreignGw = await createGateway({ userId: foreignBot.userId });
+    const ownLead = await createLead(owner.id, 5100n);
+    const foreignLead = await createLead(foreignBot.id, 5101n);
+    const db = await testDb();
+    const [foreignOffer] = await db.insert(funnelOffers).values({ botId: foreignBot.id, name: "Oferta alheia", price: 1000 }).returning();
+    // Pagamento real do bot alheio pra essa oferta (é o que teríamos vazado se o
+    // filtro não fosse escopado por botId).
+    await db.insert(payments).values({ userId: foreignBot.userId, botId: foreignBot.id, leadId: foreignLead, gatewayId: foreignGw, amount: 1000, offerId: foreignOffer.id, status: "paid" });
+    // O dono do broadcast também tem um comprador — mas de OUTRA oferta (não a filtrada).
+    const [ownOffer] = await db.insert(funnelOffers).values({ botId: owner.id, name: "Oferta própria", price: 1000 }).returning();
+    await db.insert(payments).values({ userId: owner.userId, botId: owner.id, leadId: ownLead, gatewayId: gw, amount: 1000, offerId: ownOffer.id, status: "paid" });
+
+    await seedMsg(owner.id, owner.userId, {
+      filterType: "product",
+      advancedFilters: { filter_product_id: foreignOffer.id },
+      message: "promo",
+    });
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMessage").length).toBe(0);
+  });
+
   it("filterType 'buyers' só envia para quem comprou", async () => {
     const bot = await createBot();
     const gw = await createGateway({ userId: bot.userId });
