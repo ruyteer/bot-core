@@ -1,8 +1,9 @@
 // Regressão dos riscos confirmados em nova-ui/docs/fase-5/semantica-e-riscos.md
-// (broadcasts): clique duplo criando dois disparos. Chama os handlers REAIS
-// de broadcasts.api.ts.
+// (broadcasts): clique duplo criando dois disparos, e edição/cancelamento
+// durante o envio. Chama os handlers REAIS de broadcasts.api.ts.
 import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { APIError } from "encore.dev/api";
 import { testDb } from "../../test/helpers/db.js";
 import { scheduledMessages } from "../shared/schema/index.js";
 import { createBot } from "../../test/helpers/seed.js";
@@ -12,7 +13,7 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { create, send } = await import("./broadcasts.api.js");
+const { create, send, update, remove } = await import("./broadcasts.api.js");
 
 describe("clientRequestId — clique duplo não cria dois disparos", () => {
   it("create: mesma clientRequestId devolve o disparo já criado, sem duplicar", async () => {
@@ -57,5 +58,54 @@ describe("clientRequestId — clique duplo não cria dois disparos", () => {
     const db = await testDb();
     const rows = await db.select().from(scheduledMessages).where(eq(scheduledMessages.botId, bot.id));
     expect(rows).toHaveLength(1);
+  });
+});
+
+describe("PATCH/DELETE durante envio — 409 em vez de mentir com 200", () => {
+  async function createSendingBroadcast() {
+    const bot = await createBot();
+    const db = await testDb();
+    const [row] = await db.insert(scheduledMessages).values({
+      userId: bot.userId, botId: bot.id, botIds: [bot.id], message: "promo",
+      broadcastType: "instant", filterType: "all", targetType: "leads", targetGroupIds: [],
+      scheduledAt: new Date(), status: "sending",
+    }).returning();
+    return { bot, row };
+  }
+
+  it("update: 409 (aborted) quando o disparo está em 'sending'", async () => {
+    const { bot, row } = await createSendingBroadcast();
+    authUserId = bot.userId;
+
+    let error: unknown;
+    try { await update({ id: row.id, message: "editado" }); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(APIError);
+    expect((error as APIError).code).toBe("aborted");
+
+    const db = await testDb();
+    const [after] = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, row.id));
+    expect(after.message).toBe("promo"); // não alterou nada
+  });
+
+  it("remove: 409 (aborted) quando o disparo está em 'sending'", async () => {
+    const { bot, row } = await createSendingBroadcast();
+    authUserId = bot.userId;
+
+    let error: unknown;
+    try { await remove({ id: row.id }); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(APIError);
+    expect((error as APIError).code).toBe("aborted");
+
+    const db = await testDb();
+    const rows = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, row.id));
+    expect(rows).toHaveLength(1); // não excluiu
+  });
+
+  it("update: fora de 'sending' continua funcionando normalmente (sanidade)", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const created = await create({ botId: bot.id, message: "promo", scheduledAt: new Date(Date.now() + 60_000).toISOString() });
+    const updated = await update({ id: created.id, message: "editado" });
+    expect(updated.message).toBe("editado");
   });
 });

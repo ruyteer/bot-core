@@ -9,6 +9,16 @@ import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts
 import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
 import { isUniqueViolation } from "../shared/db-errors.js";
 
+// Disparo em "sending" está sendo processado neste exato momento pelo runner
+// (ver process-broadcasts.use-case.ts) — editar ou cancelar nesse meio-tempo
+// não interrompe nada e deixa a UI achando que mudou algo que na prática já
+// está indo pro Telegram. Bloqueia com 409 em vez de mentir com um 200.
+function assertNotSending(status: string): void {
+  if (status === "sending") {
+    throw APIError.aborted("disparo em andamento — aguarde terminar para editar ou cancelar");
+  }
+}
+
 // Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts.
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -317,12 +327,12 @@ export const update = api(
     recurrenceRule?: unknown | null;
     recurrenceMaxOccurrences?: number | null;
     recurrenceEndAt?: string | null;
-    recurrenceCount?: number;
   }): Promise<ScheduledMessageResponse> => {
     const { userID: userId } = getAuthData()!;
     const existing = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, id)).limit(1);
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
+    assertNotSending(existing[0].status);
     if (req.targetGroupIds !== undefined) await assertGroupsOwnership(req.targetGroupIds, userId);
 
     // tz efetivo: usa a recurrenceRule enviada no patch (se houver), senão a já persistida —
@@ -339,7 +349,9 @@ export const update = api(
     if ("recurrenceRule" in req)                  patch.recurrenceRule = req.recurrenceRule;
     if ("recurrenceMaxOccurrences" in req)        patch.recurrenceMaxOccurrences = req.recurrenceMaxOccurrences;
     if (req.recurrenceEndAt !== undefined)        patch.recurrenceEndAt = req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null;
-    if (req.recurrenceCount !== undefined)        patch.recurrenceCount = req.recurrenceCount;
+    // recurrenceCount não é mais aceito do cliente: é controle interno do
+    // processamento (finalizeSchedule em process-broadcasts.use-case.ts), não
+    // algo que a UI deveria poder sobrescrever.
 
     const [updated] = await db.update(scheduledMessages).set(patch).where(eq(scheduledMessages.id, id)).returning();
     scanSourceAsync("broadcast", id);
@@ -355,6 +367,7 @@ export const remove = api(
     const existing = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, id)).limit(1);
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
+    assertNotSending(existing[0].status);
     await db.delete(scheduledMessages).where(eq(scheduledMessages.id, id));
   },
 );
