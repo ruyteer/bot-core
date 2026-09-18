@@ -256,6 +256,35 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "referral_withdrawals_pending_user_unique"
      ON "referral_withdrawals" USING btree ("user_id")
      WHERE "status" = 'pending'`,
+
+  // 0016_broadcast_deliveries.sql — corrige o reenvio pro público inteiro
+  // quando um broadcast trava em "sending" >10min e é resgatado: registro por
+  // lead já entregue (broadcast_deliveries), escopado por ocorrência.
+  `CREATE TABLE IF NOT EXISTS "broadcast_deliveries" (
+     "id"                    uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+     "scheduled_message_id"  uuid NOT NULL,
+     "occurrence_at"         timestamp with time zone NOT NULL,
+     "lead_id"               uuid NOT NULL,
+     "created_at"            timestamp with time zone DEFAULT now() NOT NULL
+   )`,
+  `DO $$ BEGIN
+     ALTER TABLE "broadcast_deliveries" ADD CONSTRAINT "broadcast_deliveries_scheduled_message_id_scheduled_messages_id_fk"
+       FOREIGN KEY ("scheduled_message_id") REFERENCES "scheduled_messages"("id") ON DELETE cascade ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  `DO $$ BEGIN
+     ALTER TABLE "broadcast_deliveries" ADD CONSTRAINT "broadcast_deliveries_lead_id_leads_id_fk"
+       FOREIGN KEY ("lead_id") REFERENCES "leads"("id") ON DELETE cascade ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "broadcast_deliveries_message_occurrence_lead_unique"
+     ON "broadcast_deliveries" USING btree ("scheduled_message_id", "occurrence_at", "lead_id")`,
+
+  // 0017_scheduled_messages_client_request_id.sql — contra clique duplo em
+  // POST /broadcasts e POST /broadcasts/send: chave de idempotência opcional
+  // enviada pelo cliente (client_request_id), nullable e escopada por usuário.
+  `ALTER TABLE "scheduled_messages" ADD COLUMN IF NOT EXISTS "client_request_id" text`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "scheduled_messages_user_client_request_unique"
+     ON "scheduled_messages" USING btree ("user_id", "client_request_id")
+     WHERE "client_request_id" IS NOT NULL`,
 ];
 
 export async function ensureSchema(): Promise<void> {

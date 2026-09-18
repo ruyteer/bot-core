@@ -7,6 +7,17 @@ import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
 import { assertBotOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
 import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
 import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
+import { isUniqueViolation } from "../shared/db-errors.js";
+
+// Disparo em "sending" está sendo processado neste exato momento pelo runner
+// (ver process-broadcasts.use-case.ts) — editar ou cancelar nesse meio-tempo
+// não interrompe nada e deixa a UI achando que mudou algo que na prática já
+// está indo pro Telegram. Bloqueia com 409 em vez de mentir com um 200.
+function assertNotSending(status: string): void {
+  if (status === "sending") {
+    throw APIError.aborted("disparo em andamento — aguarde terminar para editar ou cancelar");
+  }
+}
 
 // Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts.
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -186,6 +197,10 @@ export const create = api(
     recurrenceRule?: unknown | null;
     recurrenceMaxOccurrences?: number | null;
     recurrenceEndAt?: string | null;
+    // Chave de idempotência opcional (clique duplo/reenvio de rede no botão de
+    // criar disparo): uma segunda chamada com o mesmo valor devolve o disparo
+    // já criado em vez de criar outro. Ver migration 0017_scheduled_messages_client_request_id.sql.
+    clientRequestId?: string | null;
   }): Promise<ScheduledMessageResponse> => {
     const { userID: userId } = getAuthData()!;
     const userBotIdSet = new Set(await getUserBotIds(userId));
@@ -196,7 +211,7 @@ export const create = api(
     if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
     const tz = extractTz(req.recurrenceRule);
-    const [row] = await db.insert(scheduledMessages).values({
+    const values = {
       userId,
       botId:                    req.botId,
       botIds:                   allBotIds,
@@ -213,7 +228,23 @@ export const create = api(
       recurrenceCount:          0,
       recurrenceMaxOccurrences: req.recurrenceMaxOccurrences ?? null,
       recurrenceEndAt:          req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null,
-    }).returning();
+      clientRequestId:          req.clientRequestId ?? null,
+    };
+
+    let row: typeof scheduledMessages.$inferSelect;
+    try {
+      [row] = await db.insert(scheduledMessages).values(values).returning();
+    } catch (err) {
+      // Segunda chamada com o mesmo clientRequestId (clique duplo) — devolve o
+      // disparo já criado em vez de propagar a violação do índice único.
+      if (req.clientRequestId && isUniqueViolation(err, "scheduled_messages_user_client_request_unique")) {
+        const [existing] = await db.select().from(scheduledMessages)
+          .where(and(eq(scheduledMessages.userId, userId), eq(scheduledMessages.clientRequestId, req.clientRequestId)))
+          .limit(1);
+        if (existing) return toScheduledResponse(existing);
+      }
+      throw err;
+    }
 
     scanSourceAsync("broadcast", row.id);
     return toScheduledResponse(row);
@@ -235,6 +266,9 @@ export const send = api(
     inlineButtons?: unknown[];
     offers?: unknown[];
     media?: unknown[];
+    // Mesma chave de idempotência de POST /broadcasts (ver comentário lá) —
+    // uma segunda chamada com o mesmo valor não cria um segundo disparo.
+    clientRequestId?: string | null;
   }): Promise<{ accepted: boolean }> => {
     const { userID: userId } = getAuthData()!;
     if (!req.botIds.length) throw APIError.invalidArgument("botIds must not be empty");
@@ -243,28 +277,42 @@ export const send = api(
     await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
     if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
-    await db.insert(scheduledMessages).values({
-      userId,
-      botId:           req.botIds[0],
-      botIds:          req.botIds,
-      message:         req.message ?? "",
-      broadcastType:   req.broadcastType,
-      filterType:      req.filterType,
-      advancedFilters: {
-        filter_product_id: req.filterProductId ?? null,
-        inline_buttons:    sanitizeButtonArray(req.inlineButtons ?? []),
-        offers:            sanitizeButtonArray(req.offers ?? []),
-        media:             req.media ?? [],
-      },
-      targetType:      req.targetType,
-      targetGroupIds:  req.targetGroupIds ?? [],
-      funnelId:        req.funnelId ?? null,
-      scheduledAt:     new Date(),
-      status:          "pending",
-      recurrenceRule:  null,
-      recurrenceCount: 0,
-    });
+    let row: typeof scheduledMessages.$inferSelect;
+    try {
+      [row] = await db.insert(scheduledMessages).values({
+        userId,
+        botId:           req.botIds[0],
+        botIds:          req.botIds,
+        message:         req.message ?? "",
+        broadcastType:   req.broadcastType,
+        filterType:      req.filterType,
+        advancedFilters: {
+          filter_product_id: req.filterProductId ?? null,
+          inline_buttons:    sanitizeButtonArray(req.inlineButtons ?? []),
+          offers:            sanitizeButtonArray(req.offers ?? []),
+          media:             req.media ?? [],
+        },
+        targetType:      req.targetType,
+        targetGroupIds:  req.targetGroupIds ?? [],
+        funnelId:        req.funnelId ?? null,
+        scheduledAt:     new Date(),
+        status:          "pending",
+        recurrenceRule:  null,
+        recurrenceCount: 0,
+        clientRequestId: req.clientRequestId ?? null,
+      }).returning();
+    } catch (err) {
+      // Clique duplo com o mesmo clientRequestId: o disparo já foi aceito na
+      // primeira chamada — responde igual sem criar um segundo.
+      if (req.clientRequestId && isUniqueViolation(err, "scheduled_messages_user_client_request_unique")) {
+        return { accepted: true };
+      }
+      throw err;
+    }
 
+    // Mesma varredura de conteúdo que POST /broadcasts já faz — send() só
+    // enfileira mensagem instantânea, mas o texto/mídia é igualmente livre.
+    scanSourceAsync("broadcast", row.id);
     return { accepted: true };
   },
 );
@@ -283,12 +331,12 @@ export const update = api(
     recurrenceRule?: unknown | null;
     recurrenceMaxOccurrences?: number | null;
     recurrenceEndAt?: string | null;
-    recurrenceCount?: number;
   }): Promise<ScheduledMessageResponse> => {
     const { userID: userId } = getAuthData()!;
     const existing = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, id)).limit(1);
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
+    assertNotSending(existing[0].status);
     if (req.targetGroupIds !== undefined) await assertGroupsOwnership(req.targetGroupIds, userId);
 
     // tz efetivo: usa a recurrenceRule enviada no patch (se houver), senão a já persistida —
@@ -305,7 +353,9 @@ export const update = api(
     if ("recurrenceRule" in req)                  patch.recurrenceRule = req.recurrenceRule;
     if ("recurrenceMaxOccurrences" in req)        patch.recurrenceMaxOccurrences = req.recurrenceMaxOccurrences;
     if (req.recurrenceEndAt !== undefined)        patch.recurrenceEndAt = req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null;
-    if (req.recurrenceCount !== undefined)        patch.recurrenceCount = req.recurrenceCount;
+    // recurrenceCount não é mais aceito do cliente: é controle interno do
+    // processamento (finalizeSchedule em process-broadcasts.use-case.ts), não
+    // algo que a UI deveria poder sobrescrever.
 
     const [updated] = await db.update(scheduledMessages).set(patch).where(eq(scheduledMessages.id, id)).returning();
     scanSourceAsync("broadcast", id);
@@ -321,6 +371,7 @@ export const remove = api(
     const existing = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, id)).limit(1);
     if (!existing.length) throw APIError.notFound("broadcast not found");
     await assertBotOwnership(existing[0].botId, userId);
+    assertNotSending(existing[0].status);
     await db.delete(scheduledMessages).where(eq(scheduledMessages.id, id));
   },
 );
