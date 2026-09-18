@@ -118,7 +118,9 @@ export class GatewayDrizzleRepository {
       provider:     input.provider,
       label:        input.label,
       clientId:     encrypt(input.clientId),
-      clientSecret: encrypt(input.clientSecret),
+      // Coluna é NOT NULL; provedores sem secret continuam gravando "" (mesmo
+      // comportamento de sempre quando o client manda string vazia).
+      clientSecret: encrypt(input.clientSecret ?? ""),
       isActive:     true,
     }).returning({ id: paymentGateways.id, provider: paymentGateways.provider, label: paymentGateways.label, isActive: paymentGateways.isActive });
     return { ...row, provider: row.provider as Provider };

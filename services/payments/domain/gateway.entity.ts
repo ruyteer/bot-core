@@ -25,7 +25,10 @@ export interface CreateGatewayInput {
   provider:     Provider;
   label:        string;
   clientId:     string;
-  clientSecret: string;
+  // Só o SyncPay usa client secret — os demais provedores são forçados hoje a
+  // mandar string vazia (ou um sentinel) pra satisfazer o tipo. Opcional aqui;
+  // a validação de que o SyncPay precisa dele fica no endpoint.
+  clientSecret?: string;
 }
 
 export interface UpdateGatewayInput {
