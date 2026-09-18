@@ -14,7 +14,7 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { saveMessages, update, enroll } = await import("./remarketing.api.js");
+const { saveMessages, update, enroll, create } = await import("./remarketing.api.js");
 
 async function campaign(botId: string, over: Partial<typeof remarketingCampaigns.$inferInsert> = {}) {
   const db = await testDb();
@@ -217,5 +217,62 @@ describe("enroll — não reinicia do zero quem comprou, foi bloqueado, ou é bo
     const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
     expect(row.status).toBe("active");
     expect(row.cyclesCompleted).toBe(0);
+  });
+});
+
+describe("create — defaults perigosos corrigidos", () => {
+  it("maxCycles ausente no corpo vira 1 (não infinito)", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp" });
+    expect(c.maxCycles).toBe(1);
+  });
+
+  it("maxCycles=null explícito preserva 'sem limite' (é o que a UI antiga sempre manda)", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp", maxCycles: null });
+    expect(c.maxCycles).toBeNull();
+  });
+
+  it("maxCycles numérico é respeitado", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp", maxCycles: 3 });
+    expect(c.maxCycles).toBe(3);
+  });
+
+  it("gatilho 'buyers' força stopOnPurchase=false mesmo se o cliente mandar true", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp", triggerType: "buyers", stopOnPurchase: true });
+    expect(c.stopOnPurchase).toBe(false);
+  });
+
+  it("outros gatilhos preservam stopOnPurchase enviado", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await create({ botId: bot.id, name: "Camp", triggerType: "pix_unpaid", stopOnPurchase: true });
+    expect(c.stopOnPurchase).toBe(true);
+  });
+});
+
+describe("update — força stopOnPurchase=false ao mudar/manter gatilho 'buyers'", () => {
+  it("PATCH triggerType para 'buyers' força stopOnPurchase=false mesmo mantendo o valor antigo", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await campaign(bot.id, { triggerType: "pix_unpaid", stopOnPurchase: true });
+
+    const updated = await update({ id: c.id, triggerType: "buyers" });
+    expect(updated.stopOnPurchase).toBe(false);
+  });
+
+  it("PATCH tentando ligar stopOnPurchase numa campanha já 'buyers' é ignorado", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await campaign(bot.id, { triggerType: "buyers", stopOnPurchase: false });
+
+    const updated = await update({ id: c.id, stopOnPurchase: true });
+    expect(updated.stopOnPurchase).toBe(false);
   });
 });

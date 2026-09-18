@@ -342,3 +342,25 @@ describe("resumeLeadsAfterReactivation — reativar campanha retoma leads pausad
     expect(n2).toBe(1);
   });
 });
+
+describe("gatilho 'buyers' nunca para em stopOnPurchase (defesa em profundidade no processador)", () => {
+  it("envia normalmente mesmo com stopOnPurchase=true numa campanha 'buyers' já gravada assim", async () => {
+    const bot = await createBot();
+    const gw = await createGateway({ userId: bot.userId });
+    const lead = await createLead(bot.id, 6500n);
+    const db = await testDb();
+    await db.insert(payments).values({ userId: bot.userId, botId: bot.id, leadId: lead, gatewayId: gw, amount: 1000, status: "paid" });
+    // Campanha "suja": gravada (ou criada antes desta trava existir) com o par
+    // perigoso triggerType='buyers' + stopOnPurchase=true, que travaria o envio
+    // pra sempre se o processador confiasse cegamente no campo.
+    const c = await campaign(bot.id, { triggerType: "buyers", stopOnPurchase: true });
+    await message(c.id);
+    const st = await state(c.id, bot.id, lead);
+
+    const n = await processDueRemarketing();
+    expect(n).toBe(1);
+    expect(getSentMessages().length).toBeGreaterThan(0);
+    const [after] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.id, st.id));
+    expect(after.status).toBe("active");
+  });
+});

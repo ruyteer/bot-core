@@ -221,18 +221,31 @@ export const create = api(
     await assertBotsOwnership(allBotIds, userId);
     await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
 
+    const triggerType = req.triggerType ?? "manual";
+    // Gatilho "buyers" só inscreve quem já pagou (ver enrollRemarketingTriggers) —
+    // com stopOnPurchase também true a campanha pararia todo lead no primeiro
+    // envio, sempre, e nunca mandaria mensagem nenhuma. A UI antiga não tem essa
+    // trava (manda stopOnPurchase=true por padrão pra qualquer gatilho), então
+    // força aqui em vez de confiar no cliente.
+    const stopOnPurchase = triggerType === "buyers" ? false : (req.stopOnPurchase ?? true);
+    // maxCycles: campo AUSENTE no corpo vira 1 ciclo (evita loop infinito por
+    // omissão). Se o cliente mandar `null` explicitamente, preserva como "sem
+    // limite" — é o valor que a UI antiga sempre manda de propósito quando o
+    // usuário não mexe no campo de repetição.
+    const maxCycles = "maxCycles" in req ? (req.maxCycles ?? null) : 1;
+
     const [c] = await db.insert(remarketingCampaigns).values({
       botId:           req.botId,
       botIds:          req.botIds ?? [req.botId],
       name:            req.name,
-      triggerType:     req.triggerType ?? "manual",
+      triggerType,
       triggerConfig:   req.triggerConfig ?? {},
       filterType:      req.filterType ?? "all",
       advancedFilters: req.advancedFilters ?? {},
       targetGroupIds:  req.targetGroupIds ?? [],
-      stopOnPurchase:  req.stopOnPurchase ?? true,
+      stopOnPurchase,
       stopOnReply:     req.stopOnReply ?? false,
-      maxCycles:       req.maxCycles ?? null,
+      maxCycles,
       isActive:        req.isActive ?? false,
     }).returning();
 
@@ -277,7 +290,18 @@ export const update = api(
     if (req.filterType !== undefined)      patch.filterType = req.filterType;
     if (req.advancedFilters !== undefined) patch.advancedFilters = req.advancedFilters;
     if (req.targetGroupIds !== undefined)  patch.targetGroupIds = req.targetGroupIds;
-    if (req.stopOnPurchase !== undefined)  patch.stopOnPurchase = req.stopOnPurchase;
+    // Mesma trava do create: gatilho "buyers" nunca pode conviver com
+    // stopOnPurchase=true (a campanha pararia todo lead no primeiro envio).
+    // Considera o triggerType EFETIVO após este PATCH (o que veio no corpo, ou o
+    // que a campanha já tinha) — cobre tanto "mudou o gatilho pra buyers mantendo
+    // stopOnPurchase antigo" quanto "tentou ligar stopOnPurchase numa campanha
+    // que já era buyers".
+    const effectiveTriggerType = req.triggerType !== undefined ? req.triggerType : existing.triggerType;
+    if (effectiveTriggerType === "buyers") {
+      patch.stopOnPurchase = false;
+    } else if (req.stopOnPurchase !== undefined) {
+      patch.stopOnPurchase = req.stopOnPurchase;
+    }
     if (req.stopOnReply !== undefined)     patch.stopOnReply = req.stopOnReply;
     if ("maxCycles" in req)                patch.maxCycles = req.maxCycles;
     if (req.isActive !== undefined)        patch.isActive = req.isActive;

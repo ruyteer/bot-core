@@ -175,7 +175,14 @@ export async function processDueRemarketing(): Promise<number> {
 
       const [camp] = await db.select().from(remarketingCampaigns).where(eq(remarketingCampaigns.id, st.campaignId));
       if (!camp || !camp.isActive) { await db.update(remarketingLeadState).set({ status: "paused", pauseReason: "campaign_inactive", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
-      if (camp.stopOnPurchase && await hasPaid(st.leadId)) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "purchased", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
+      // Gatilho "buyers" só inscreve quem já pagou — se stop_on_purchase também
+      // estivesse valendo aqui, a campanha pararia no primeiro envio, sempre,
+      // pra todo mundo (hasPaid() é sempre true). A API já força stopOnPurchase
+      // pra false na criação/edição de campanhas com esse gatilho, mas campanhas
+      // gravadas antes dessa checagem existir (ou pela UI antiga, que não tem
+      // essa trava) ficam protegidas aqui também, sem precisar de backfill.
+      const effectiveStopOnPurchase = camp.stopOnPurchase && camp.triggerType !== "buyers";
+      if (effectiveStopOnPurchase && await hasPaid(st.leadId)) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "purchased", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
       if (!msgCache.has(st.campaignId)) {
         const m = await db.select().from(remarketingMessages).where(eq(remarketingMessages.campaignId, st.campaignId));
