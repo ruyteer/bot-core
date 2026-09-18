@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueBroadcasts } from "./application/process-broadcasts.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { scheduledMessages, broadcastRuns, payments, leads, funnelOffers, botGroups } from "../shared/schema/index.js";
+import { scheduledMessages, broadcastRuns, broadcastDeliveries, bots, payments, leads, funnelOffers, botGroups } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 
@@ -278,5 +278,70 @@ describe("processDueBroadcasts — cor do botão (style)", () => {
     const kb = (call.body.reply_markup as { inline_keyboard: Btn[][] }).inline_keyboard;
     const btn = kb.flat().find((b) => b.callback_data === `bcast_buy_${offer.id}`);
     expect(btn?.style).toBeUndefined();
+  });
+});
+
+// Regressão do item de backlog "envio duplicado pro público inteiro": um
+// disparo preso em "sending" por >10min (deploy, timeout) voltava pra
+// "pending" e reprocessava a audiência INTEIRA de novo, mesmo quem já tinha
+// recebido — sem heartbeat, sem CAS explícito, sem registro por lead. A
+// correção adiciona broadcast_deliveries (registro por lead/ocorrência,
+// consultado antes de enviar) e mantém o claim atômico (CAS na UPDATE) que já
+// existia.
+describe("processDueBroadcasts — resgate não reenvia quem já recebeu (fix duplicidade)", () => {
+  it("disparo travado em 'sending' há mais de 10min é resgatado, mas pula quem já está em broadcast_deliveries", async () => {
+    const bot = await createBot();
+    const lead1 = await createLead(bot.id, 9101n); // já recebeu antes do travamento
+    const lead2 = await createLead(bot.id, 9102n); // ainda não recebeu
+
+    const db = await testDb();
+    const scheduledAt = new Date(Date.now() - 20 * 60_000);
+    const staleUpdatedAt = new Date(Date.now() - 11 * 60_000); // >10min sem heartbeat
+    const [msg] = await db.insert(scheduledMessages).values({
+      userId: bot.userId, botId: bot.id, botIds: [bot.id], message: "promo",
+      broadcastType: "instant", filterType: "all", targetType: "leads", targetGroupIds: [],
+      scheduledAt, status: "sending", updatedAt: staleUpdatedAt,
+    }).returning();
+    // Simula que lead1 já recebeu na tentativa anterior (antes do processo travar).
+    await db.insert(broadcastDeliveries).values({ scheduledMessageId: msg.id, occurrenceAt: scheduledAt, leadId: lead1 });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1); // resgatou e reprocessou o disparo
+
+    const sent = getTelegramCalls("sendMessage");
+    expect(sent.length).toBe(1); // só lead2 — lead1 não recebeu de novo
+
+    const [after] = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, msg.id));
+    expect(after.status).toBe("sent");
+
+    const runs = await db.select().from(broadcastRuns).where(eq(broadcastRuns.scheduledMessageId, msg.id));
+    expect(runs[0].totalTargets).toBe(1); // lead1 pulado não conta como alvo desta tentativa
+    expect(runs[0].sentCount).toBe(1);
+  });
+});
+
+describe("processDueBroadcasts — claim concorrente (fix duplicidade)", () => {
+  it("duas chamadas concorrentes de processDueBroadcasts não enviam o mesmo disparo duas vezes", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9201n);
+    await seedMsg(bot.id, bot.userId, { message: "promo" });
+
+    const [n1, n2] = await Promise.all([processDueBroadcasts(), processDueBroadcasts()]);
+    expect(n1 + n2).toBe(1); // só uma das duas chamadas efetivamente processou o disparo
+    expect(getTelegramCalls("sendMessage").length).toBe(1); // lead recebe uma única vez
+  });
+});
+
+describe("processDueBroadcasts — bot inativo (não envia por bot desativado)", () => {
+  it("bot com isActive=false é pulado, sem quebrar o processamento do disparo", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9301n);
+    const db = await testDb();
+    await db.update(bots).set({ isActive: false }).where(eq(bots.id, bot.id));
+    await seedMsg(bot.id, bot.userId, { message: "promo" });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getTelegramCalls("sendMessage").length).toBe(0); // bot inativo, ninguém recebe
   });
 });

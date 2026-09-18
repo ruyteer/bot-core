@@ -1,11 +1,17 @@
 import { eq, and, inArray, lte, lt, gt } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
-  scheduledMessages, broadcastRuns, bots, leads, payments, botGroups, funnelOffers,
+  scheduledMessages, broadcastRuns, broadcastDeliveries, bots, leads, payments, botGroups, funnelOffers,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
+
+// Intervalo mínimo entre heartbeats (updatedAt) durante um envio em andamento —
+// evita martelar o UPDATE a cada lead num broadcast grande, mas garante que o
+// resgate de "sending" travado (processDueBroadcasts, >10min sem heartbeat) não
+// dispare enquanto o processo ainda está vivo e progredindo.
+const HEARTBEAT_INTERVAL_MS = 15_000;
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -128,7 +134,11 @@ async function sendMedia(tg: TelegramClient, chatId: string, items: MediaItem[],
 async function finalizeSchedule(msg: typeof scheduledMessages.$inferSelect, finalStatus: "sent" | "partial" | "failed"): Promise<void> {
   const now = new Date();
   const rule = (msg.recurrenceRule as RecurrenceRule | null) || null;
-  if (!rule) { await db.update(scheduledMessages).set({ status: finalStatus, sentAt: now, updatedAt: now }).where(eq(scheduledMessages.id, msg.id)); return; }
+  if (!rule) {
+    await db.update(scheduledMessages).set({ status: finalStatus, sentAt: now, updatedAt: now }).where(eq(scheduledMessages.id, msg.id));
+    await cleanupDeliveries(msg.id, msg.scheduledAt);
+    return;
+  }
   const newCount = (msg.recurrenceCount || 0) + 1;
   const max = msg.recurrenceMaxOccurrences;
   const endAt = msg.recurrenceEndAt ? new Date(msg.recurrenceEndAt) : null;
@@ -136,6 +146,19 @@ async function finalizeSchedule(msg: typeof scheduledMessages.$inferSelect, fina
   const exhausted = !next || (max != null && newCount >= max) || (endAt && next > endAt);
   if (exhausted) await db.update(scheduledMessages).set({ status: "completed", sentAt: now, recurrenceCount: newCount, updatedAt: now }).where(eq(scheduledMessages.id, msg.id));
   else await db.update(scheduledMessages).set({ status: "pending", scheduledAt: next!, recurrenceCount: newCount, updatedAt: now }).where(eq(scheduledMessages.id, msg.id));
+  // A ocorrência que acabou de terminar (recorrente ou não) nunca mais será
+  // reprocessada com este occurrenceAt — a próxima (se houver) usa um
+  // scheduledAt novo. Libera os registros de entrega dela pra não acumular
+  // linhas indefinidamente na tabela.
+  await cleanupDeliveries(msg.id, msg.scheduledAt);
+}
+
+// Apaga o registro de entregas de UMA ocorrência já finalizada (best-effort —
+// nunca deve derrubar o finalize).
+async function cleanupDeliveries(scheduledMessageId: string, occurrenceAt: Date): Promise<void> {
+  await db.delete(broadcastDeliveries)
+    .where(and(eq(broadcastDeliveries.scheduledMessageId, scheduledMessageId), eq(broadcastDeliveries.occurrenceAt, occurrenceAt)))
+    .catch((e) => console.error("[broadcast] limpeza de broadcast_deliveries falhou:", scheduledMessageId, e));
 }
 
 // ── Processa broadcasts vencidos (chamado pelo tick do runner) ──────────────────
@@ -187,7 +210,29 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   const botRows = await db.select().from(bots).where(inArray(bots.id, botIdList));
   let totalTargets = 0, sentCount = 0, failedCount = 0;
 
+  // Ocorrência deste disparo (estável durante retries de um resgate — só muda
+  // quando finalizeSchedule agenda a PRÓXIMA ocorrência de uma recorrência).
+  // Carrega quem já recebeu nesta ocorrência pra um resgate não reenviar.
+  const occurrenceAt = msg.scheduledAt;
+  const deliveredRows = await db.select({ leadId: broadcastDeliveries.leadId }).from(broadcastDeliveries)
+    .where(and(eq(broadcastDeliveries.scheduledMessageId, msg.id), eq(broadcastDeliveries.occurrenceAt, occurrenceAt)));
+  const deliveredLeadIds = new Set(deliveredRows.map((r) => r.leadId));
+
+  // Heartbeat: em broadcasts grandes (milhares de leads), o envio pode passar
+  // dos 10min que processDueBroadcasts usa pra considerar "sending" travado.
+  // Sem isso, o processo ainda vivo seria resgatado e reprocessado do zero.
+  // Throttlado (não a cada lead) pra não martelar o UPDATE.
+  let lastHeartbeat = Date.now();
+  async function maybeHeartbeat(): Promise<void> {
+    if (Date.now() - lastHeartbeat < HEARTBEAT_INTERVAL_MS) return;
+    lastHeartbeat = Date.now();
+    await db.update(scheduledMessages).set({ updatedAt: new Date() }).where(eq(scheduledMessages.id, msg.id))
+      .catch((e) => console.error("[broadcast] heartbeat falhou:", msg.id, e));
+  }
+
   for (const bot of botRows) {
+    // Bot desativado pelo dono não deve continuar recebendo/enviando broadcast.
+    if (!bot.isActive) { console.error("[broadcast] bot inativo, envio pulado:", bot.id); continue; }
     const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
     const inlineKb = buildKeyboard(inlineButtons);
     const offerRows = await resolveOfferButtons(bot.id, offers);
@@ -198,6 +243,9 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
     if (targetType === "leads" || targetType === "both") {
       const audience = await getAudienceLeads(bot.id, msg.filterType || "all", filterProductId);
       for (const lead of audience) {
+        // Já entregue numa tentativa anterior desta mesma ocorrência (resgate
+        // de "sending" travado) — não conta como alvo nem reenvia.
+        if (deliveredLeadIds.has(lead.id)) continue;
         const chatId = lead.telegramChatId.toString();
         const text = replaceVars(msg.message || "", lead);
         if (media.length === 0 && !text && !keyboard) continue; // nada a enviar
@@ -206,7 +254,12 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
           if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
           else await tg.sendMessage({ chatId, text: text || "👇", replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
+          deliveredLeadIds.add(lead.id);
+          await db.insert(broadcastDeliveries).values({ scheduledMessageId: msg.id, occurrenceAt, leadId: lead.id })
+            .onConflictDoNothing()
+            .catch((e) => console.error("[broadcast] registro de entrega falhou:", lead.id, e));
         } catch (e) { failedCount++; console.error("[broadcast] lead falhou:", lead.id, e); }
+        await maybeHeartbeat();
       }
     }
 
@@ -229,6 +282,7 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
           else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
         } catch (e) { failedCount++; console.error("[broadcast] grupo falhou:", g.id, e); }
+        await maybeHeartbeat();
       }
     }
   }

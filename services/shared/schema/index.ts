@@ -379,6 +379,23 @@ export const broadcastRuns = pgTable("broadcast_runs", {
   updatedAt:        timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Registro por lead de um envio de broadcast já efetivado, escopado por OCORRÊNCIA
+// (occurrence_at = scheduledMessages.scheduledAt no momento do claim — estável
+// durante retries da mesma ocorrência, mas muda a cada disparo de recorrência).
+// Consultado antes de enviar em sendBroadcast: se o processo travar em "sending" e
+// for resgatado (processDueBroadcasts), o reprocessamento pula quem já está aqui em
+// vez de reenviar pra audiência inteira. Ver migration 0016_broadcast_deliveries.sql.
+export const broadcastDeliveries = pgTable("broadcast_deliveries", {
+  id:                 uuid("id").defaultRandom().primaryKey(),
+  scheduledMessageId: uuid("scheduled_message_id").notNull().references(() => scheduledMessages.id, { onDelete: "cascade" }),
+  occurrenceAt:       timestamp("occurrence_at", { withTimezone: true }).notNull(),
+  leadId:             uuid("lead_id").notNull().references(() => leads.id, { onDelete: "cascade" }),
+  createdAt:          timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [
+  uniqueIndex("broadcast_deliveries_message_occurrence_lead_unique")
+    .on(t.scheduledMessageId, t.occurrenceAt, t.leadId),
+]);
+
 // ─── REMARKETING ──────────────────────────────────────────────────────────────
 
 export const remarketingCampaigns = pgTable("remarketing_campaigns", {
@@ -697,6 +714,7 @@ export type PaymentGateway                = typeof paymentGateways.$inferSelect;
 export type Payment                       = typeof payments.$inferSelect;
 export type ScheduledMessage              = typeof scheduledMessages.$inferSelect;
 export type BroadcastRun                  = typeof broadcastRuns.$inferSelect;
+export type BroadcastDelivery              = typeof broadcastDeliveries.$inferSelect;
 export type RemarketingCampaign           = typeof remarketingCampaigns.$inferSelect;
 export type RemarketingMessage            = typeof remarketingMessages.$inferSelect;
 export type RemarketingLeadState          = typeof remarketingLeadState.$inferSelect;
