@@ -99,6 +99,29 @@ describe("whitelist de style — endpoint real saveMessages (remarketing)", () =
     const [row] = await db.select().from(remarketingMessages).where(eq(remarketingMessages.campaignId, c.id));
     expect(row.offerStyle).toBeNull();
   });
+
+  it("se o insert falhar, a transação reverte o delete (campanha não fica sem mensagem)", async () => {
+    // Regressão: antes, delete+insert rodavam soltos (sem transação) — um insert
+    // que falhasse no meio deixava a campanha já sem NENHUMA mensagem (o delete
+    // já tinha sido commitado), e o processador pausaria todo lead devido como
+    // 'no_messages' sem retomada automática.
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const c = await campaign(bot.id);
+    await saveMessages({ id: c.id, messages: [{ message: "Original", delayValue: 1, delayUnit: "days", orderIndex: 0 }] });
+
+    await expect(saveMessages({
+      id: c.id,
+      // message não pode ser null na coluna (NOT NULL) — força o INSERT a
+      // falhar no banco depois que o DELETE já rodou dentro da mesma transação.
+      messages: [{ message: null as unknown as string, delayValue: 1, delayUnit: "days", orderIndex: 0 }],
+    })).rejects.toThrow();
+
+    const db = await testDb();
+    const rows = await db.select().from(remarketingMessages).where(eq(remarketingMessages.campaignId, c.id));
+    expect(rows.length).toBe(1);
+    expect(rows[0].message).toBe("Original");
+  });
 });
 
 describe("update — reativar campanha (isActive false→true) retoma leads pausados por ela", () => {

@@ -371,22 +371,35 @@ export const saveMessages = api(
       if (validOffers.length !== offerIds.length) throw APIError.notFound("offer not found");
     }
 
-    await db.delete(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
-    if (messages.length > 0) {
-      await db.insert(remarketingMessages).values(
-        messages.map((m) => ({
-          campaignId:    id,
-          message:       m.message,
-          media:         m.media ?? {},
-          inlineButtons: sanitizeButtonArray(m.inlineButtons ?? []),
-          offerId:       m.offerId ?? null,
-          offerStyle:    sanitizeButtonStyle(m.offerStyle) ?? null,
-          delayValue:    m.delayValue,
-          delayUnit:     m.delayUnit,
-          orderIndex:    m.orderIndex,
-        }))
-      );
-    }
+    // Apaga e recria numa única transação: sem isto, uma janela existia entre o
+    // DELETE e o INSERT em que processDueRemarketing (rodando em paralelo, outra
+    // réplica ou outro tick) via a campanha SEM mensagem nenhuma e pausava todo
+    // lead devido nela como status='paused'/pause_reason='no_messages' — pausa
+    // que hoje não tem retomada automática (só campaign_inactive é resgatada em
+    // resumeLeadsAfterReactivation), ou seja, o lead ficava preso pra sempre por
+    // causa de um save que nem chegou a mudar o conteúdo de fato. Não há FK de
+    // remarketing_lead_state pra remarketing_messages (o "ponteiro" da mensagem
+    // atual é nextMessageIndex, um inteiro por posição, não um id) — diferente do
+    // saveFlow de funis (PR #44), aqui não há registro derrubado por CASCADE/SET
+    // NULL, só essa janela de leitura vazia, que a transação fecha.
+    await db.transaction(async (tx) => {
+      await tx.delete(remarketingMessages).where(eq(remarketingMessages.campaignId, id));
+      if (messages.length > 0) {
+        await tx.insert(remarketingMessages).values(
+          messages.map((m) => ({
+            campaignId:    id,
+            message:       m.message,
+            media:         m.media ?? {},
+            inlineButtons: sanitizeButtonArray(m.inlineButtons ?? []),
+            offerId:       m.offerId ?? null,
+            offerStyle:    sanitizeButtonStyle(m.offerStyle) ?? null,
+            delayValue:    m.delayValue,
+            delayUnit:     m.delayUnit,
+            orderIndex:    m.orderIndex,
+          }))
+        );
+      }
+    });
     scanSourceAsync("remarketing", id);
     return { ok: true };
   },
