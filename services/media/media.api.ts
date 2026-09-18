@@ -6,7 +6,7 @@ import Busboy from "busboy";
 import { encoreExternalUrl } from "../config/secrets.js";
 import { isPlatformAdmin } from "../shared/roles.js";
 import { putObject, getObject } from "./application/s3-client.js";
-import { isAllowedMime, sanitizeFolder, extFromFilename } from "./application/validation.js";
+import { isAllowedMime, matchesFileSignature, sanitizeFolder, extFromFilename } from "./application/validation.js";
 
 // Espelha o limite que hoje só existe client-side (MediaUpload.tsx e afins,
 // checado em bytes antes do upload) — agora também reforçado aqui, já que o
@@ -77,6 +77,16 @@ export const uploadMedia = api.raw(
     if (!isAllowedMime(parsed.mime)) {
       resp.writeHead(400, { "Content-Type": "application/json" });
       resp.end(JSON.stringify({ error: `tipo de arquivo não permitido: ${parsed.mime}` }));
+      return;
+    }
+
+    // O Content-Type do multipart é só o que o cliente afirmou — confere a
+    // assinatura de bytes (magic numbers) do arquivo de verdade antes de
+    // gravar, senão um executável/script disfarçado de imagem passava direto
+    // (e depois era servido de volta por GET /media/*key).
+    if (!matchesFileSignature(parsed.mime, parsed.buffer)) {
+      resp.writeHead(400, { "Content-Type": "application/json" });
+      resp.end(JSON.stringify({ error: `conteúdo do arquivo não corresponde ao tipo declarado (${parsed.mime})` }));
       return;
     }
 
