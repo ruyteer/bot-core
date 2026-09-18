@@ -47,7 +47,17 @@ export async function enrollRemarketingTriggers(): Promise<number> {
   let enrolled = 0;
 
   for (const camp of camps) {
-    const botIdList = (Array.isArray(camp.botIds) && camp.botIds.length ? camp.botIds : [camp.botId]).map(String);
+    const rawBotIds = (Array.isArray(camp.botIds) && camp.botIds.length ? camp.botIds : [camp.botId]).map(String);
+    // Defesa em profundidade: remarketing_campaigns não tem coluna user_id — o dono da
+    // campanha é o dono do bot PRINCIPAL (camp.botId). Se a campanha foi gravada (ou
+    // corrompida) com bot_ids de outro dono, nunca inscrevemos leads desse bot aqui —
+    // reduz rawBotIds ao subconjunto pertencente ao MESMO dono de camp.botId.
+    const [ownerRow] = await db.select({ userId: bots.userId }).from(bots).where(eq(bots.id, camp.botId)).limit(1);
+    if (!ownerRow) continue; // bot principal não existe mais — nada seguro a inscrever
+    const ownedBotRows = await db.select({ id: bots.id }).from(bots)
+      .where(and(inArray(bots.id, rawBotIds), eq(bots.userId, ownerRow.userId)));
+    const botIdList = ownedBotRows.map((b) => b.id);
+    if (!botIdList.length) continue;
     const cfg = (camp.triggerConfig as Record<string, unknown>) || {};
     let pairs: Array<{ leadId: string; botId: string }> = [];
 
@@ -156,6 +166,18 @@ export async function processDueRemarketing(): Promise<number> {
       if (!botCache.has(sendBotId)) { const [b] = await db.select().from(bots).where(eq(bots.id, sendBotId)); botCache.set(sendBotId, b); }
       const bot = botCache.get(sendBotId);
       if (!bot) { await db.update(remarketingLeadState).set({ status: "error", pauseReason: "bot_missing", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
+
+      // Defesa em profundidade: campanhas gravadas (ou corrompidas) ANTES desta checagem
+      // existir com um bot_ids de outro dono — ou um lead_state com bot_id divergente —
+      // nunca devem continuar enviando. Confirma que o bot que vai enviar (a) pertence ao
+      // MESMO dono do bot principal da campanha e (b) está de fato listado em bot_ids.
+      if (!botCache.has(camp.botId)) { const [b] = await db.select().from(bots).where(eq(bots.id, camp.botId)); botCache.set(camp.botId, b); }
+      const ownerBot = botCache.get(camp.botId);
+      const campaignBotIds = (Array.isArray(camp.botIds) && camp.botIds.length ? (camp.botIds as string[]).map(String) : [camp.botId]);
+      if (!ownerBot || bot.userId !== ownerBot.userId || !campaignBotIds.includes(sendBotId)) {
+        await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "bot_not_owned", updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+        continue;
+      }
 
       const tg = new TelegramClient(decrypt(bot.telegramToken), bot.id);
       const chatId = lead.telegramChatId.toString();

@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { APIError } from "encore.dev/api";
 import { testDb } from "../../test/helpers/db.js";
-import { funnels, funnelBots } from "../shared/schema/index.js";
+import { funnels, funnelBots, funnelOffers, botGroups } from "../shared/schema/index.js";
 import { createBot } from "../../test/helpers/seed.js";
 
 let authUserId = "";
@@ -19,6 +19,12 @@ vi.mock("~encore/auth", () => ({
 const { create, update, duplicate, assignBots, createOffer, createOffersBulk } =
   await import("./funnels.api.js");
 const { assertBotOwnership, assertBotsOwnership } = await import("../shared/bot-ownership.js");
+
+async function createGroup(botId: string, chatId: bigint) {
+  const db = await testDb();
+  const [g] = await db.insert(botGroups).values({ botId, telegramChatId: chatId, name: "Grupo" }).returning();
+  return g;
+}
 
 describe("posse de bot — endpoints reais de funnels", () => {
   it("create: rejeita botId de outro usuário", async () => {
@@ -200,5 +206,55 @@ describe("posse de bot — endpoints reais de funnels", () => {
     }
     expect(caught).toBeInstanceOf(APIError);
     expect((caught as APIError).code).toBe("not_found");
+  });
+
+  // Regressão: telegramGroupId (FK pra bot_groups) vinha sendo gravado sem checar
+  // posse — como o convite de entrada no grupo VIP é criado com o TOKEN DO BOT DA
+  // OFERTA (execute-flow-step.use-case.ts deliverFunnelOffer), apontar pra um grupo
+  // de outro bot/dono é uma referência que nunca deveria ter sido aceita na escrita.
+  it("createOffer: rejeita telegramGroupId de grupo de bot alheio", async () => {
+    const owner = await createBot();
+    authUserId = owner.userId;
+    const attackerBot = await createBot();
+    const foreignGroup = await createGroup(attackerBot.id, -3001n);
+
+    await expect(
+      createOffer({ botId: owner.id, name: "Oferta", price: 1000, telegramGroupId: foreignGroup.id }),
+    ).rejects.toThrow();
+  });
+
+  it("createOffer: rejeita telegramGroupId de grupo de OUTRO bot do MESMO usuário (precisa ser do bot da própria oferta)", async () => {
+    const owner = await createBot();
+    authUserId = owner.userId;
+    const secondBot = await createBot({ userId: owner.userId });
+    const groupOfSecondBot = await createGroup(secondBot.id, -3002n);
+
+    await expect(
+      createOffer({ botId: owner.id, name: "Oferta", price: 1000, telegramGroupId: groupOfSecondBot.id }),
+    ).rejects.toThrow();
+  });
+
+  it("createOffer: aceita telegramGroupId de grupo do próprio bot (caso feliz)", async () => {
+    const owner = await createBot();
+    authUserId = owner.userId;
+    const group = await createGroup(owner.id, -3003n);
+
+    const offer = await createOffer({ botId: owner.id, name: "Oferta", price: 1000, telegramGroupId: group.id });
+    const db = await testDb();
+    const [row] = await db.select().from(funnelOffers).where(eq(funnelOffers.id, offer.id));
+    expect(row.telegramGroupId).toBe(group.id);
+  });
+
+  it("createOffersBulk: rejeita telegramGroupId de um grupo que não é do botId daquela oferta", async () => {
+    const owner = await createBot();
+    authUserId = owner.userId;
+    const secondBot = await createBot({ userId: owner.userId });
+    const groupOfSecondBot = await createGroup(secondBot.id, -3004n);
+
+    await expect(
+      createOffersBulk({
+        offers: [{ botId: owner.id, name: "Oferta", price: 1000, telegramGroupId: groupOfSecondBot.id }],
+      }),
+    ).rejects.toThrow();
   });
 });

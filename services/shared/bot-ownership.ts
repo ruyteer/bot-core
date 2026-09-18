@@ -1,7 +1,7 @@
 import { APIError } from "encore.dev/api";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "./database.js";
-import { bots } from "./schema/index.js";
+import { bots, botGroups } from "./schema/index.js";
 
 // Mesma regex usada em process-broadcasts.use-case.ts / notifications.api.ts /
 // funnel.drizzle.repository.ts. bots.id é uuid no schema — um id malformado
@@ -28,4 +28,34 @@ export async function assertBotsOwnership(botIds: string[], userId: string): Pro
   const rows = await db.select({ id: bots.id }).from(bots)
     .where(and(inArray(bots.id, uniqueIds), eq(bots.userId, userId)));
   if (rows.length !== uniqueIds.length) throw APIError.notFound("bot not found");
+}
+
+// Checagem de posse de grupo (bot_groups.id), usada por qualquer endpoint que grave um
+// telegramGroupId/targetGroupId vindo do cliente (ofertas VIP, broadcasts, remarketing).
+// bot_groups.id nunca é exposto a quem não é dono do bot (GET /bots/:id/groups já checa
+// posse), mas mesmo assim nunca confiamos numa FK vinda do cliente sem revalidar aqui —
+// mesmo princípio de assertBotOwnership.
+// scopeBotId, quando informado, exige que o grupo pertença exatamente a ESSE bot (ex.:
+// oferta VIP — o convite é criado com o token do bot da própria oferta, então um grupo de
+// OUTRO bot do mesmo usuário também falharia — silenciosamente — no Telegram).
+export async function assertGroupOwnership(groupId: string, userId: string, scopeBotId?: string): Promise<void> {
+  if (!UUID_REGEX.test(groupId)) throw APIError.notFound("group not found");
+  const conditions = [eq(botGroups.id, groupId), eq(bots.userId, userId)];
+  if (scopeBotId) conditions.push(eq(botGroups.botId, scopeBotId));
+  const rows = await db.select({ id: botGroups.id }).from(botGroups)
+    .innerJoin(bots, eq(botGroups.botId, bots.id))
+    .where(and(...conditions)).limit(1);
+  if (!rows.length) throw APIError.notFound("group not found");
+}
+
+// Versão em lote de assertGroupOwnership: uma query só, falha se QUALQUER id do array
+// não pertencer a um bot do usuário.
+export async function assertGroupsOwnership(groupIds: string[], userId: string): Promise<void> {
+  if (groupIds.length === 0) return;
+  if (groupIds.some((id) => !UUID_REGEX.test(id))) throw APIError.notFound("group not found");
+  const uniqueIds = [...new Set(groupIds)];
+  const rows = await db.select({ id: botGroups.id }).from(botGroups)
+    .innerJoin(bots, eq(botGroups.botId, bots.id))
+    .where(and(inArray(botGroups.id, uniqueIds), eq(bots.userId, userId)));
+  if (rows.length !== uniqueIds.length) throw APIError.notFound("group not found");
 }

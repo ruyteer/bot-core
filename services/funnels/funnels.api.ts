@@ -12,7 +12,7 @@ import { db } from "../shared/database.js";
 import { funnelOffers, leadProgress, payments, funnelNodes, bots } from "../shared/schema/index.js";
 import type { SQL } from "drizzle-orm";
 import { eq, and, inArray, sql } from "drizzle-orm";
-import { assertBotOwnership, assertBotsOwnership } from "../shared/bot-ownership.js";
+import { assertBotOwnership, assertBotsOwnership, assertGroupOwnership } from "../shared/bot-ownership.js";
 
 const repo = new FunnelDrizzleRepository();
 
@@ -535,6 +535,10 @@ export const createOffer = api(
   }): Promise<{ id: string; name: string; price: number; botId: string; externalRef: string | null }> => {
     const { userID: userId } = getAuthData()!;
     await assertBotOwnership(req.botId, userId);
+    // telegramGroupId é bot_groups.id vindo do cliente: precisa ser um grupo DESTE MESMO
+    // bot — o convite de entrada é criado com o token deste bot (deliverFunnelOffer), então
+    // um grupo de outro bot (mesmo que do mesmo usuário) já falharia no Telegram.
+    if (req.telegramGroupId) await assertGroupOwnership(req.telegramGroupId, userId, req.botId);
 
     assertOfferComplete(req);
 
@@ -565,6 +569,11 @@ export const createOffersBulk = api(
     if (offers.length === 0) return { offers: [] };
 
     await assertBotsOwnership(offers.map((o) => o.botId), userId);
+    // Cada oferta pode ir pra um bot diferente (replicação cross-bot) — o grupo
+    // precisa ser DESSE bot específico, não só de "algum bot do usuário".
+    for (const o of offers) {
+      if (o.telegramGroupId) await assertGroupOwnership(o.telegramGroupId, userId, o.botId);
+    }
 
     offers.forEach((o, i) => assertOfferComplete(o, `a oferta ${i + 1}`));
 
