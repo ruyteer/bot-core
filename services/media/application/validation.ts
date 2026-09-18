@@ -30,6 +30,31 @@ function asciiAt(buf: Buffer, offset: number, str: string): boolean {
   return buf.toString("ascii", offset, offset + str.length) === str;
 }
 
+// Frame sync MPEG genérico: FF seguido de um byte cujos 3 bits mais altos
+// são 1 (11 bits de sync no total). Cobre MP3 sem tag ID3 em qualquer
+// combinação de MPEG version/layer (não só FF FB/F3/F2) e também ADTS de AAC
+// "cru" (audio/aac, FF F1/F9) — os dois usam o mesmo padrão de sync word.
+function isMpegFrameSync(b: Buffer): boolean {
+  return b.length >= 2 && b[0] === 0xff && (b[1] & 0xe0) === 0xe0;
+}
+
+// Containers "guarda-chuva" — o mesmo container de bytes serve pra mais de
+// uma categoria de mídia dependendo do codec/track de dentro, e não dá pra
+// distinguir sem decodificar de verdade:
+//   - ftyp (ISO-BMFF): MP4/MOV/M4V/3GP (vídeo), M4A/AAC (áudio) e também
+//     HEIC/HEIF/AVIF (imagem) — todos usam a mesma caixa `ftyp` no offset 4.
+//   - EBML: WebM pode carregar só vídeo, só áudio (ex.: gravação de
+//     microfone do navegador em Opus/WebM, audio/webm) ou os dois; MKV é o
+//     mesmo container.
+//   - OggS: Ogg pode carregar Vorbis/Opus (áudio) ou Theora (video/ogg).
+// Aceita esses containers pra qualquer categoria de mídia que os usa de
+// verdade em vez de tentar diferenciar por assinatura (exigiria ler o
+// major brand / faixas internas) — o que importa aqui é barrar a categoria
+// ERRADA (executável/script disfarçado), não fechar os codecs 1:1.
+const isFtypBox = (b: Buffer) => asciiAt(b, 4, "ftyp");
+const isEbmlHeader = (b: Buffer) => startsWithBytes(b, [0x1a, 0x45, 0xdf, 0xa3]);
+const isOggsHeader = (b: Buffer) => asciiAt(b, 0, "OggS");
+
 // Cada regra só confirma a CATEGORIA (não o subtipo exato) — o que importa é
 // barrar a categoria errada (executável/script disfarçado), não fechar a
 // lista exaustiva de todo container de vídeo/áudio existente.
@@ -41,20 +66,25 @@ const SIGNATURES: Array<{ category: SignatureCategory; test: (b: Buffer) => bool
   { category: "image", test: (b) => asciiAt(b, 0, "RIFF") && asciiAt(b, 8, "WEBP") }, // WEBP
   { category: "image", test: (b) => startsWithBytes(b, [0x42, 0x4d]) }, // BMP
   { category: "image", test: (b) => startsWithBytes(b, [0x49, 0x49, 0x2a, 0x00]) || startsWithBytes(b, [0x4d, 0x4d, 0x00, 0x2a]) }, // TIFF
+  { category: "image", test: isFtypBox }, // HEIC/HEIF/AVIF (ISO-BMFF)
 
   // Vídeos
-  { category: "video", test: (b) => asciiAt(b, 4, "ftyp") }, // MP4/MOV/M4V (ISO base media file format)
-  { category: "video", test: (b) => startsWithBytes(b, [0x1a, 0x45, 0xdf, 0xa3]) }, // WEBM/MKV (EBML)
+  { category: "video", test: isFtypBox }, // MP4/MOV/M4V/3GP (ISO-BMFF)
+  { category: "video", test: isEbmlHeader }, // WEBM/MKV
+  { category: "video", test: isOggsHeader }, // Ogg Theora (video/ogg)
   { category: "video", test: (b) => asciiAt(b, 0, "RIFF") && asciiAt(b, 8, "AVI ") }, // AVI
   { category: "video", test: (b) => startsWithBytes(b, [0x46, 0x4c, 0x56, 0x01]) }, // FLV
+  // QuickTime antigo sem caixa `ftyp`: começa direto num átomo top-level.
+  { category: "video", test: (b) => ["moov", "mdat", "wide", "free", "skip"].some((atom) => asciiAt(b, 4, atom)) },
 
   // Áudios
   { category: "audio", test: (b) => asciiAt(b, 0, "ID3") }, // MP3 com tag ID3
-  { category: "audio", test: (b) => startsWithBytes(b, [0xff, 0xfb]) || startsWithBytes(b, [0xff, 0xf3]) || startsWithBytes(b, [0xff, 0xf2]) }, // MP3 (frame sync sem ID3)
+  { category: "audio", test: isMpegFrameSync }, // MP3 sem ID3 e AAC ADTS cru (mesmo sync word)
   { category: "audio", test: (b) => asciiAt(b, 0, "RIFF") && asciiAt(b, 8, "WAVE") }, // WAV
-  { category: "audio", test: (b) => asciiAt(b, 0, "OggS") }, // OGG
+  { category: "audio", test: isOggsHeader }, // Ogg Vorbis/Opus
   { category: "audio", test: (b) => asciiAt(b, 0, "fLaC") }, // FLAC
-  { category: "audio", test: (b) => asciiAt(b, 4, "ftyp") }, // M4A/AAC (mesmo container do MP4)
+  { category: "audio", test: isFtypBox }, // M4A/AAC (mesmo container do MP4)
+  { category: "audio", test: isEbmlHeader }, // audio/webm — gravação de microfone do navegador (Opus em WebM)
 
   // Documentos
   { category: "document", test: (b) => startsWithBytes(b, [0x25, 0x50, 0x44, 0x46, 0x2d]) }, // PDF (%PDF-)
