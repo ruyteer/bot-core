@@ -7,6 +7,7 @@ import { eq, and, inArray, desc, gte, sql } from "drizzle-orm";
 import { assertBotOwnership, assertGroupsOwnership } from "../shared/bot-ownership.js";
 import { DEFAULT_TZ, zonedWallTimeToUtc } from "./application/process-broadcasts.use-case.js";
 import { sanitizeButtonArray } from "../runner/application/telegram-button-style.js";
+import { isUniqueViolation } from "../shared/db-errors.js";
 
 // Mesma regex usada em bot-ownership.ts / process-broadcasts.use-case.ts / notifications.api.ts.
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -186,6 +187,10 @@ export const create = api(
     recurrenceRule?: unknown | null;
     recurrenceMaxOccurrences?: number | null;
     recurrenceEndAt?: string | null;
+    // Chave de idempotência opcional (clique duplo/reenvio de rede no botão de
+    // criar disparo): uma segunda chamada com o mesmo valor devolve o disparo
+    // já criado em vez de criar outro. Ver migration 0017_scheduled_messages_client_request_id.sql.
+    clientRequestId?: string | null;
   }): Promise<ScheduledMessageResponse> => {
     const { userID: userId } = getAuthData()!;
     const userBotIdSet = new Set(await getUserBotIds(userId));
@@ -196,7 +201,7 @@ export const create = api(
     if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
     const tz = extractTz(req.recurrenceRule);
-    const [row] = await db.insert(scheduledMessages).values({
+    const values = {
       userId,
       botId:                    req.botId,
       botIds:                   allBotIds,
@@ -213,7 +218,23 @@ export const create = api(
       recurrenceCount:          0,
       recurrenceMaxOccurrences: req.recurrenceMaxOccurrences ?? null,
       recurrenceEndAt:          req.recurrenceEndAt ? parseScheduledAt(req.recurrenceEndAt, tz) : null,
-    }).returning();
+      clientRequestId:          req.clientRequestId ?? null,
+    };
+
+    let row: typeof scheduledMessages.$inferSelect;
+    try {
+      [row] = await db.insert(scheduledMessages).values(values).returning();
+    } catch (err) {
+      // Segunda chamada com o mesmo clientRequestId (clique duplo) — devolve o
+      // disparo já criado em vez de propagar a violação do índice único.
+      if (req.clientRequestId && isUniqueViolation(err, "scheduled_messages_user_client_request_unique")) {
+        const [existing] = await db.select().from(scheduledMessages)
+          .where(and(eq(scheduledMessages.userId, userId), eq(scheduledMessages.clientRequestId, req.clientRequestId)))
+          .limit(1);
+        if (existing) return toScheduledResponse(existing);
+      }
+      throw err;
+    }
 
     scanSourceAsync("broadcast", row.id);
     return toScheduledResponse(row);
@@ -235,6 +256,9 @@ export const send = api(
     inlineButtons?: unknown[];
     offers?: unknown[];
     media?: unknown[];
+    // Mesma chave de idempotência de POST /broadcasts (ver comentário lá) —
+    // uma segunda chamada com o mesmo valor não cria um segundo disparo.
+    clientRequestId?: string | null;
   }): Promise<{ accepted: boolean }> => {
     const { userID: userId } = getAuthData()!;
     if (!req.botIds.length) throw APIError.invalidArgument("botIds must not be empty");
@@ -243,27 +267,37 @@ export const send = api(
     await assertGroupsOwnership(req.targetGroupIds ?? [], userId);
     if (req.funnelId) await assertFunnelOwnership(req.funnelId, userId);
 
-    await db.insert(scheduledMessages).values({
-      userId,
-      botId:           req.botIds[0],
-      botIds:          req.botIds,
-      message:         req.message ?? "",
-      broadcastType:   req.broadcastType,
-      filterType:      req.filterType,
-      advancedFilters: {
-        filter_product_id: req.filterProductId ?? null,
-        inline_buttons:    sanitizeButtonArray(req.inlineButtons ?? []),
-        offers:            sanitizeButtonArray(req.offers ?? []),
-        media:             req.media ?? [],
-      },
-      targetType:      req.targetType,
-      targetGroupIds:  req.targetGroupIds ?? [],
-      funnelId:        req.funnelId ?? null,
-      scheduledAt:     new Date(),
-      status:          "pending",
-      recurrenceRule:  null,
-      recurrenceCount: 0,
-    });
+    try {
+      await db.insert(scheduledMessages).values({
+        userId,
+        botId:           req.botIds[0],
+        botIds:          req.botIds,
+        message:         req.message ?? "",
+        broadcastType:   req.broadcastType,
+        filterType:      req.filterType,
+        advancedFilters: {
+          filter_product_id: req.filterProductId ?? null,
+          inline_buttons:    sanitizeButtonArray(req.inlineButtons ?? []),
+          offers:            sanitizeButtonArray(req.offers ?? []),
+          media:             req.media ?? [],
+        },
+        targetType:      req.targetType,
+        targetGroupIds:  req.targetGroupIds ?? [],
+        funnelId:        req.funnelId ?? null,
+        scheduledAt:     new Date(),
+        status:          "pending",
+        recurrenceRule:  null,
+        recurrenceCount: 0,
+        clientRequestId: req.clientRequestId ?? null,
+      });
+    } catch (err) {
+      // Clique duplo com o mesmo clientRequestId: o disparo já foi aceito na
+      // primeira chamada — responde igual sem criar um segundo.
+      if (req.clientRequestId && isUniqueViolation(err, "scheduled_messages_user_client_request_unique")) {
+        return { accepted: true };
+      }
+      throw err;
+    }
 
     return { accepted: true };
   },

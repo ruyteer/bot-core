@@ -347,9 +347,19 @@ export const scheduledMessages = pgTable("scheduled_messages", {
   recurrenceMaxOccurrences: integer("recurrence_max_occurrences"),
   recurrenceEndAt:       timestamp("recurrence_end_at", { withTimezone: true }),
   parentScheduleId:      uuid("parent_schedule_id"),
+  // Chave de idempotência opcional enviada pelo cliente (clique duplo/reenvio de
+  // rede no botão de disparar) — ver unique index abaixo.
+  clientRequestId:       text("client_request_id"),
   createdAt:             timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:             timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Só barra duplicata quando o cliente manda a chave (nullable, sem afetar
+  // quem não envia). Escopada por usuário: dois usuários podem usar o mesmo
+  // valor de clientRequestId sem colidir.
+  uniqueIndex("scheduled_messages_user_client_request_unique")
+    .on(t.userId, t.clientRequestId)
+    .where(sql`${t.clientRequestId} IS NOT NULL`),
+]);
 
 export const broadcastRuns = pgTable("broadcast_runs", {
   id:               uuid("id").defaultRandom().primaryKey(),

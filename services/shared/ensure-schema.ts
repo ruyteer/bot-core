@@ -277,6 +277,14 @@ const STATEMENTS: string[] = [
    EXCEPTION WHEN duplicate_object THEN null; END $$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "broadcast_deliveries_message_occurrence_lead_unique"
      ON "broadcast_deliveries" USING btree ("scheduled_message_id", "occurrence_at", "lead_id")`,
+
+  // 0017_scheduled_messages_client_request_id.sql — contra clique duplo em
+  // POST /broadcasts e POST /broadcasts/send: chave de idempotência opcional
+  // enviada pelo cliente (client_request_id), nullable e escopada por usuário.
+  `ALTER TABLE "scheduled_messages" ADD COLUMN IF NOT EXISTS "client_request_id" text`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "scheduled_messages_user_client_request_unique"
+     ON "scheduled_messages" USING btree ("user_id", "client_request_id")
+     WHERE "client_request_id" IS NOT NULL`,
 ];
 
 export async function ensureSchema(): Promise<void> {
