@@ -105,7 +105,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     if (expectedUpdatedAt) {
       const [current] = await db.select({ updatedAt: funnels.updatedAt }).from(funnels)
         .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
-      if (!current) throw new Error("funnel not found");
+      if (!current) throw APIError.notFound("funnel not found");
       if (current.updatedAt.getTime() !== expectedUpdatedAt.getTime()) {
         throw APIError.aborted("funil foi alterado por outra sessão desde que foi carregado — recarregue antes de salvar");
       }
@@ -120,7 +120,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
       })
       .where(and(eq(funnels.id, id), eq(funnels.userId, userId)))
       .returning();
-    if (!row) throw new Error("funnel not found");
+    if (!row) throw APIError.notFound("funnel not found");
     return this.toFunnel(row);
   }
 
@@ -159,7 +159,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
       // do resto do save, pra ler `updatedAt` no mesmo snapshot que o diff usa.
       const [row] = await tx.select({ id: funnels.id, updatedAt: funnels.updatedAt }).from(funnels)
         .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
-      if (!row) throw new Error("funnel not found");
+      if (!row) throw APIError.notFound("funnel not found");
 
       if (input.expectedUpdatedAt) {
         const expected = new Date(input.expectedUpdatedAt).getTime();

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import { bots, leads, trackingClicks } from "../../shared/schema/index.js";
+import { allowClick } from "./click-rate-limiter.js";
 
 // ── Registro do clique (links de tráfego pago /r?b=...) ──────────────────────
 
@@ -39,6 +40,26 @@ export async function registerTrackingClick(params: ClickParams): Promise<{ url:
   const [bot] = await db.select({ username: bots.telegramUsername })
     .from(bots).where(eq(bots.id, params.botId)).limit(1);
   if (!bot?.username) return null;
+
+  const ip = params.clientIp?.trim() || null;
+  // Sem IP pra correlacionar (proxy que não repassa nada), não dá pra conter
+  // replay sem arriscar throttle cruzado entre visitantes distintos — nesse
+  // caso raro segue sem rate limit.
+  if (ip && !allowClick(ip, params.botId)) {
+    // Estourou o limite: não grava clique novo (evita inflar tracking_clicks
+    // com replay), mas o visitante real não pode cair numa página de erro —
+    // reaproveita o último clique gravado desse IP+bot pra montar a mesma URL
+    // do Telegram. Existe pelo menos um, já que a janela só bloqueia depois
+    // de MAX_CLICKS_PER_WINDOW cliques terem sido gravados de verdade.
+    const [last] = await db.select({ token: trackingClicks.token })
+      .from(trackingClicks)
+      .where(and(eq(trackingClicks.botId, params.botId), eq(trackingClicks.clientIp, ip.slice(0, 100))))
+      .orderBy(desc(trackingClicks.createdAt))
+      .limit(1);
+    if (last) return { url: `https://t.me/${bot.username}?start=tk_${last.token}` };
+    // Sem clique anterior achado (não deveria acontecer): segue pro fluxo
+    // normal abaixo em vez de travar o redirect do visitante real.
+  }
 
   // 3 + 32 = 35 chars — dentro do limite de 64 do start payload do Telegram.
   const token = randomUUID().replace(/-/g, "");
