@@ -57,4 +57,12 @@ export interface SaveFlowInput {
     sourceHandle: string | null;
     targetNodeId: string;
   }>;
+  /**
+   * `updatedAt` (ISO) que o cliente leu antes de editar. Se vier preenchido e
+   * não bater com o `funnels.updated_at` atual, o funil mudou desde o
+   * carregamento (outra aba, outro usuário) — o save é rejeitado com 409 em
+   * vez de sobrescrever silenciosamente. Ver `FunnelDrizzleRepository.saveFlow`.
+   * Opcional pra não quebrar clientes antigos que ainda não mandam o campo.
+   */
+  expectedUpdatedAt?: string;
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, and, inArray, ne, or, desc } from "drizzle-orm";
+import { APIError } from "encore.dev/api";
 import { db } from "../../shared/database.js";
 import {
   funnels, funnelBots, funnelNodes, nodeConnections, bots,
@@ -96,7 +97,20 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     return this.toFunnel(row);
   }
 
-  async update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig" | "botId">>): Promise<Funnel> {
+  async update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig" | "botId">>, expectedUpdatedAt?: Date): Promise<Funnel> {
+    // Checagem otimista opcional (mesma ideia do `saveFlow` abaixo): sem
+    // `expectedUpdatedAt`, comportamento idêntico ao anterior. Check-then-act
+    // sem lock/transação — mesma janela de corrida já aceita em `activate()`
+    // (ver comentário lá); o pior caso aqui é o mesmo 409 "falso negativo" raro.
+    if (expectedUpdatedAt) {
+      const [current] = await db.select({ updatedAt: funnels.updatedAt }).from(funnels)
+        .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
+      if (!current) throw new Error("funnel not found");
+      if (current.updatedAt.getTime() !== expectedUpdatedAt.getTime()) {
+        throw APIError.aborted("funil foi alterado por outra sessão desde que foi carregado — recarregue antes de salvar");
+      }
+    }
+
     const [row] = await db.update(funnels)
       .set({
         ...(data.name !== undefined && { name: data.name }),
@@ -119,11 +133,6 @@ export class FunnelDrizzleRepository implements FunnelRepository {
   }
 
   async saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<void> {
-    // Verify ownership
-    const [row] = await db.select({ id: funnels.id }).from(funnels)
-      .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
-    if (!row) throw new Error("funnel not found");
-
     const validTypes = ["trigger","message","media","audio","buttons","input","delay","condition","random","offer","wait_response"] as const;
     type NodeType = typeof validTypes[number];
 
@@ -131,17 +140,92 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     // para conexões desenhadas à mão. Regenera server-side qualquer id inválido
     // (remapeando as referências das conexões quando for id de nó).
     const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
-    const nodeIdMap = new Map<string, string>();
-    for (const n of input.nodes) nodeIdMap.set(n.id, isUuid(n.id) ? n.id : randomUUID());
 
-    // Full replace dentro de UMA transação: se qualquer insert falhar, o fluxo
-    // antigo permanece intacto (antes, um erro no meio apagava as conexões).
+    // Save DIFERENCIAL numa transação (era full delete+insert: apagava e
+    // recriava TODOS os nós a cada save, mesmo preservando os ids nos
+    // inserts). As FKs reagem ao DELETE mesmo quando o INSERT devolve o id
+    // igual — o registro é outro fisicamente:
+    //   - lead_progress.current_node_id  → SET NULL (leads perdiam a posição)
+    //   - scheduled_delays.next_node_id  → CASCADE  (delay agendado sumia)
+    //   - payments.node_id               → SET NULL (retomada de PIX pago quebrava)
+    //   - funnel_offers.node_id          → SET NULL
+    // Ou seja: qualquer autosave de um funil ATIVO tirava leads da posição,
+    // apagava delays agendados e podia impedir um PIX pago de retomar o
+    // funil. Ver bug reportado — corrige fazendo UPDATE dos nós que
+    // continuam existindo (mesmo id, mesmo funil), INSERT só dos novos e
+    // DELETE só dos removidos.
     await db.transaction(async (tx) => {
-      await tx.delete(nodeConnections).where(eq(nodeConnections.funnelId, id));
-      await tx.delete(funnelNodes).where(eq(funnelNodes.funnelId, id));
+      // Ownership + checagem otimista de concorrência dentro da MESMA transação
+      // do resto do save, pra ler `updatedAt` no mesmo snapshot que o diff usa.
+      const [row] = await tx.select({ id: funnels.id, updatedAt: funnels.updatedAt }).from(funnels)
+        .where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
+      if (!row) throw new Error("funnel not found");
 
-      if (input.nodes.length > 0) {
-        await tx.insert(funnelNodes).values(input.nodes.map((n) => ({
+      if (input.expectedUpdatedAt) {
+        const expected = new Date(input.expectedUpdatedAt).getTime();
+        if (expected !== row.updatedAt.getTime()) {
+          throw APIError.aborted("funil foi alterado por outra sessão desde que foi carregado — recarregue antes de salvar");
+        }
+      }
+
+      // Nós que já existem NESTE funil — base do diff update/insert/delete.
+      const existingRows = await tx.select({ id: funnelNodes.id }).from(funnelNodes)
+        .where(eq(funnelNodes.funnelId, id));
+      const existingIds = new Set(existingRows.map((r) => r.id));
+
+      // Um uuid de entrada pode: (a) já ser um nó deste funil → update; (b) já
+      // existir mas pertencer a OUTRO funil → nunca reaproveita esse registro
+      // (evita um funil "sequestrar" nó de outro só mandando o id certo) —
+      // trata como nó novo, gerando outro id; (c) não existir em lugar nenhum
+      // → nó novo de verdade, mantém o uuid que o cliente já gerou.
+      const candidateUuids = [...new Set(input.nodes.map((n) => n.id).filter(isUuid))];
+      const foreignRows = candidateUuids.length > 0
+        ? await tx.select({ id: funnelNodes.id, funnelId: funnelNodes.funnelId }).from(funnelNodes)
+            .where(inArray(funnelNodes.id, candidateUuids))
+        : [];
+      const foreignFunnelById = new Map(foreignRows.map((r) => [r.id, r.funnelId]));
+
+      const nodeIdMap = new Map<string, string>();
+      for (const n of input.nodes) {
+        if (isUuid(n.id) && existingIds.has(n.id)) {
+          nodeIdMap.set(n.id, n.id);
+        } else if (isUuid(n.id) && foreignFunnelById.has(n.id) && foreignFunnelById.get(n.id) !== id) {
+          nodeIdMap.set(n.id, randomUUID());
+        } else if (isUuid(n.id)) {
+          nodeIdMap.set(n.id, n.id);
+        } else {
+          nodeIdMap.set(n.id, randomUUID());
+        }
+      }
+
+      const keepIds = new Set([...nodeIdMap.values()].filter((finalId) => existingIds.has(finalId)));
+      const deleteIds = [...existingIds].filter((existingId) => !keepIds.has(existingId));
+
+      // Arestas: nenhuma outra tabela tem FK pra `node_connections.id` (só pra
+      // `funnel_nodes.id`, que tem os 4 FKs listados acima) — apagar e
+      // recriar todas não perde nenhuma referência externa. Mantém o
+      // full-replace aqui, mais simples que diferenciar sem ganho nenhum.
+      await tx.delete(nodeConnections).where(eq(nodeConnections.funnelId, id));
+
+      if (deleteIds.length > 0) {
+        await tx.delete(funnelNodes).where(and(eq(funnelNodes.funnelId, id), inArray(funnelNodes.id, deleteIds)));
+      }
+
+      for (const n of input.nodes) {
+        const finalId = nodeIdMap.get(n.id)!;
+        if (!keepIds.has(finalId)) continue;
+        await tx.update(funnelNodes).set({
+          type:      (validTypes.includes(n.type as NodeType) ? n.type : "message") as NodeType,
+          content:   n.content,
+          positionX: n.positionX,
+          positionY: n.positionY,
+          updatedAt: new Date(),
+        }).where(eq(funnelNodes.id, finalId));
+      }
+
+      const newNodes = input.nodes.filter((n) => !keepIds.has(nodeIdMap.get(n.id)!));
+      if (newNodes.length > 0) {
+        await tx.insert(funnelNodes).values(newNodes.map((n) => ({
           id:        nodeIdMap.get(n.id)!,
           funnelId:  id,
           type:      (validTypes.includes(n.type as NodeType) ? n.type : "message") as NodeType,
