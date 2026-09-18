@@ -118,6 +118,26 @@ function assertFunnelReadyToActivate(detail: FunnelDetail): void {
   }
 }
 
+// Únicos valores que o schema aceita (services/shared/schema/index.ts,
+// coluna `kind`). A UI antiga (BotFunnels.tsx) manda "flow_chat" pro tipo
+// visual de nós/conexões — normaliza pra "flow" em vez de rejeitar, senão
+// ela quebra ao criar funil.
+const VALID_FUNNEL_KINDS = new Set(["flow", "simplified"]);
+
+function normalizeFunnelKind(kind: string | undefined): string {
+  const raw = (kind ?? "flow").trim();
+  const normalized = raw === "flow_chat" ? "flow" : raw;
+  if (!VALID_FUNNEL_KINDS.has(normalized)) {
+    throw APIError.invalidArgument(`kind inválido: "${raw}" — use "flow" ou "simplified"`);
+  }
+  return normalized;
+}
+
+// Mesmo limite que a UI antiga aplicava client-side (FunnelBotsManage.tsx,
+// MAX_BOTS_PER_FUNNEL) — reforçado aqui porque `assignBots` também é
+// alcançável direto pela API, sem passar pela tela.
+const MAX_BOTS_PER_FUNNEL = 5;
+
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 // GET /funnels?botId=...
@@ -151,7 +171,7 @@ export const create = api(
       userId,
       botId: req.botId,
       name:  req.name,
-      kind:  req.kind ?? "flow",
+      kind:  normalizeFunnelKind(req.kind),
     });
     scanSourceAsync("funnel", funnel.id);
     return toResponse({ ...funnel, bots: [{ id: req.botId, name: "" }] });
@@ -573,6 +593,9 @@ export const createOffersBulk = api(
 export const assignBots = api(
   { method: "PUT", path: "/funnels/:id/bots", expose: true, auth: true },
   async ({ id, botIds }: { id: string; botIds: string[] }): Promise<{ ok: boolean }> => {
+    if (botIds.length > MAX_BOTS_PER_FUNNEL) {
+      throw APIError.invalidArgument(`limite de ${MAX_BOTS_PER_FUNNEL} bots por funil`);
+    }
     const { userID: userId } = getAuthData()!;
     await assertBotsOwnership(botIds, userId);
     await repo.assignBots(id, userId, botIds);
