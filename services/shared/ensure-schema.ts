@@ -287,10 +287,37 @@ const STATEMENTS: string[] = [
      WHERE "client_request_id" IS NOT NULL`,
 ];
 
-export async function ensureSchema(): Promise<void> {
-  for (const stmt of STATEMENTS) {
-    await db.execute(sql.raw(stmt));
+export interface SchemaFailure {
+  statement: string;
+  error:     unknown;
+}
+
+// Erro de conexão (sem SQLSTATE, ou classe 08 / 57P = servidor caindo) vale
+// retry do bootstrap inteiro. Qualquer outro erro é do próprio statement (ex.:
+// índice único sobre dado duplicado) e não pode travar os seguintes — já
+// aconteceu: o índice 0014 falhou e 0015–0017 ficaram sem aplicar em produção.
+export function isConnectionError(err: unknown): boolean {
+  const e = err as { code?: unknown; cause?: { code?: unknown } } | null;
+  const code = typeof e?.code === "string" ? e.code
+    : typeof e?.cause?.code === "string" ? e.cause.code
+    : undefined;
+  if (!code || !/^[0-9A-Z]{5}$/.test(code)) return true;
+  return code.startsWith("08") || code.startsWith("57P");
+}
+
+// Aplica cada statement isolado: falha de um não impede os outros. Devolve as
+// falhas (vazio = tudo aplicado). Erro de conexão é relançado pro retry.
+export async function ensureSchema(statements: readonly string[] = STATEMENTS): Promise<SchemaFailure[]> {
+  const failures: SchemaFailure[] = [];
+  for (const stmt of statements) {
+    try {
+      await db.execute(sql.raw(stmt));
+    } catch (err) {
+      if (isConnectionError(err)) throw err;
+      failures.push({ statement: stmt, error: err });
+    }
   }
+  return failures;
 }
 
 // Boot com retry: o DB do Railway às vezes recusa conexão nos primeiros
@@ -299,8 +326,16 @@ export async function ensureSchema(): Promise<void> {
 export async function ensureSchemaAtBoot(attempts = 5, delayMs = 5_000): Promise<void> {
   for (let i = 1; i <= attempts; i++) {
     try {
-      await ensureSchema();
-      console.log("[schema] bootstrap de schema aplicado (idempotente)");
+      const failures = await ensureSchema();
+      if (failures.length === 0) {
+        console.log("[schema] bootstrap de schema aplicado (idempotente)");
+        return;
+      }
+      // Erro de dado/DDL não se resolve com retry: loga cada um e segue.
+      for (const f of failures) {
+        console.error("[schema] statement falhou (os demais foram aplicados):", f.statement.trim().split("\n")[0], f.error);
+      }
+      console.error(`[schema] ATENÇÃO: ${failures.length} statement(s) do bootstrap não aplicado(s) — corrigir o dado e reiniciar, ou aplicar migrations/*.sql manualmente`);
       return;
     } catch (err) {
       console.error(`[schema] tentativa ${i}/${attempts} falhou:`, err);
