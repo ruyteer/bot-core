@@ -5,7 +5,6 @@
 const DEFAULTS: Record<string, string> = {
   // Chave AES-256-GCM de teste (32 bytes = 64 hex). NÃO é a de produção.
   ENCRYPTION_KEY: "0".repeat(64),
-  SUPABASE_URL: "https://test.supabase.local",
   ENCORE_EXTERNAL_URL: "https://test.orionbot.local",
   DATABASE_URL: "postgres://test/test",
 };
