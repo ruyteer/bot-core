@@ -3,9 +3,11 @@ import { db } from "../../shared/database.js";
 import {
   bots, leads, funnels, payments, simplifiedScheduledTasks,
 } from "../../shared/schema/index.js";
-import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
 import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { telegramButtonStyle } from "./telegram-button-style.js";
+import { fmtBRL, sendPixMessages } from "./pix-messages.js";
+import { buildOrderBumpCard } from "./order-bump.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
@@ -19,10 +21,6 @@ const payRepo = new PaymentDrizzleRepository();
 
 // ── Helpers (porte fiel do backend antigo Lovable) ──────────────────────────────
 
-function fmtBRL(centavos: number): string {
-  return Number(centavos || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
-}
-
 // `sale_type` derivado do contexto do PIX do funil simplificado.
 // LIMITAÇÃO CONHECIDA: order bump não vira uma linha própria em `payments` — o
 // valor do bump é somado ao PIX do plano (um pagamento só). Por isso um plano
@@ -34,25 +32,6 @@ function saleTypeFromCtx(kind: SimplifiedPaymentCtx["kind"]): SaleType {
     case "downsell": return "downsell";
     default:         return "offer";
   }
-}
-
-function replacePixVariables(text: string, vars: { nome?: string; valor?: string; produto?: string; descricao?: string; mensagem?: string }): string {
-  if (!text) return text || "";
-  return text
-    .replace(/\{nome\}/gi, vars.nome || "")
-    .replace(/\{valor\}/gi, vars.valor || "")
-    .replace(/\{produto\}/gi, vars.produto || "")
-    .replace(/\{descricao\}/gi, vars.descricao || "")
-    .replace(/\{mensagem\}/gi, vars.mensagem || "");
-}
-
-// Placeholders suportados nos labels editáveis de order bump: {nome} e {preco}
-// ({valor} é aceito como apelido de {preco}, para bater com os templates de PIX).
-function replaceOrderBumpVars(text: string, vars: { nome?: string; preco?: string }): string {
-  if (!text) return text || "";
-  return text
-    .replace(/\{nome\}/gi, vars.nome || "")
-    .replace(/\{(preco|valor)\}/gi, vars.preco || "");
 }
 
 // Retorna o texto do campo se for uma string não-vazia (após trim), senão undefined.
@@ -340,29 +319,26 @@ export class ExecuteSimplifiedFunnelUseCase {
 
   // ── Card de order bumps ──
   private async sendOrderBumpOffer(tg: TelegramClient, chatId: string, planId: string, applicable: Array<Record<string, unknown>>, cfg: Record<string, unknown>, protect: boolean): Promise<void> {
-    const bumpsTotal = applicable.reduce((s, ob) => s + Number(ob.price || 0), 0);
-    const text = String(cfg.order_bumps_intro_text || "").trim() || "🎁 Adicione ao seu pedido:";
-    const keyboard: Array<Array<Record<string, unknown>>> = [];
-    if (applicable.length > 1) {
-      for (const ob of applicable) {
-        const shortId = String(ob.id || "").substring(0, 8);
-        const itemLabelTpl = nonEmptyStr(ob.button_label) || "➕ {nome} (+{preco})";
-        const itemLabel = replaceOrderBumpVars(itemLabelTpl, { nome: String(ob.name || ""), preco: fmtBRL(Number(ob.price || 0)) });
-        const style = telegramButtonStyle(ob.style);
-        keyboard.push([{ text: itemLabel, callback_data: `sb_one_${planId}_${shortId}`, ...(style ? { style } : {}) }]);
-      }
-      const addAllTpl = nonEmptyStr(cfg.order_bumps_add_all_label) || "✅ Adicionar tudo (+{preco})";
-      const addAllStyle = telegramButtonStyle(cfg.order_bumps_add_all_style);
-      keyboard.push([{ text: replaceOrderBumpVars(addAllTpl, { preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}`, ...(addAllStyle ? { style: addAllStyle } : {}) }]);
-    } else {
-      const addOneTpl = nonEmptyStr(cfg.order_bumps_add_one_label) || "✅ Adicionar (+{preco})";
-      const addOneStyle = telegramButtonStyle(cfg.order_bumps_add_one_style);
-      keyboard.push([{ text: replaceOrderBumpVars(addOneTpl, { nome: String(applicable[0]?.name || ""), preco: fmtBRL(bumpsTotal) }), callback_data: `sb_yes_${planId}`, ...(addOneStyle ? { style: addOneStyle } : {}) }]);
-    }
-    const declineLabel = nonEmptyStr(cfg.order_bumps_decline_label) || "Não, obrigado";
-    const declineStyle = telegramButtonStyle(cfg.order_bumps_decline_style);
-    keyboard.push([{ text: declineLabel, callback_data: `sb_no_${planId}`, ...(declineStyle ? { style: declineStyle } : {}) }]);
-    await tg.sendMessage({ chatId, text, replyMarkup: { inline_keyboard: keyboard }, protectContent: protect });
+    const card = buildOrderBumpCard({
+      items: applicable.map((ob) => ({
+        id: String(ob.id || "").substring(0, 8),
+        name: String(ob.name || ""),
+        price: Number(ob.price || 0),
+        buttonLabel: nonEmptyStr(ob.button_label),
+        style: ob.style,
+      })),
+      introText: String(cfg.order_bumps_intro_text || ""),
+      skipText: nonEmptyStr(cfg.order_bumps_decline_label),
+      skipStyle: cfg.order_bumps_decline_style,
+      addOneTemplate: nonEmptyStr(cfg.order_bumps_add_one_label),
+      addOneStyle: cfg.order_bumps_add_one_style,
+      addAllTemplate: nonEmptyStr(cfg.order_bumps_add_all_label),
+      addAllStyle: cfg.order_bumps_add_all_style,
+      callbackYes: `sb_yes_${planId}`,
+      callbackNo: `sb_no_${planId}`,
+      callbackOne: (id) => `sb_one_${planId}_${id}`,
+    });
+    await tg.sendMessage({ chatId, text: card.text, replyMarkup: card.replyMarkup, protectContent: protect });
   }
 
   // ── Gera PIX de um plano (com/sem bumps) + agenda downsells ──
@@ -478,57 +454,17 @@ export class ExecuteSimplifiedFunnelUseCase {
       data:      { url: "/sales", lead_id: lead.id },
     }).catch((err) => console.error("[simplified] push de PIX gerado falhou:", err));
 
-    await this.sendPixMessages(tg, chatId, pix.pixCode, amount, productName, payCfg, bot.protectContent, lead.firstName ?? "");
-    return { paymentId: created.id };
-  }
-
-  // ── Envio das mensagens do PIX (QR + copia-e-cola), respeitando o payment config ──
-  private async sendPixMessages(
-    tg: TelegramClient,
-    chatId: string,
-    pixCode: string,
-    amount: number,
-    productName: string,
-    payCfg: Record<string, unknown>,
-    protect: boolean,
-    leadName = "",
-  ): Promise<void> {
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=15&data=${encodeURIComponent(pixCode)}`;
-    // {nome} era substituído por "" fixo — o lead nunca via o próprio nome.
-    const pixVars = { nome: leadName, valor: fmtBRL(amount), produto: productName, descricao: "", mensagem: "" };
-
-    const qrCaption = payCfg.pix_caption_template
-      ? replacePixVariables(String(payCfg.pix_caption_template), pixVars)
-      : `🛒 ${productName}\n\n💰 Total: ${fmtBRL(amount)}\n\nEscaneie o QR Code para pagar!`;
-    const copyText = payCfg.pix_copy_text
-      ? replacePixVariables(String(payCfg.pix_copy_text), pixVars)
-      : "👆 Ou copie o código acima e cole no app do seu banco.";
-
-    const sendMode  = payCfg.pix_send_mode === "combined" ? "combined" : "separate";
     // O "botão nativo de copiar" (bloco <pre><code>, tap-to-copy) foi removido:
     // não funcionava em vários celulares. `pix_native_copy` é ignorado mesmo se
     // vier true de um funil antigo salvo no banco. Mantemos o <code> no texto
     // (clients velhos ainda conseguem selecionar) e o botão inline sempre ativo.
-    const pixCodeHtml = `<code>${pixCode}</code>`;
-
-    const copyButtonMarkup = pixCopyButtonMarkup(
-      pixCode,
-      typeof payCfg.pix_copy_button_label === "string" ? payCfg.pix_copy_button_label : undefined,
-    );
-
-    if (sendMode === "combined") {
-      await tg.sendPhoto({
-        chatId, photo: qrUrl, caption: `${qrCaption}\n\n${pixCodeHtml}\n\n${copyText}`,
-        protectContent: protect, replyMarkup: copyButtonMarkup,
-      });
-    } else {
-      await tg.sendPhoto({ chatId, photo: qrUrl, caption: qrCaption, protectContent: protect });
-      await tg.sendMessage({ chatId, text: `${pixCodeHtml}\n\n${copyText}`, protectContent: protect, replyMarkup: copyButtonMarkup });
-    }
-
-    if (payCfg.pix_after_text) {
-      await tg.sendMessage({ chatId, text: replacePixVariables(String(payCfg.pix_after_text), pixVars), protectContent: protect });
-    }
+    await sendPixMessages({
+      tg, chatId, pixCode: pix.pixCode,
+      qrPhoto: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=15&data=${encodeURIComponent(pix.pixCode)}`,
+      amountReais: amount, productName, payCfg, protect: bot.protectContent,
+      leadName: lead.firstName ?? "", fallback: "simplified",
+    });
+    return { paymentId: created.id };
   }
 
   // ── Pago: entrega os itens + agenda upsells (chamado pelo subscriber paymentPaid) ──

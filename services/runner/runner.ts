@@ -14,6 +14,7 @@ import { processDueBroadcasts } from "../broadcasts/application/process-broadcas
 import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing/application/process-remarketing.use-case.js";
 import { ensureSchemaAtBoot } from "../shared/ensure-schema.js";
 import { processPendingConversionEvents } from "../bots/application/pixel-events.js";
+import { routePaidPayment } from "./application/paid-routing.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
@@ -39,9 +40,10 @@ const _paidSub = new Subscription(paymentPaid, "runner-payment-paid", {
     try {
       const payment = await payRepo.findById(event.paymentId);
       if (!payment) return;
-      // Simplificado: entrega itens + agenda upsells. Flow: retoma pelo handle __paid.
-      if (payment.simplifiedCtx) await simplifiedFunnel.deliverPaid(payment);
-      else                       await executeFlowStep.handlePaidOffer(payment);
+      // Simplificado: entrega itens + agenda upsells. Flow: entrega a oferta
+      // (e os bumps aceitos) e retoma pelo handle __paid. Ver routePaidPayment.
+      if (routePaidPayment(payment) === "simplified") await simplifiedFunnel.deliverPaid(payment);
+      else                                             await executeFlowStep.handlePaidOffer(payment);
     } catch (err) {
       console.error(`[runner] error handling paid payment ${event.paymentId}:`, err);
     }
