@@ -126,7 +126,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
       id,
       nodes: [{ id: crypto.randomUUID(), type: "offer", content: { offers: [{}] }, positionX: 0, positionY: 0 }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("aceita oferta iniciada só com nome — falta preço e entrega", async () => {
@@ -139,7 +139,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("aceita oferta iniciada com nome e preço, mas sem entrega configurada", async () => {
@@ -152,7 +152,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("aceita oferta completa num nó offer dedicado", async () => {
@@ -165,7 +165,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("aceita oferta vip_group com só delivery_url preenchido (validação de tipo fica só pra activate)", async () => {
@@ -178,7 +178,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("aceita shape legado de oferta única (product_id direto em content, sem array offers) mesmo incompleto", async () => {
@@ -191,7 +191,7 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         positionX: 0, positionY: 0,
       }],
       connections: [],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
   });
 
   it("não afeta funil sem nenhuma oferta (nós de trigger/mensagem comuns)", async () => {
@@ -204,7 +204,18 @@ describe("saveFlow — aceita qualquer oferta, completa ou não (validação mov
         { id: n2, type: "message", content: { message: "oi" }, positionX: 0, positionY: 0 },
       ],
       connections: [{ id: crypto.randomUUID(), sourceNodeId: n1, sourceHandle: null, targetNodeId: n2 }],
-    })).resolves.toEqual({ ok: true });
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it("devolve o updatedAt gravado no funil (campo novo; cliente antigo ignora)", async () => {
+    const id = await newFunnel();
+    const db = await testDb();
+    const { funnels } = await import("../shared/schema/index.js");
+    const result = await saveFlow({ id, nodes: [], connections: [] });
+    expect(result.ok).toBe(true);
+    expect(result.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    const [row] = await db.select({ updatedAt: funnels.updatedAt }).from(funnels).where(eq(funnels.id, id));
+    expect(row.updatedAt.toISOString()).toBe(result.updatedAt);
   });
 });
 
@@ -280,7 +291,7 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
       }],
       connections: [],
     });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   it("funil flow: aceita ativação quando a oferta está totalmente vazia (rascunho legítimo, não 'iniciada')", async () => {
@@ -290,7 +301,7 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
       nodes: [{ id: crypto.randomUUID(), type: "offer", content: { offers: [{}] }, positionX: 0, positionY: 0 }],
       connections: [],
     });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   it("funil flow: rejeita ativação com oferta incompleta escondida num bloco de oferta dentro de um nó message", async () => {
@@ -318,7 +329,7 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
       }],
       connections: [],
     });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   it("funil flow: rejeita ativação com shape legado de oferta única (product_id direto em content, sem array offers) quando incompleto", async () => {
@@ -346,7 +357,7 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
       }],
       connections: [],
     });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   it("funil simplificado: rejeita ativação com plano iniciado sem entrega", async () => {
@@ -363,7 +374,7 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
   it("funil simplificado: aceita plano com vip_group_id preenchido mesmo sem delivery_type explícito", async () => {
     const id = await newSimplifiedFunnel();
     await update({ id, simplifiedConfig: { plans: [{ name: "Plano VIP", price: 1000, vip_group_id: "-100987" }] } });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   // Regressão do achado de revisão de segurança: `deliveryTypeOf` (runtime)
@@ -412,11 +423,11 @@ describe("activate — bloqueia funil com oferta incompleta (rascunho vazio pass
         order_bumps: [{ name: "Bump", price: 300, delivery_type: "content", delivery_url: "https://x.com/bump" }],
       },
     });
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 
   it("funil simplificado: aceita ativação quando não há nenhum item cadastrado (rascunho vazio)", async () => {
     const id = await newSimplifiedFunnel();
-    await expect(activate({ id })).resolves.toEqual({ ok: true });
+    await expect(activate({ id })).resolves.toMatchObject({ ok: true });
   });
 });

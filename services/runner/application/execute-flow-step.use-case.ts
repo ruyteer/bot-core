@@ -1698,7 +1698,9 @@ export class ExecuteFlowStepUseCase {
         buttonLabel: typeof bump.button_label === "string" ? bump.button_label : undefined,
         style: bump.style,
       })),
-      introText: typeof offer.bump_message === "string" ? offer.bump_message : undefined,
+      // Texto plano do editor; parse_mode HTML do sendMessage rejeita `&`/`<>`
+      // crus e aborta o passo — o lead clica Comprar e o card nunca chega.
+      introText: typeof offer.bump_message === "string" ? escapeHtml(offer.bump_message) : undefined,
       skipText: typeof offer.bump_skip_text === "string" ? offer.bump_skip_text : undefined,
       addOneTemplate: typeof offer.bump_button_template === "string" ? offer.bump_button_template : undefined,
       callbackYes: `ob:y:${scope}:${offerIdx}`,

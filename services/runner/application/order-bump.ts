@@ -9,11 +9,27 @@ import type { SimplifiedDeliveryItem } from "../../payments/domain/payment.entit
  * runner não pisar no prefixo do outro (`sb_` vs `ob:`).
  */
 
-export function replaceOrderBumpVars(text: string, vars: { nome?: string; preco?: string }): string {
+export function replaceOrderBumpVars(
+  text: string,
+  vars: { nome?: string; preco?: string; produto?: string; total?: string },
+): string {
   if (!text) return text || "";
+  // Aliases da UI antiga (`BumpsEditor`): `{bump_nome}` / `{bump_preco}` /
+  // `{preco_produto}` / `{produto}` / `{total}`. Troca os compostos ANTES de
+  // `{nome}`/`{preco}` pra não deixar o prefixo `bump_` órfão.
   return text
+    .replace(/\{bump_nome\}/gi, vars.nome || "")
+    .replace(/\{bump_preco\}/gi, vars.preco || "")
+    .replace(/\{preco_produto\}/gi, vars.preco || "")
+    .replace(/\{produto\}/gi, vars.produto || vars.nome || "")
+    .replace(/\{total\}/gi, vars.total || vars.preco || "")
     .replace(/\{nome\}/gi, vars.nome || "")
     .replace(/\{(preco|valor)\}/gi, vars.preco || "");
+}
+
+function labelOrFallback(tpl: string, vars: { nome?: string; preco?: string; produto?: string; total?: string }, fallback: string): string {
+  const out = replaceOrderBumpVars(tpl, vars).trim();
+  return out || fallback;
 }
 
 function nonEmptyStr(v: unknown): string | undefined {
@@ -48,20 +64,23 @@ export function buildOrderBumpCard(opts: {
 
   if (items.length > 1) {
     for (const item of items) {
+      const vars = { nome: item.name, preco: fmtBRL(item.price), total: fmtBRL(item.price) };
       const itemLabelTpl = nonEmptyStr(item.buttonLabel) || "➕ {nome} (+{preco})";
-      const itemLabel = replaceOrderBumpVars(itemLabelTpl, { nome: item.name, preco: fmtBRL(item.price) });
+      const itemLabel = labelOrFallback(itemLabelTpl, vars, `➕ ${item.name}`);
       const style = telegramButtonStyle(item.style);
       keyboard.push([{ text: itemLabel, callback_data: opts.callbackOne(item.id), ...(style ? { style } : {}) }]);
     }
     const addAllTpl = nonEmptyStr(opts.addAllTemplate) || "✅ Adicionar tudo (+{preco})";
     const addAllStyle = telegramButtonStyle(opts.addAllStyle);
-    keyboard.push([{ text: replaceOrderBumpVars(addAllTpl, { preco: fmtBRL(bumpsTotal) }), callback_data: opts.callbackYes, ...(addAllStyle ? { style: addAllStyle } : {}) }]);
+    const addAllVars = { preco: fmtBRL(bumpsTotal), total: fmtBRL(bumpsTotal) };
+    keyboard.push([{ text: labelOrFallback(addAllTpl, addAllVars, "✅ Adicionar tudo"), callback_data: opts.callbackYes, ...(addAllStyle ? { style: addAllStyle } : {}) }]);
   } else {
     const addOneTpl = nonEmptyStr(opts.addOneTemplate) || "✅ Adicionar (+{preco})";
     const addOneStyle = telegramButtonStyle(opts.addOneStyle);
     const first = items[0];
+    const addVars = { nome: first?.name || "", preco: fmtBRL(bumpsTotal), total: fmtBRL(bumpsTotal) };
     keyboard.push([{
-      text: replaceOrderBumpVars(addOneTpl, { nome: first?.name || "", preco: fmtBRL(bumpsTotal) }),
+      text: labelOrFallback(addOneTpl, addVars, "✅ Adicionar"),
       callback_data: opts.callbackYes,
       ...(addOneStyle ? { style: addOneStyle } : {}),
     }]);

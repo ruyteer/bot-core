@@ -132,7 +132,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     await db.delete(funnels).where(and(eq(funnels.id, id), eq(funnels.userId, userId)));
   }
 
-  async saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<void> {
+  async saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<Date> {
     const validTypes = ["trigger","message","media","audio","buttons","input","delay","condition","random","offer","wait_response"] as const;
     type NodeType = typeof validTypes[number];
 
@@ -154,7 +154,7 @@ export class FunnelDrizzleRepository implements FunnelRepository {
     // funil. Ver bug reportado — corrige fazendo UPDATE dos nós que
     // continuam existindo (mesmo id, mesmo funil), INSERT só dos novos e
     // DELETE só dos removidos.
-    await db.transaction(async (tx) => {
+    return db.transaction(async (tx) => {
       // Ownership + checagem otimista de concorrência dentro da MESMA transação
       // do resto do save, pra ler `updatedAt` no mesmo snapshot que o diff usa.
       const [row] = await tx.select({ id: funnels.id, updatedAt: funnels.updatedAt }).from(funnels)
@@ -245,7 +245,9 @@ export class FunnelDrizzleRepository implements FunnelRepository {
         })));
       }
 
-      await tx.update(funnels).set({ updatedAt: new Date() }).where(eq(funnels.id, id));
+      const savedAt = new Date();
+      await tx.update(funnels).set({ updatedAt: savedAt }).where(eq(funnels.id, id));
+      return savedAt;
     });
   }
 

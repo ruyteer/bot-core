@@ -14,7 +14,7 @@ export interface FunnelRepository {
   // comportamento é o mesmo de antes.
   update(id: string, userId: string, data: Partial<Pick<Funnel, "name" | "simplifiedConfig" | "botId">>, expectedUpdatedAt?: Date): Promise<Funnel>;
   delete(id: string, userId: string): Promise<void>;
-  saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<void>;
+  saveFlow(id: string, userId: string, input: SaveFlowInput): Promise<Date>;
   activate(id: string, userId: string): Promise<void>;
   deactivate(id: string, userId: string): Promise<void>;
   duplicate(id: string, userId: string, targetBotId: string): Promise<Funnel>;

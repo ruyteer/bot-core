@@ -6,7 +6,7 @@ import { payments } from "../../shared/schema/index.js";
 import {
   createBot, createGateway, createFlowFunnel, startUpdate, callbackUpdate,
 } from "../../../test/helpers/seed.js";
-import { getSentMessages, getTelegramCalls } from "../../../test/helpers/fetch-mock.js";
+import { getSentMessages, getTelegramCalls, rejectUnescapedTelegramHtml } from "../../../test/helpers/fetch-mock.js";
 
 const useCase = new ExecuteFlowStepUseCase();
 const payRepo = new PaymentDrizzleRepository();
@@ -41,6 +41,17 @@ function bumpCallback(kind: "y" | "n" | "1"): string {
   });
   const kb = (bumpMsg!.body.reply_markup as { inline_keyboard: { callback_data?: string }[][] }).inline_keyboard;
   return kb.flat().find((b) => b.callback_data?.startsWith(`ob:${kind}:`))!.callback_data!;
+}
+
+function offerBuyCallback(): string {
+  for (const method of ["sendMessage", "sendPhoto"] as const) {
+    for (const call of getTelegramCalls(method)) {
+      const kb = (call.body.reply_markup as { inline_keyboard?: { callback_data?: string }[][] } | undefined)?.inline_keyboard;
+      const hit = kb?.flat().find((b) => typeof b.callback_data === "string" && b.callback_data.startsWith("o:"));
+      if (hit?.callback_data) return hit.callback_data;
+    }
+  }
+  throw new Error("nenhum botão o:<nó>:<i> nas chamadas do Telegram");
 }
 
 describe("flow PIX texts", () => {
@@ -261,5 +272,53 @@ describe("flow order bump — mesmo PIX", () => {
     const [pay] = await db.select().from(payments);
     expect(pay.amount).toBe(3000);
     expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0);
+  });
+
+  it("clique de produção o:<nó>:<i> também manda o card (não só o legado offer:0)", async () => {
+    const { bot } = await setupOffer({
+      offer: {
+        product_name: "Curso", price: 19.9, callback: "promo", button_text: "Comprar",
+        bumps: [bump], bump_message: "Leva o brinde?",
+      },
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(825) });
+    const buy = offerBuyCallback();
+    expect(buy).toMatch(/^o:[a-z0-9]{1,8}:0$/);
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(825, buy) });
+    expect(await (await testDb()).select().from(payments)).toHaveLength(0);
+    expect(getSentMessages().some((m) => m.includes("Leva o brinde?"))).toBe(true);
+    expect(bumpCallback("y")).toMatch(/^ob:y:/);
+  });
+
+  it("mensagem com & não aborta o card — Telegram rejeita HTML malformado", async () => {
+    rejectUnescapedTelegramHtml(true);
+    const { bot } = await setupOffer({
+      offer: {
+        product_name: "Curso", price: 19.9, callback: "promo", button_text: "Comprar",
+        bumps: [bump], bump_message: "Leva A & B?",
+      },
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(826) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(826, offerBuyCallback()) });
+    expect(await (await testDb()).select().from(payments)).toHaveLength(0);
+    expect(getSentMessages().some((m) => m.includes("A &amp; B"))).toBe(true);
+  });
+
+  it("template legado {bump_nome} aparece resolvido no botão do card", async () => {
+    const { bot } = await setupOffer({
+      offer: {
+        product_name: "Curso", price: 19.9, callback: "promo", button_text: "Comprar",
+        bumps: [bump],
+        bump_button_template: "{bump_nome} (+{bump_preco})",
+      },
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(827) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(827, offerBuyCallback()) });
+    const bumpMsg = getTelegramCalls("sendMessage").find((c) => {
+      const kb = (c.body.reply_markup as { inline_keyboard?: { text?: string; callback_data?: string }[][] } | undefined)?.inline_keyboard;
+      return kb?.flat().some((b) => b.callback_data?.startsWith("ob:y:"));
+    });
+    const labels = (bumpMsg!.body.reply_markup as { inline_keyboard: { text?: string }[][] }).inline_keyboard.flat().map((b) => b.text ?? "");
+    expect(labels.some((t) => t.includes("Brinde") && !t.includes("{bump_nome}"))).toBe(true);
   });
 });
