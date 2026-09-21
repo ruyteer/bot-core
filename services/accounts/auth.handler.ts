@@ -1,7 +1,7 @@
 import { authHandler } from "encore.dev/auth";
 import { APIError, Gateway, Header } from "encore.dev/api";
 import { createRemoteJWKSet, customFetch, decodeJwt, jwtVerify, type JWTPayload } from "jose";
-import { supabaseUrl, nextAuthIssuer } from "../config/secrets.js";
+import { nextAuthIssuer } from "../config/secrets.js";
 import { ProfileDrizzleRepository } from "./infrastructure/profile.drizzle.repository.js";
 import { UpsertProfileUseCase } from "./application/use-cases/upsert-profile.use-case.js";
 
@@ -20,16 +20,12 @@ export interface AuthJwtPayload {
   exp:            number;
 }
 
-// Convivência temporária entre dois emissores de JWT enquanto migramos a
-// autenticação pra fora do Supabase:
-//   - Supabase (legado): continua servindo o bot-ui antigo, em produção.
-//   - app novo (Next): ES256 próprio, `iss` = URL do app, JWKS publicado em
-//     `<iss>/.well-known/jwks.json`.
-// O emissor é escolhido pelo claim `iss` do token — nunca por um default.
+// Depois da virada: só o JWT ES256 do app novo. O emissor do Supabase (UI
+// antiga) não é mais aceito — mergear este PR antes disso derruba o login
+// legado. O `iss` do token tem que bater com NEXT_AUTH_ISSUER; qualquer
+// outro (incluindo o URL do projeto Supabase) é rejeitado.
 export interface AuthIssuersConfig {
-  /** URL do projeto Supabase (emissor legado). */
-  supabaseUrl: string;
-  /** URL do app Next novo. Ausente/vazio = segredo ainda não configurado. */
+  /** URL do app Next. Ausente/vazio = recusa todos os tokens. */
   nextAuthIssuer?: string;
   /** Só para teste: injeta o fetch usado pra buscar o JWKS, sem tocar rede. */
   fetchImpl?: typeof fetch;
@@ -51,14 +47,11 @@ function jwksFor(jwksUrl: string, fetchImpl?: typeof fetch): ReturnType<typeof c
 }
 
 /**
- * Escolhe o emissor pelo claim `iss` do token (decodificado sem validar) e
- * verifica com o JWKS correspondente. `iss` desconhecido é sempre rejeitado.
+ * Verifica o JWT com o JWKS do app novo. `iss` desconhecido é sempre rejeitado
+ * — não há mais fallback para o Supabase.
  *
- * Caminho Supabase: sem nenhuma mudança de comportamento (mesmo JWKS, mesma
- * validação de sempre — sem restringir `issuer`/`audience`/`algorithms`).
- * Caminho do app novo: exige `issuer`, `audience` e `algorithms: ["ES256"]`
- * no `jwtVerify` — sem restringir o algoritmo, o `alg` do header do token vira
- * superfície de ataque.
+ * Exige `issuer`, `audience` e `algorithms: ["ES256"]` no `jwtVerify` — sem
+ * restringir o algoritmo, o `alg` do header do token vira superfície de ataque.
  */
 export async function verifyAuthToken(token: string, config: AuthIssuersConfig): Promise<AuthJwtPayload> {
   let iss: string | undefined;
@@ -68,37 +61,27 @@ export async function verifyAuthToken(token: string, config: AuthIssuersConfig):
     throw APIError.unauthenticated("invalid token");
   }
 
-  let payload: JWTPayload;
-  if (typeof iss === "string" && !!config.supabaseUrl && iss === config.supabaseUrl) {
-    try {
-      ({ payload } = await jwtVerify(
-        token,
-        jwksFor(`${config.supabaseUrl}/auth/v1/.well-known/jwks.json`, config.fetchImpl),
-      ));
-    } catch (e: any) {
-      throw APIError.unauthenticated(`invalid or expired token: ${e?.message}`);
-    }
-  } else if (typeof iss === "string" && !!config.nextAuthIssuer && iss === config.nextAuthIssuer) {
-    try {
-      ({ payload } = await jwtVerify(
-        token,
-        jwksFor(`${config.nextAuthIssuer}/.well-known/jwks.json`, config.fetchImpl),
-        { issuer: config.nextAuthIssuer, audience: NEXT_AUTH_AUDIENCE, algorithms: ["ES256"] },
-      ));
-    } catch (e: any) {
-      throw APIError.unauthenticated(`invalid or expired token: ${e?.message}`);
-    }
-  } else {
+  if (typeof iss !== "string" || !config.nextAuthIssuer || iss !== config.nextAuthIssuer) {
     throw APIError.unauthenticated("unknown token issuer");
+  }
+
+  let payload: JWTPayload;
+  try {
+    ({ payload } = await jwtVerify(
+      token,
+      jwksFor(`${config.nextAuthIssuer}/.well-known/jwks.json`, config.fetchImpl),
+      { issuer: config.nextAuthIssuer, audience: NEXT_AUTH_AUDIENCE, algorithms: ["ES256"] },
+    ));
+  } catch (e: any) {
+    throw APIError.unauthenticated(`invalid or expired token: ${e?.message}`);
   }
 
   return payload as unknown as AuthJwtPayload;
 }
 
-// Secret opcional: se NEXT_AUTH_ISSUER não estiver setado (segredo novo, ainda
-// sem valor em produção até o app novo entrar no ar), `nextAuthIssuer()`
-// lança em ambiente deployado — o core precisa continuar de pé só com
-// Supabase, então o erro é engolido e tratado como "não configurado".
+// Se NEXT_AUTH_ISSUER não estiver setado, `nextAuthIssuer()` lança em
+// ambiente deployado. Engolimos o erro e recusamos o token — o boot do
+// processo não pode cair por um segredo ausente no meio de um restart.
 function readOptionalSecret(fn: () => string): string {
   try {
     return fn() || "";
@@ -115,7 +98,6 @@ export const auth = authHandler<AuthParams, AuthData>(async (params) => {
   if (!token) throw APIError.unauthenticated("missing token");
 
   const payload = await verifyAuthToken(token, {
-    supabaseUrl:    supabaseUrl(),
     nextAuthIssuer: readOptionalSecret(nextAuthIssuer) || undefined,
   });
 

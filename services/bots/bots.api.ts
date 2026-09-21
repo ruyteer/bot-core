@@ -5,7 +5,7 @@ import { BotDrizzleRepository } from "./infrastructure/bot.drizzle.repository.js
 import { db } from "../shared/database.js";
 import { botGroups, vipMembers, trackingPixels, conversionEvents } from "../shared/schema/index.js";
 import { and, eq, desc, sql } from "drizzle-orm";
-import { encrypt, decrypt } from "../shared/crypto.js";
+import { encrypt } from "../shared/crypto.js";
 import { CreateBotUseCase } from "./application/use-cases/create-bot.use-case.js";
 import { UpdateBotUseCase } from "./application/use-cases/update-bot.use-case.js";
 import { DeleteBotUseCase } from "./application/use-cases/delete-bot.use-case.js";
@@ -548,21 +548,6 @@ export const upsertPixel = api(
     }
 
     return { id: row.id, provider: row.provider, pixelId: row.pixelId, isActive: row.isActive };
-  },
-);
-
-// GET /bots/:id/pixels/:provider — get single pixel (returns access token for editing)
-export const getPixel = api(
-  { method: "GET", path: "/bots/:id/pixels/:provider", expose: true, auth: true },
-  async ({ id, provider }: { id: string; provider: string }): Promise<{ found: boolean; id: string; provider: string; pixelId: string; accessToken: string | null; isActive: boolean }> => {
-    assertValidPixelProvider(provider);
-    const { userID: userId } = getAuthData()!;
-    const bots = await repo.findByUserId(userId);
-    if (!bots.some((b) => b.id === id)) throw APIError.notFound("bot not found");
-    const rows = await db.select().from(trackingPixels).where(and(eq(trackingPixels.botId, id), eq(trackingPixels.provider, provider))).limit(1);
-    if (!rows.length) return { found: false, id: "", provider, pixelId: "", accessToken: null, isActive: false };
-    const p = rows[0];
-    return { found: true, id: p.id, provider: p.provider, pixelId: p.pixelId, accessToken: p.accessToken ? decrypt(p.accessToken) : null, isActive: p.isActive };
   },
 );
 

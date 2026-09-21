@@ -1,16 +1,9 @@
 import { secret } from "encore.dev/config";
 
 export const encryptionKey    = secret("ENCRYPTION_KEY");
-export const supabaseUrl      = secret("SUPABASE_URL");
-// URL do app Next novo (emissor de JWT ES256 próprio; JWKS em
-// <url>/.well-known/jwks.json). Convivência temporária com o Supabase durante
-// a migração de auth — ver services/accounts/auth.handler.ts. Se não estiver
-// setado, o core aceita só token do Supabase; não quebra o boot.
+// URL do app Next (emissor de JWT ES256 próprio; JWKS em
+// <url>/.well-known/jwks.json). Depois da virada é o único emissor aceito.
 export const nextAuthIssuer   = secret("NEXT_AUTH_ISSUER");
-// Service role key do Supabase — acesso admin total (bypassa RLS). Usada só
-// pra gerar o link de sessão da impersonação (POST /admin/users/:id/impersonate).
-// NUNCA exposta ao frontend; fica só no processo do backend.
-export const supabaseServiceRoleKey = secret("SUPABASE_SERVICE_ROLE_KEY");
 export const encoreExternalUrl = secret("ENCORE_EXTERNAL_URL");
 export const databaseUrl       = secret("DATABASE_URL");
 

@@ -1,14 +1,12 @@
-// Testes do handler de auth (services/accounts/auth.handler.ts): convivência
-// entre o JWT legado do Supabase e o JWT ES256 próprio do app novo enquanto a
-// autenticação migra pra fora do Supabase. `verifyAuthToken` é a função pura
-// de escolha+verificação extraída do authHandler (casca fina em cima dela).
+// Testes do handler de auth (services/accounts/auth.handler.ts): depois da
+// virada só o JWT ES256 do app novo é aceito. JWT do Supabase (UI antiga)
+// passa a ser `unknown token issuer`.
 //
 // Sem rede: cada teste gera seu próprio par de chaves ES256 com `jose` e
-// injeta um `fetchImpl` que serve o JWKS em memória — nada bate em Supabase
-// nem no app novo de verdade. URLs de emissor são únicas por teste porque
-// `verifyAuthToken` cacheia um `createRemoteJWKSet` por URL (de propósito,
-// pra não re-buscar o JWKS a cada request em produção); reusar a mesma URL
-// entre testes com chaves diferentes reaproveitaria o cache do primeiro.
+// injeta um `fetchImpl` que serve o JWKS em memória. URLs de emissor são
+// únicas por teste porque `verifyAuthToken` cacheia um `createRemoteJWKSet`
+// por URL; reusar a mesma URL entre testes com chaves diferentes reaproveitaria
+// o cache do primeiro.
 import { describe, it, expect } from "vitest";
 import { SignJWT, exportJWK, generateKeyPair, type JWK } from "jose";
 import { verifyAuthToken, type AuthIssuersConfig } from "./auth.handler.js";
@@ -32,7 +30,7 @@ function fetchServing(jwksUrl: string, jwks: unknown): typeof fetch {
   }) as typeof fetch;
 }
 
-describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES256)", () => {
+describe("verifyAuthToken — só o emissor do app novo (pós-virada)", () => {
   it("aceita token válido do emissor novo (ES256, iss/aud corretos)", async () => {
     const nextIssuer = "https://next-valido.example";
     const { privateKey, jwks } = await makeEs256Key("next-valido");
@@ -47,7 +45,7 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-nao-usado.example", nextAuthIssuer: nextIssuer, fetchImpl };
+    const config: AuthIssuersConfig = { nextAuthIssuer: nextIssuer, fetchImpl };
     const payload = await verifyAuthToken(token, config);
 
     expect(payload.email).toBe("a@a.com");
@@ -65,11 +63,11 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-iss-desconhecido.example", nextAuthIssuer: "https://next-iss-desconhecido.example" };
+    const config: AuthIssuersConfig = { nextAuthIssuer: "https://next-iss-desconhecido.example" };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
-  it("rejeita token sem claim iss (não confunde 'undefined === undefined' com emissor não configurado)", async () => {
+  it("rejeita token sem claim iss", async () => {
     const { privateKey } = await makeEs256Key("sem-iss");
     const token = await new SignJWT({})
       .setProtectedHeader({ alg: "ES256", kid: "sem-iss" })
@@ -78,7 +76,7 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-sem-iss.example", nextAuthIssuer: undefined };
+    const config: AuthIssuersConfig = { nextAuthIssuer: undefined };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
@@ -96,7 +94,7 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-nao-usado.example", nextAuthIssuer: nextIssuer, fetchImpl };
+    const config: AuthIssuersConfig = { nextAuthIssuer: nextIssuer, fetchImpl };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
@@ -105,9 +103,6 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
     const { jwks } = await makeEs256Key("next-alg-errado");
     const fetchImpl = fetchServing(`${nextIssuer}/.well-known/jwks.json`, jwks);
 
-    // Forja um token HS256 usando o mesmo kid do JWKS ES256 — sem restringir
-    // `algorithms`, um atacante pode tentar confundir o verificador quanto ao
-    // algoritmo esperado.
     const forgedSecret = new TextEncoder().encode("chave-hmac-fraca-de-teste-0000000000");
     const token = await new SignJWT({})
       .setProtectedHeader({ alg: "HS256", kid: "next-alg-errado" })
@@ -118,7 +113,7 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(forgedSecret);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-nao-usado.example", nextAuthIssuer: nextIssuer, fetchImpl };
+    const config: AuthIssuersConfig = { nextAuthIssuer: nextIssuer, fetchImpl };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
@@ -136,19 +131,17 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime(Math.floor(Date.now() / 1000) - 60)
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-nao-usado.example", nextAuthIssuer: nextIssuer, fetchImpl };
+    const config: AuthIssuersConfig = { nextAuthIssuer: nextIssuer, fetchImpl };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
-  it("caminho Supabase continua aceitando o que aceitava — mesmo JWKS, sem novas restrições de issuer/audience/alg", async () => {
-    const supabaseUrl = "https://supa-ok.example";
-    const { privateKey, jwks } = await makeEs256Key("supa-ok");
+  it("rejeita JWT do Supabase (emissor legado da UI antiga)", async () => {
+    const supabaseUrl = "https://supa-legado.example";
+    const { privateKey, jwks } = await makeEs256Key("supa-legado");
     const fetchImpl = fetchServing(`${supabaseUrl}/auth/v1/.well-known/jwks.json`, jwks);
 
-    // Token no shape real do Supabase: sem `aud` de app específico (o Supabase
-    // usa "authenticated"), e o handler nunca validou issuer/audience aqui.
     const token = await new SignJWT({ email: "b@b.com", user_metadata: { full_name: "Ciclana" } })
-      .setProtectedHeader({ alg: "ES256", kid: "supa-ok" })
+      .setProtectedHeader({ alg: "ES256", kid: "supa-legado" })
       .setSubject(crypto.randomUUID())
       .setIssuer(supabaseUrl)
       .setAudience("authenticated")
@@ -156,33 +149,11 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl, nextAuthIssuer: "https://next-nao-usado.example", fetchImpl };
-    const payload = await verifyAuthToken(token, config);
-
-    expect(payload.email).toBe("b@b.com");
-    expect(payload.user_metadata?.full_name).toBe("Ciclana");
+    const config: AuthIssuersConfig = { nextAuthIssuer: "https://next-nao-usado.example", fetchImpl };
+    await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 
-  it("caminho Supabase continua funcionando mesmo sem NEXT_AUTH_ISSUER configurado", async () => {
-    const supabaseUrl = "https://supa-sem-next.example";
-    const { privateKey, jwks } = await makeEs256Key("supa-sem-next");
-    const fetchImpl = fetchServing(`${supabaseUrl}/auth/v1/.well-known/jwks.json`, jwks);
-
-    const token = await new SignJWT({ email: "c@c.com" })
-      .setProtectedHeader({ alg: "ES256", kid: "supa-sem-next" })
-      .setSubject(crypto.randomUUID())
-      .setIssuer(supabaseUrl)
-      .setIssuedAt()
-      .setExpirationTime("5m")
-      .sign(privateKey);
-
-    const config: AuthIssuersConfig = { supabaseUrl, nextAuthIssuer: undefined, fetchImpl };
-    const payload = await verifyAuthToken(token, config);
-
-    expect(payload.email).toBe("c@c.com");
-  });
-
-  it("rejeita token do emissor novo quando NEXT_AUTH_ISSUER ainda não está configurado (não quebra, só recusa esse token)", async () => {
+  it("rejeita token do emissor novo quando NEXT_AUTH_ISSUER ainda não está configurado", async () => {
     const nextIssuer = "https://next-nao-configurado.example";
     const { privateKey, jwks } = await makeEs256Key("next-nao-configurado");
     const fetchImpl = fetchServing(`${nextIssuer}/.well-known/jwks.json`, jwks);
@@ -196,7 +167,7 @@ describe("verifyAuthToken — convivência Supabase (legado) + emissor novo (ES2
       .setExpirationTime("5m")
       .sign(privateKey);
 
-    const config: AuthIssuersConfig = { supabaseUrl: "https://supa-nao-usado-2.example", nextAuthIssuer: undefined, fetchImpl };
+    const config: AuthIssuersConfig = { nextAuthIssuer: undefined, fetchImpl };
     await expect(verifyAuthToken(token, config)).rejects.toMatchObject({ code: "unauthenticated" });
   });
 });

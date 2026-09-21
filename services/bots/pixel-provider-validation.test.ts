@@ -12,20 +12,13 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { upsertPixel, getPixel, deletePixel, testPixel } = await import("./bots.api.js");
+const { upsertPixel, deletePixel, testPixel } = await import("./bots.api.js");
 
 describe("provider inválido em endpoints de pixel", () => {
   it("upsertPixel rejeita provider desconhecido", async () => {
     const bot = await createBot();
     authUserId = bot.userId;
     await expect(upsertPixel({ id: bot.id, provider: "google", pixelId: "px1" }))
-      .rejects.toThrow(/provider inválido/);
-  });
-
-  it("getPixel rejeita provider desconhecido", async () => {
-    const bot = await createBot();
-    authUserId = bot.userId;
-    await expect(getPixel({ id: bot.id, provider: "snapchat" }))
       .rejects.toThrow(/provider inválido/);
   });
 
