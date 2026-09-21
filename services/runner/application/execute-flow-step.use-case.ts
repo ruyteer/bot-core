@@ -17,12 +17,14 @@ import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.
 import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
-import type { Payment } from "../../payments/domain/payment.entity.js";
+import type { Payment, SimplifiedDeliveryItem } from "../../payments/domain/payment.entity.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
 import { telegramButtonStyle } from "./telegram-button-style.js";
 import { applyStartTracking } from "../../leads/application/tracking-click.js";
 import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notifications/application/send-push.use-case.js";
+import { sendPixMessages } from "./pix-messages.js";
+import { buildOrderBumpCard, flowBumpRawList, pixConfigForOffer, toDeliveryItemFromFlowBump } from "./order-bump.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -198,6 +200,25 @@ function resolveOfferCallback(callbackData: string, nodeId: string): number | nu
     return scoped.scope === nodeScopeId(nodeId) && scoped.parts.length === 1 ? toIdx(scoped.parts[0]) : null;
   }
   return toIdx(callbackData.slice("offer:".length));
+}
+
+// Order bump do flow: `ob:y|n|1:<nó>:<offerIdx>[:bumpIdx]`. Prefixo `ob:` de
+// propósito NÃO casa com `o:` (oferta) nem com `sb_` (simplificado).
+function parseFlowBumpCallback(callbackData: string): {
+  action: "y" | "n" | "1";
+  scope: string;
+  offerIdx: number;
+  bumpIdx: number | null;
+} | null {
+  if (!callbackData.startsWith("ob:")) return null;
+  const segs = callbackData.slice("ob:".length).split(":");
+  if (segs.length < 3) return null;
+  const action = segs[0];
+  if (action !== "y" && action !== "n" && action !== "1") return null;
+  const offerIdx = /^\d+$/.test(segs[2]) ? parseInt(segs[2], 10) : NaN;
+  if (!Number.isFinite(offerIdx)) return null;
+  const bumpIdx = segs.length >= 4 && /^\d+$/.test(segs[3]) ? parseInt(segs[3], 10) : null;
+  return { action, scope: segs[1], offerIdx, bumpIdx };
 }
 
 // Handles candidatos para um `callback_data` recebido, resolvidos contra o
@@ -645,6 +666,7 @@ export class ExecuteFlowStepUseCase {
     const messageText = update.message?.text ?? null;
     const callbackData = update.callback_query?.data ?? null;
     const callbackQueryId = update.callback_query?.id ?? null;
+    const callbackMessageId = update.callback_query?.message?.message_id ?? null;
 
     // Get bot token (for Telegram API calls)
     const [bot] = await db.select().from(bots).where(eq(bots.id, botId));
@@ -829,6 +851,28 @@ export class ExecuteFlowStepUseCase {
         ? (await db.select().from(funnelNodes).where(eq(funnelNodes.id, prog.currentNodeId)))[0]
         : null;
 
+      // Clique no card de order bump (`ob:y|n|1:<nó>:<i>[:bump]`).
+      const bumpClick = parseFlowBumpCallback(callbackData);
+      if (bumpClick) {
+        const originNode = await resolveScopedOriginNode(prog.funnelId, currentNode ?? null, bumpClick.scope);
+        if (!originNode) return;
+        const offersList = collectNodeOffers(originNode.content as Record<string, unknown>);
+        const picked = offersList[bumpClick.offerIdx];
+        if (!picked) return;
+        if (callbackMessageId != null) {
+          await tg.editMessageReplyMarkup(chatIdStr, callbackMessageId, { inline_keyboard: [] }).catch(() => {});
+        }
+        const allBumps = flowBumpRawList(picked.offer);
+        let selected: Array<Record<string, unknown>> = [];
+        if (bumpClick.action === "y") selected = allBumps;
+        else if (bumpClick.action === "1" && bumpClick.bumpIdx != null) {
+          const one = allBumps[bumpClick.bumpIdx];
+          if (one) selected = [one];
+        }
+        await this.handleOfferPurchase(picked.offer, picked.handleId, originNode, prog, lead, bot, chatIdStr, tg, selected);
+        return;
+      }
+
       // Clique num botão de compra (callback `o:<nó>:<i>`, curto p/ caber no limite
       // de 64 bytes do TG; `offer:<i>` é o formato legado). Funciona no nó `offer`
       // dedicado E em ofertas embutidas num nó `message` — o índice é resolvido pela
@@ -852,7 +896,12 @@ export class ExecuteFlowStepUseCase {
           // O nó passado é o de ORIGEM (pode ser diferente do nó em que o lead
           // está agora) — é dele que vem a oferta certa, preservando a garantia
           // que o guard antigo protegia: nunca cobrar pelo produto do nó errado.
-          await this.handleOfferPurchase(picked.offer, picked.handleId, originNode, prog, lead, bot, chatIdStr, tg);
+          const bumps = flowBumpRawList(picked.offer);
+          if (bumps.length > 0) {
+            await this.sendFlowOrderBumpCard(originNode.id, index ?? 0, picked.offer, chatIdStr, tg, bot.protectContent);
+          } else {
+            await this.handleOfferPurchase(picked.offer, picked.handleId, originNode, prog, lead, bot, chatIdStr, tg, []);
+          }
         }
         return;
       }
@@ -1364,7 +1413,13 @@ export class ExecuteFlowStepUseCase {
         if (block.type === "text" && text) {
           await tg.sendMessage({ chatId, text: escapeHtml(interpolate(text, vars)), protectContent: protect, replyMarkup: attach });
         } else if ((block.type === "media" || block.type === "image" || block.type === "video" || block.type === "document") && url) {
-          if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
+          const spoiler = !!block.has_spoiler;
+          if (spoiler && mediaType !== "document") {
+            await tg.sendSingleMedia(chatId, {
+              type: mediaType === "video" ? "video" : "image",
+              url, caption, hasSpoiler: true, protect,
+            });
+          } else if (mediaType === "video")         await tg.sendVideo(chatId, url, caption, protect);
           else if (mediaType === "document") await tg.sendDocument(chatId, url, caption, protect);
           else                               await tg.sendPhoto({ chatId, photo: url, caption, protectContent: protect });
         } else if (block.type === "audio" && url) {
@@ -1403,7 +1458,7 @@ export class ExecuteFlowStepUseCase {
     // imagem/vídeo, envia como ÁLBUM (sendMediaGroup) — o Telegram agrupa numa só
     // mensagem. Documentos/áudios não entram em álbum e vão individualmente.
     // O caption (HTML) vai só no 1º item do álbum (limite do Telegram).
-    const main   = { url: c.url, media_type: c.media_type, caption: c.caption } as Record<string, unknown>;
+    const main   = { url: c.url, media_type: c.media_type, caption: c.caption, has_spoiler: c.has_spoiler } as Record<string, unknown>;
     const extras = (c.extra_items as Array<Record<string, unknown>>) ?? [];
     const items  = [main, ...extras].filter((it) => typeof it.url === "string" && it.url);
 
@@ -1411,11 +1466,19 @@ export class ExecuteFlowStepUseCase {
       typeof it.caption === "string" ? escapeHtml(interpolate(it.caption, vars)) : undefined;
     const typeOf = (it: Record<string, unknown>): string => (it.media_type as string) || "image";
     const isAlbumType = (t: string): boolean => t === "image" || t === "photo" || t === "video";
+    const spoilerOf = (it: Record<string, unknown>): boolean => !!it.has_spoiler;
 
     const single = (it: Record<string, unknown>): Promise<void> => {
       const url = it.url as string;
       const caption = capOf(it);
       const t = typeOf(it);
+      const spoiler = spoilerOf(it);
+      if (spoiler && (t === "video" || t === "image" || t === "photo")) {
+        return tg.sendSingleMedia(chatId, {
+          type: t === "video" ? "video" : "image",
+          url, caption, hasSpoiler: true, protect,
+        });
+      }
       if (t === "video")    return tg.sendVideo(chatId, url, caption, protect);
       if (t === "document") return tg.sendDocument(chatId, url, caption, protect);
       if (t === "audio")    return tg.sendAudio(chatId, url, caption, protect);
@@ -1431,6 +1494,7 @@ export class ExecuteFlowStepUseCase {
             type:    typeOf(it) === "video" ? "video" as const : "photo" as const,
             media:   it.url as string,
             caption: i === 0 ? capOf(it) : undefined,
+            ...(spoilerOf(it) ? { has_spoiler: true } : {}),
           })),
           protect,
         );
@@ -1616,6 +1680,34 @@ export class ExecuteFlowStepUseCase {
     });
   }
 
+  private async sendFlowOrderBumpCard(
+    nodeId: string,
+    offerIdx: number,
+    offer: Record<string, unknown>,
+    chatId: string,
+    tg: TelegramClient,
+    protect: boolean,
+  ): Promise<void> {
+    const bumps = flowBumpRawList(offer);
+    const scope = nodeScopeId(nodeId);
+    const card = buildOrderBumpCard({
+      items: bumps.map((bump, i) => ({
+        id: String(i),
+        name: String(bump.product_name || bump.name || "Produto"),
+        price: Number(bump.price || 0),
+        buttonLabel: typeof bump.button_label === "string" ? bump.button_label : undefined,
+        style: bump.style,
+      })),
+      introText: typeof offer.bump_message === "string" ? offer.bump_message : undefined,
+      skipText: typeof offer.bump_skip_text === "string" ? offer.bump_skip_text : undefined,
+      addOneTemplate: typeof offer.bump_button_template === "string" ? offer.bump_button_template : undefined,
+      callbackYes: `ob:y:${scope}:${offerIdx}`,
+      callbackNo: `ob:n:${scope}:${offerIdx}`,
+      callbackOne: (id) => `ob:1:${scope}:${offerIdx}:${id}`,
+    });
+    await tg.sendMessage({ chatId, text: card.text, replyMarkup: card.replyMarkup, protectContent: protect });
+  }
+
   // ── Compra: gera PIX, persiste a cobrança e envia copia-e-cola + QR ──────────
   private async handleOfferPurchase(
     offer:  Record<string, unknown>,
@@ -1626,6 +1718,7 @@ export class ExecuteFlowStepUseCase {
     bot:    typeof bots.$inferSelect,
     chatId: string,
     tg:     TelegramClient,
+    selectedBumps: Array<Record<string, unknown>> = [],
   ): Promise<void> {
     const paidHandle = `${handleId}__paid`;
     const nodeContent = node.content as Record<string, unknown> & { unpaid_timeout?: number };
@@ -1663,7 +1756,11 @@ export class ExecuteFlowStepUseCase {
     ));
 
     // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
-    const amount    = typeof offer.price === "number" ? Math.round(offer.price * 100) : 0;
+    // Order bump soma no MESMO PIX (não gera cobrança à parte) — paridade com o simplificado.
+    const offerPriceReais = typeof offer.price === "number" ? offer.price : 0;
+    const bumpsPriceReais = selectedBumps.reduce((sum, bump) => sum + Number(bump.price || 0), 0);
+    const amountReais = offerPriceReais + bumpsPriceReais;
+    const amount    = Math.round(amountReais * 100);
     const productName = (typeof offer.product_name === "string" && offer.product_name) ? offer.product_name : "Produto";
 
     if (amount <= 0) {
@@ -1694,6 +1791,9 @@ export class ExecuteFlowStepUseCase {
     const { gateway: gw, pix } = result;
 
     // Persiste a cobrança com o contexto p/ retomar o funil quando pago.
+    // Bumps aceitos vão em simplifiedCtx.items pra a entrega extra sobreviver
+    // ao webhook — sale_type continua o da oferta (nunca "order_bump").
+    const bumpItems = selectedBumps.map(toDeliveryItemFromFlowBump);
     try {
       await payRepo.create({
         userId:      bot.userId,
@@ -1711,6 +1811,9 @@ export class ExecuteFlowStepUseCase {
         progressId:  prog.id,
         nodeId:      node.id,
         paidHandle,
+        simplifiedCtx: bumpItems.length
+          ? { kind: "plan", funnelId: prog.funnelId, items: bumpItems }
+          : null,
       });
     } catch (err) {
       // Corrida: entre o findPendingForOffer lá em cima e este INSERT, OUTRA
@@ -1745,13 +1848,11 @@ export class ExecuteFlowStepUseCase {
     // Cancelado quando o pagamento confirma (handlePaidOffer).
     await this.scheduleOfferTimeouts(prog.funnelId, node, prog.id, lead.id, bot.id, "unpaid", handleId);
 
-    const caption = `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${(amount / 100).toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`;
-    await tg.sendPhoto({ chatId, photo: pix.qrImage, caption, protectContent: bot.protectContent });
-    await tg.sendMessage({
-      chatId,
-      text: `<code>${escapeHtml(pix.pixCode)}</code>`,
-      protectContent: bot.protectContent,
-      replyMarkup: pixCopyButtonMarkup(pix.pixCode),
+    const payCfg = pixConfigForOffer(node.content as Record<string, unknown>, offer);
+    await sendPixMessages({
+      tg, chatId, pixCode: pix.pixCode, qrPhoto: pix.qrImage,
+      amountReais, productName, payCfg, protect: bot.protectContent,
+      leadName: lead.firstName ?? "", fallback: "flow",
     });
     await saveOutbound(lead.id, bot.id, { kind: "offer_pix", offerName: productName, externalId: pix.externalId, nodeId: node.id });
   }
@@ -1912,6 +2013,11 @@ export class ExecuteFlowStepUseCase {
     if (offer) {
       await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars)
         .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
+      const extras = payment.simplifiedCtx?.items ?? [];
+      for (const item of extras) {
+        await this.deliverPurchasedItem(item, chatId, tg, bot.protectContent, vars)
+          .catch((e) => console.error("[runner] entrega do bump falhou:", e));
+      }
     }
 
     // Retoma o funil pelo ramo __paid. Sem conexão nesse handle, cai na saída
@@ -1981,6 +2087,46 @@ export class ExecuteFlowStepUseCase {
     const text = url
       ? `✅ Pagamento confirmado! Acesse seu produto: ${escapeHtml(interpolate(url, vars))}`
       : "✅ Pagamento confirmado!";
+    await tg.sendMessage({ chatId, text, protectContent: protect });
+  }
+
+  private async deliverPurchasedItem(
+    item: SimplifiedDeliveryItem,
+    chatId: string,
+    tg: TelegramClient,
+    protect: boolean,
+    vars: Map<string, string>,
+  ): Promise<void> {
+    if (item.delivery_type === "vip_group") {
+      const groupId = (item.vip_group_id ?? "").trim();
+      if (!groupId) {
+        await tg.sendMessage({ chatId, text: `✅ ${item.name}: pagamento confirmado!`, protectContent: protect });
+        return;
+      }
+      const accessDays = item.access_days || 0;
+      const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
+      try {
+        const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
+        await tg.sendMessage({
+          chatId,
+          text: `✅ ${escapeHtml(item.name)} confirmado! Toque para entrar no grupo:`,
+          replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
+          protectContent: protect,
+        });
+      } catch (err) {
+        console.error("[runner] createChatInviteLink (bump) falhou:", err);
+        await tg.sendMessage({ chatId, text: `✅ ${escapeHtml(item.name)} confirmado! Em instantes você recebe o acesso.`, protectContent: protect });
+      }
+      return;
+    }
+    if (item.delivery_type === "text" && item.delivery_text) {
+      await tg.sendMessage({ chatId, text: `✅ ${escapeHtml(item.name)}\n\n${escapeHtml(interpolate(item.delivery_text, vars))}`, protectContent: protect });
+      return;
+    }
+    const url = item.delivery_url ?? "";
+    const text = url
+      ? `✅ ${escapeHtml(item.name)}: ${escapeHtml(interpolate(url, vars))}`
+      : `✅ ${escapeHtml(item.name)} confirmado!`;
     await tg.sendMessage({ chatId, text, protectContent: protect });
   }
 }
