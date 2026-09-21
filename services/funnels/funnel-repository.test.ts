@@ -267,7 +267,7 @@ describe("FunnelDrizzleRepository.saveFlow — save diferencial preserva referê
 
     // Sem expectedUpdatedAt, comportamento de antes é preservado (sem checagem).
     await expect(repo.saveFlow(funnel.id, bot.userId, { nodes: [], connections: [] }))
-      .resolves.toBeUndefined();
+      .resolves.toBeInstanceOf(Date);
   });
 
   it("aceita quando expectedUpdatedAt bate com o valor atual do funil", async () => {
@@ -278,7 +278,7 @@ describe("FunnelDrizzleRepository.saveFlow — save diferencial preserva referê
       nodes: [],
       connections: [],
       expectedUpdatedAt: funnel.updatedAt.toISOString(),
-    })).resolves.toBeUndefined();
+    })).resolves.toBeInstanceOf(Date);
   });
 });
 

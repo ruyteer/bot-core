@@ -26,6 +26,20 @@ export function forceTelegramError(method: string, errorCode?: number, descripti
   if (description !== undefined) forcedErrorDescriptions.set(method, description);
 }
 
+// Espelha o parse_mode HTML do Telegram: `&` solto (não-entidade) faz a API
+// responder `can't parse entities` e o sendMessage inteiro falhar. Os testes
+// do card de bump ligam isto pra reproduzir o abort que o mock permissivo
+// escondia. Desligado por padrão — o resto da suíte manda texto cru de
+// propósito em vários caminhos.
+let rejectUnescapedHtml = false;
+export function rejectUnescapedTelegramHtml(on = true): void {
+  rejectUnescapedHtml = on;
+}
+
+function telegramHtmlLooksBroken(text: string): boolean {
+  return /&(?![a-zA-Z]+;|#\d+;|#x[0-9a-fA-F]+;)/.test(text);
+}
+
 // Derruba um gateway PIX por trecho da URL (ex.: "realtechdev" = BuckPay), para
 // testar a cadeia de fallback. Casa por substring, não por URL exata.
 const forcedGatewayErrors = new Set<string>();
@@ -119,6 +133,19 @@ export function installFetchMock(): void {
     if (tgMatch) {
       const method = tgMatch[1];
       telegramCalls.push({ method, body: body ?? {} });
+      if (
+        rejectUnescapedHtml
+        && method === "sendMessage"
+        && (body?.parse_mode === "HTML" || body?.parse_mode == null)
+        && typeof body?.text === "string"
+        && telegramHtmlLooksBroken(body.text)
+      ) {
+        return jsonResponse({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: can't parse entities: Unsupported start tag at byte offset 0",
+        });
+      }
       if (forcedErrors.has(method)) {
         const code = forcedErrors.get(method);
         return jsonResponse({
@@ -169,6 +196,7 @@ export function resetFetchMock(): void {
   forcedErrors.clear();
   forcedErrorDescriptions.clear();
   forcedGatewayErrors.clear();
+  rejectUnescapedHtml = false;
 }
 
 export function uninstallFetchMock(): void {

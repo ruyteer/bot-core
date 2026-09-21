@@ -59,6 +59,27 @@ async function requireAdmin(userId: string) {
   if (!role) throw APIError.permissionDenied("admin access required");
 }
 
+// Allowlist do PUT /admin/config/:key. Sem isto qualquer admin gravava
+// TELEGRAM_SECRET_TOKEN (e qualquer outra chave) por este endpoint. A lista
+// é o que as duas UIs de fato editam: split, URL de afiliado, WhatsApp e o
+// token do webhook do Telegram (UI antiga — não pode quebrar até a virada).
+const WRITABLE_PLATFORM_CONFIG_KEYS = new Set([
+  "BUCKPAY_SPLIT_ENABLED", "BUCKPAY_SPLIT_EMAIL", "BUCKPAY_SPLIT_FEE_CENTS",
+  "SYNCPAY_SPLIT_ENABLED", "SYNCPAY_SPLIT_USER_ID", "SYNCPAY_SPLIT_FEE_CENTS",
+  "NEXUSPAG_SPLIT_ENABLED", "NEXUSPAG_SPLIT_USER_ID", "NEXUSPAG_SPLIT_FEE_CENTS",
+  "WIINPAY_SPLIT_ENABLED", "WIINPAY_SPLIT_USER_ID", "WIINPAY_SPLIT_FEE_CENTS",
+  "GATEWAY_AFFILIATE_URL_SYNCPAY", "GATEWAY_AFFILIATE_URL_BUCKPAY",
+  "GATEWAY_AFFILIATE_URL_NEXUSPAG", "GATEWAY_AFFILIATE_URL_WIINPAY",
+  "WHATSAPP_SUPPORT_PHONE", "WHATSAPP_SUPPORT_MESSAGE",
+  "TELEGRAM_SECRET_TOKEN",
+]);
+
+function assertWritablePlatformConfigKey(key: string): void {
+  if (!WRITABLE_PLATFORM_CONFIG_KEYS.has(key)) {
+    throw APIError.invalidArgument("chave de configuração não permitida");
+  }
+}
+
 // ─── GET /admin/stats ─────────────────────────────────────────────────────────
 
 export const getStats = api(
@@ -773,6 +794,7 @@ export const setConfig = api(
   async ({ key, value }: { key: string; value: string }): Promise<{ ok: boolean }> => {
     const { userID } = getAuthData()!;
     await requireAdmin(userID);
+    assertWritablePlatformConfigKey(key);
     await db.insert(platformConfig)
       .values({ key, value, updatedBy: userID })
       .onConflictDoUpdate({

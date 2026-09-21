@@ -238,11 +238,13 @@ export const deactivate = api(
 // completas — ver `assertFunnelReadyToActivate` acima.
 export const saveFlow = api(
   { method: "PUT", path: "/funnels/:id/flow", expose: true, auth: true },
-  async ({ id, ...input }: { id: string } & SaveFlowInput): Promise<{ ok: boolean }> => {
+  async ({ id, ...input }: { id: string } & SaveFlowInput): Promise<{ ok: boolean; updatedAt: string }> => {
     const { userID: userId } = getAuthData()!;
-    await repo.saveFlow(id, userId, input);
+    const updatedAt = await repo.saveFlow(id, userId, input);
     scanSourceAsync("funnel", id);
-    return { ok: true };
+    // Campo novo e opcional do ponto de vista do cliente: a UI antiga ignora;
+    // a nova usa pra fechar a janela de conflito entre abas sem reler o funil.
+    return { ok: true, updatedAt: updatedAt.toISOString() };
   },
 );
 
