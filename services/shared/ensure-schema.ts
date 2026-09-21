@@ -297,11 +297,14 @@ export interface SchemaFailure {
 // índice único sobre dado duplicado) e não pode travar os seguintes — já
 // aconteceu: o índice 0014 falhou e 0015–0017 ficaram sem aplicar em produção.
 export function isConnectionError(err: unknown): boolean {
-  const e = err as { code?: unknown; cause?: { code?: unknown } } | null;
-  const code = typeof e?.code === "string" ? e.code
-    : typeof e?.cause?.code === "string" ? e.cause.code
-    : undefined;
-  if (!code || !/^[0-9A-Z]{5}$/.test(code)) return true;
+  type PgLike = { code?: unknown; severity?: unknown; cause?: PgLike } | null | undefined;
+  const e = err as PgLike;
+  // Erro vindo do servidor Postgres (DatabaseError) sempre traz `severity`;
+  // erro de sistema do Node (ECONNREFUSED, EPIPE, EPERM...) nunca traz — e
+  // EPIPE/EPERM têm 5 letras, então a forma do código sozinha não distingue.
+  const pg = [e, e?.cause].find((x) => typeof x?.severity === "string" && typeof x?.code === "string");
+  if (!pg) return true;
+  const code = pg.code as string;
   return code.startsWith("08") || code.startsWith("57P");
 }
 

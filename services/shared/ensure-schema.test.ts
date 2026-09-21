@@ -31,14 +31,17 @@ describe("ensureSchema (bootstrap de DDL no boot)", () => {
       where table_name = 'schema_probe_dup' and column_name = 'depois'
     `);
     expect(res.rows.length).toBe(1);
+    await db.execute(sql`drop table "schema_probe_dup"`);
   });
 
   it("isConnectionError: só erro sem SQLSTATE ou de conexão vale retry", () => {
     expect(isConnectionError(new Error("connect ECONNREFUSED"))).toBe(true);
     expect(isConnectionError({ code: "ECONNREFUSED" })).toBe(true);
-    expect(isConnectionError({ code: "08006" })).toBe(true);
-    expect(isConnectionError({ code: "57P01" })).toBe(true);
-    expect(isConnectionError({ code: "23505" })).toBe(false);
-    expect(isConnectionError({ cause: { code: "42P07" } })).toBe(false);
+    expect(isConnectionError({ code: "EPIPE" })).toBe(true);
+    expect(isConnectionError({ code: "EPERM" })).toBe(true);
+    expect(isConnectionError({ code: "08006", severity: "FATAL" })).toBe(true);
+    expect(isConnectionError({ code: "57P01", severity: "FATAL" })).toBe(true);
+    expect(isConnectionError({ code: "23505", severity: "ERROR" })).toBe(false);
+    expect(isConnectionError({ cause: { code: "42P07", severity: "ERROR" } })).toBe(false);
   });
 });
