@@ -1,7 +1,7 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import { profiles, userRoles } from "../../shared/schema/index.js";
-import type { Profile, ProfileWithRoles, UpsertProfileInput } from "../domain/profile.entity.js";
+import type { Profile, ProfileWithRoles, ProvisionProfileInput, ProvisionProfileResult, UpsertProfileInput } from "../domain/profile.entity.js";
 import type { ProfileRepository } from "../domain/profile.repository.js";
 
 export class ProfileDrizzleRepository implements ProfileRepository {
@@ -31,6 +31,49 @@ export class ProfileDrizzleRepository implements ProfileRepository {
       })
       .returning();
     return row;
+  }
+
+  // Provisionamento vindo do cadastro na UI nova (POST /accounts/provision).
+  // Diferente do upsert acima (que roda em toda requisição autenticada e é
+  // "confiante" quanto a colisão de e-mail), aqui é a PRIMEIRA gravação do
+  // usuário — precisa impedir duas contas com o mesmo e-mail, e profiles.email
+  // não tem unique constraint no schema. O advisory lock por e-mail normalizado
+  // serializa provisionamentos concorrentes do mesmo e-mail dentro da transação
+  // (liberado sozinho no commit/rollback — mesmo padrão de BotDrizzleRepository.create).
+  async provision(input: ProvisionProfileInput): Promise<ProvisionProfileResult> {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext('profile-email:' || lower(${input.email})))`);
+
+      const [emailOwner] = await tx
+        .select({ id: profiles.id })
+        .from(profiles)
+        .where(sql`lower(${profiles.email}) = ${input.email}`)
+        .limit(1);
+
+      if (emailOwner && emailOwner.id !== input.id) {
+        return { status: "email_taken", userId: emailOwner.id };
+      }
+
+      const [existing] = await tx
+        .select({ id: profiles.id })
+        .from(profiles)
+        .where(eq(profiles.id, input.id))
+        .limit(1);
+
+      if (existing) {
+        // Idempotente: reenviar o mesmo sub não sobrescreve nada, mesmo que
+        // email/name tenham vindo diferentes desta vez (ver decisão no PR).
+        return { status: "exists" };
+      }
+
+      await tx.insert(profiles).values({
+        id:    input.id,
+        email: input.email,
+        name:  input.name,
+      });
+
+      return { status: "created" };
+    });
   }
 
   async findById(id: string): Promise<ProfileWithRoles | null> {
