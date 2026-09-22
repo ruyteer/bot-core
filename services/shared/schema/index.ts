@@ -22,7 +22,15 @@ export const profiles = pgTable("profiles", {
   isBlocked: boolean("is_blocked").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Segurança (revisão do PR #53, POST /accounts/provision): antes deste
+  // índice, profiles.email não tinha nenhuma restrição de unicidade — tanto o
+  // provisionamento novo quanto o upsert do authHandler antigo (JWT Supabase)
+  // podiam gravar duas contas com o mesmo e-mail em caixa diferente. Ver
+  // ProfileDrizzleRepository.provision (trata 23505 deste índice como
+  // email_taken) e auth.handler.ts (trata como erro de auth claro).
+  uniqueIndex("profiles_email_lower_unique").on(sql`lower(${t.email})`),
+]);
 
 export const userRoles = pgTable("user_roles", {
   userId: uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),

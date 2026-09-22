@@ -48,3 +48,50 @@ describe("ProfileDrizzleRepository.upsert — não reverte nome customizado", ()
     expect(row.email).toBe("novo@a.com");
   });
 });
+
+// Segurança (revisão do PR #53, POST /accounts/provision): profiles.email
+// ganhou um índice único case-insensitive (migrations/0018_profiles_email_
+// lower_unique.sql). O caminho antigo (authHandler/upsertProfile, usado pelo
+// JWT do Supabase até a virada) não tem nenhuma trava de aplicação por
+// e-mail — sem tratar o 23505 aqui, um sub novo com e-mail já usado por outro
+// perfil derrubaria a request com um 500 cru vindo direto do Postgres.
+describe("ProfileDrizzleRepository.upsert — e-mail já vinculado a outra conta (23505 do índice único)", () => {
+  it("sub NOVO com e-mail já usado por outro perfil: erro de auth claro, não 500 cru", async () => {
+    const donoOriginal = crypto.randomUUID();
+    await repo.upsert({ id: donoOriginal, email: "ocupado@a.com", name: "Dono Original" });
+
+    const subNovo = crypto.randomUUID();
+    await expect(repo.upsert({ id: subNovo, email: "ocupado@a.com", name: "Outro" }))
+      .rejects.toMatchObject({ code: "permission_denied" });
+
+    const db = await testDb();
+    const rows = await db.select().from(profiles);
+    expect(rows.length).toBe(1); // nada foi inserido pro subNovo
+  });
+
+  it("mesma checagem vale com variação de caixa no e-mail (índice é sobre lower(email))", async () => {
+    const donoOriginal = crypto.randomUUID();
+    await repo.upsert({ id: donoOriginal, email: "foo@bar.com", name: "Dono Original" });
+
+    const subNovo = crypto.randomUUID();
+    await expect(repo.upsert({ id: subNovo, email: "Foo@Bar.com", name: "Outro" }))
+      .rejects.toMatchObject({ code: "permission_denied" });
+  });
+
+  it("upsert de um sub JÁ EXISTENTE com e-mail atualizado que colide com OUTRO perfil também é recusado", async () => {
+    const donoOriginal = crypto.randomUUID();
+    await repo.upsert({ id: donoOriginal, email: "ocupado2@a.com", name: "Dono Original" });
+
+    const outroUsuario = crypto.randomUUID();
+    await repo.upsert({ id: outroUsuario, email: "email-proprio@a.com", name: "Outro Usuário" });
+
+    // O JWT do "outro usuário" agora traz um e-mail diferente (trocou de
+    // e-mail no provedor de auth) que colide com o dono original.
+    await expect(repo.upsert({ id: outroUsuario, email: "ocupado2@a.com", name: "Outro Usuário" }))
+      .rejects.toMatchObject({ code: "permission_denied" });
+
+    const db = await testDb();
+    const [row] = await db.select().from(profiles).where(eq(profiles.id, outroUsuario));
+    expect(row.email).toBe("email-proprio@a.com"); // não foi alterado pelo upsert que falhou
+  });
+});

@@ -9,12 +9,19 @@ import {
 } from "../../services/shared/schema/index.js";
 import type { TelegramUpdate } from "../../services/shared/events/index.js";
 
-export async function createProfile(): Promise<string> {
+// Email único por padrão (baseado no id gerado): profiles.email agora tem um
+// índice único case-insensitive (migrations/0018_profiles_email_lower_unique.
+// sql, revisão de segurança do PR #53). Testes que criam vários perfis na
+// mesma suíte (ex.: indicador + vendedor) não podem mais compartilhar um
+// e-mail fixo — passar `opts.email` explicitamente quando o teste depender de
+// um valor específico.
+export async function createProfile(opts: { email?: string; name?: string } = {}): Promise<string> {
   const db = await testDb();
+  const id = crypto.randomUUID();
   const [row] = await db.insert(profiles).values({
-    id: crypto.randomUUID(),
-    email: "test@orionbot.local",
-    name: "Tester",
+    id,
+    email: opts.email ?? `test-${id}@orionbot.local`,
+    name:  opts.name ?? "Tester",
   }).returning();
   return row.id;
 }

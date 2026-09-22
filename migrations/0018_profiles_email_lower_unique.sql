@@ -1,0 +1,11 @@
+-- Segurança (revisão do PR #53 — POST /accounts/provision): profiles.email não
+-- tinha nenhuma restrição de unicidade. O provisionamento novo já trava por
+-- e-mail normalizado dentro da transação, mas o caminho antigo (authHandler /
+-- upsertProfile, usado pelo JWT do Supabase até a virada) continuava podendo
+-- gravar duas contas com o mesmo e-mail em caixa diferente — o índice fecha
+-- essa janela no próprio banco, para os dois caminhos.
+--
+-- Produção conferida antes desta migration (só leitura): 18 perfis, zero
+-- duplicata de lower(email), nenhum email nulo — aplica direto, sem limpeza
+-- prévia de dados.
+CREATE UNIQUE INDEX IF NOT EXISTS "profiles_email_lower_unique" ON "profiles" (lower("email"));

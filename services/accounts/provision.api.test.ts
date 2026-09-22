@@ -20,7 +20,10 @@ import { SignJWT, exportJWK, generateKeyPair, type JWK } from "jose";
 import { verifyAuthToken } from "./auth.handler.js";
 import { provision, PROVISION_AUDIENCE } from "./provision.api.js";
 import { parseProvisionClaims } from "./domain/provision-claims.js";
+import { ProfileDrizzleRepository } from "./infrastructure/profile.drizzle.repository.js";
+import { ProvisionProfileUseCase } from "./application/use-cases/provision-profile.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
+import { __setTestDb } from "../shared/database.js";
 import { profiles } from "../shared/schema/index.js";
 
 async function makeEs256Key(kid: string): Promise<{ privateKey: CryptoKey; jwks: { keys: JWK[] } }> {
@@ -179,6 +182,26 @@ describe("parseProvisionClaims", () => {
       sub: crypto.randomUUID(), email: "a@a.com", user_metadata: { name: "x".repeat(121) }, exp: baseExp,
     })).toThrow(/name/i);
   });
+
+  it("prioriza full_name sobre name, igual ao authHandler (ver auth.handler.ts)", () => {
+    const input = parseProvisionClaims({
+      sub: crypto.randomUUID(),
+      email: "a@a.com",
+      user_metadata: { name: "Nome Curto", full_name: "Nome Completo" },
+      exp: baseExp,
+    });
+    expect(input.name).toBe("Nome Completo");
+  });
+
+  it("usa name quando full_name não vier", () => {
+    const input = parseProvisionClaims({
+      sub: crypto.randomUUID(),
+      email: "a@a.com",
+      user_metadata: { name: "Só Name" },
+      exp: baseExp,
+    });
+    expect(input.name).toBe("Só Name");
+  });
 });
 
 // ─── Endpoint completo (Header → verificação → claims → repositório) ──────────
@@ -190,8 +213,10 @@ let issuerSeq = 0;
  * emissor/JWKS de teste único por chamada (evita colidir com o cache de
  * `jwksByUrl` de auth.handler.ts entre chamadas). `aud` é PROVISION_AUDIENCE
  * por padrão; testes de audience errada passam outro valor de propósito.
+ * `includeExp` (default true) controla se o token leva o claim `exp` — o
+ * endpoint exige vida curta, então o teste de "sem exp" passa `false`.
  */
-async function callProvision(opts: { sub: string; email?: string; name?: string; aud?: string }) {
+async function callProvision(opts: { sub: string; email?: string; name?: string; aud?: string; includeExp?: boolean }) {
   const seq = ++issuerSeq;
   const nextIssuer = `https://prov-e2e-${seq}.example`;
   const kid = `prov-e2e-${seq}`;
@@ -210,7 +235,7 @@ async function callProvision(opts: { sub: string; email?: string; name?: string;
   process.env.TEST_SECRET_NEXT_AUTH_ISSUER = nextIssuer;
 
   try {
-    const token = await new SignJWT({
+    let builder = new SignJWT({
       email: opts.email ?? "user@example.com",
       user_metadata: { name: opts.name ?? "Fulano" },
     })
@@ -218,9 +243,9 @@ async function callProvision(opts: { sub: string; email?: string; name?: string;
       .setSubject(opts.sub)
       .setIssuer(nextIssuer)
       .setAudience(opts.aud ?? PROVISION_AUDIENCE)
-      .setIssuedAt()
-      .setExpirationTime("5m")
-      .sign(privateKey);
+      .setIssuedAt();
+    if (opts.includeExp ?? true) builder = builder.setExpirationTime("5m");
+    const token = await builder.sign(privateKey);
 
     return await provision({ authorization: `Bearer ${token}` } as never);
   } finally {
@@ -285,5 +310,144 @@ describe("POST /accounts/provision — endpoint completo", () => {
 
     const db = await testDb();
     expect((await db.select().from(profiles)).length).toBe(0);
+  });
+
+  it("rejeita token sem claim exp — o endpoint exige vida curta (jose só valida expiração quando exp está presente)", async () => {
+    await expect(callProvision({ sub: crypto.randomUUID(), includeExp: false }))
+      .rejects.toMatchObject({ code: "unauthenticated" });
+
+    const db = await testDb();
+    expect((await db.select().from(profiles)).length).toBe(0);
+  });
+});
+
+// ─── Corrida simulada no INSERT (força o 23505, sem depender de concorrência
+// real do PGlite — mesma técnica de services/referrals/referrals.test.ts:
+// "catch do 23505 traduz a violação do índice único... força o INSERT a
+// colidir, sem depender de concorrência real do PGlite") ────────────────────
+//
+// PGlite roda numa conexão única: `db.transaction()` serializa completamente,
+// então duas chamadas de `provisionProfile.execute` via Promise.allSettled não
+// reproduzem a corrida de verdade — a pré-checagem da 2ª chamada já enxergaria
+// o que a 1ª gravou. Para exercitar de fato o catch de unique_violation
+// (services/accounts/infrastructure/profile.drizzle.repository.ts#provision),
+// troca-se `db.transaction` por uma versão cujo INSERT (dentro do savepoint)
+// simula outra transação "vencendo a corrida": insere de verdade a linha
+// concorrente e então lança o 23505 real do Postgres — o SELECT de
+// releitura continua rodando contra o PGlite de verdade.
+describe("ProfileDrizzleRepository.provision — corrida (simulada) resolvida sem 500 cru", () => {
+  const repo             = new ProfileDrizzleRepository();
+  const provisionProfile = new ProvisionProfileUseCase(repo);
+
+  it("mesmo sub, e-mails diferentes: o INSERT simulado colide com a PK (profiles_pkey) e a releitura resolve para 'exists'", async () => {
+    const realDb = await testDb();
+    const sub = crypto.randomUUID();
+
+    const fakeTx = {
+      execute: async () => undefined, // advisory lock — no-op basta pro teste
+      select:  realDb.select.bind(realDb),
+      transaction: async () => {
+        // Simula a OUTRA transação vencendo a corrida: insere de verdade o
+        // mesmo sub, com um e-mail diferente do que esta chamada está usando.
+        await realDb.insert(profiles).values({ id: sub, email: "ganhou-a-corrida@exemplo.com", name: "Ganhou a Corrida" });
+        throw Object.assign(
+          new Error('duplicate key value violates unique constraint "profiles_pkey"'),
+          { code: "23505", constraint: "profiles_pkey" },
+        );
+      },
+    };
+    const fakeDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") return async (cb: (tx: typeof fakeTx) => unknown) => cb(fakeTx);
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    __setTestDb(fakeDb as unknown as Parameters<typeof __setTestDb>[0]);
+    try {
+      const result = await provisionProfile.execute({ id: sub, email: "perdeu-a-corrida@exemplo.com", name: "Perdeu a Corrida" });
+      expect(result).toEqual({ status: "exists" });
+    } finally {
+      __setTestDb(realDb as unknown as Parameters<typeof __setTestDb>[0]);
+    }
+
+    const rows = await realDb.select().from(profiles).where(eq(profiles.id, sub));
+    expect(rows.length).toBe(1); // só a linha que "ganhou a corrida", nada duplicado
+    expect(rows[0].email).toBe("ganhou-a-corrida@exemplo.com");
+  });
+
+  it("e-mail já usado por outro sub: o INSERT simulado colide com profiles_email_lower_unique e a releitura resolve para 'email_taken'", async () => {
+    const realDb = await testDb();
+    const donoOriginal = crypto.randomUUID();
+    const novoSub = crypto.randomUUID();
+
+    const fakeTx = {
+      execute: async () => undefined,
+      select:  realDb.select.bind(realDb),
+      transaction: async () => {
+        // Simula a OUTRA transação vencendo a corrida: registra o dono do
+        // e-mail disputado antes desta chamada tentar seu próprio INSERT.
+        await realDb.insert(profiles).values({ id: donoOriginal, email: "disputado@exemplo.com", name: "Dono Original" });
+        throw Object.assign(
+          new Error('duplicate key value violates unique constraint "profiles_email_lower_unique"'),
+          { code: "23505", constraint: "profiles_email_lower_unique" },
+        );
+      },
+    };
+    const fakeDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") return async (cb: (tx: typeof fakeTx) => unknown) => cb(fakeTx);
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    __setTestDb(fakeDb as unknown as Parameters<typeof __setTestDb>[0]);
+    try {
+      // O repositório espera email JÁ normalizado por quem chama (mesmo
+      // contrato de ProvisionProfileInput — a normalização de caixa em si já
+      // é coberta pelo teste de ponta a ponta "email_taken... com variação de
+      // caixa" acima e por profile.repository.test.ts). Aqui o foco é só a
+      // resolução da corrida via 23505.
+      const result = await provisionProfile.execute({ id: novoSub, email: "disputado@exemplo.com", name: "Novo" });
+      expect(result).toEqual({ status: "email_taken", userId: donoOriginal });
+    } finally {
+      __setTestDb(realDb as unknown as Parameters<typeof __setTestDb>[0]);
+    }
+
+    const rows = await realDb.select().from(profiles);
+    expect(rows.length).toBe(1); // nada foi inserido pro novoSub
+    expect(rows[0].id).toBe(donoOriginal);
+  });
+
+  it("unique_violation sem nenhum conflito visível na releitura propaga o erro original (não inventa um status)", async () => {
+    const realDb = await testDb();
+    const sub = crypto.randomUUID();
+
+    const fakeTx = {
+      execute: async () => undefined,
+      select:  realDb.select.bind(realDb),
+      transaction: async () => {
+        // Simula um 23505 "fantasma": nenhuma linha concorrente é realmente
+        // gravada, então a releitura não vai achar conflito nenhum.
+        throw Object.assign(new Error('duplicate key value violates unique constraint "profiles_pkey"'), { code: "23505" });
+      },
+    };
+    const fakeDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") return async (cb: (tx: typeof fakeTx) => unknown) => cb(fakeTx);
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    __setTestDb(fakeDb as unknown as Parameters<typeof __setTestDb>[0]);
+    try {
+      await expect(provisionProfile.execute({ id: sub, email: "sem-conflito@exemplo.com", name: "X" }))
+        .rejects.toMatchObject({ code: "23505" });
+    } finally {
+      __setTestDb(realDb as unknown as Parameters<typeof __setTestDb>[0]);
+    }
   });
 });

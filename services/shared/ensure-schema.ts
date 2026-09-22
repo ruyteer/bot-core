@@ -285,6 +285,14 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "scheduled_messages_user_client_request_unique"
      ON "scheduled_messages" USING btree ("user_id", "client_request_id")
      WHERE "client_request_id" IS NOT NULL`,
+
+  // 0018_profiles_email_lower_unique.sql — segurança (revisão do PR #53,
+  // POST /accounts/provision): profiles.email não tinha nenhuma restrição de
+  // unicidade. Fecha a janela pros dois caminhos que gravam profiles (o
+  // provisionamento novo E o upsert do authHandler antigo, via JWT Supabase).
+  // Produção conferida antes (só leitura): 18 perfis, zero duplicata de
+  // lower(email), nenhum email nulo.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "profiles_email_lower_unique" ON "profiles" (lower("email"))`,
 ];
 
 export interface SchemaFailure {

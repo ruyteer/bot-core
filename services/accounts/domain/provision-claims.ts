@@ -32,7 +32,9 @@ export function parseProvisionClaims(payload: AuthJwtPayload): ProvisionProfileI
     throw APIError.invalidArgument("email inválido");
   }
 
-  const name = (payload.user_metadata?.name ?? "").trim();
+  // Mesma prioridade que o authHandler usa (auth.handler.ts): full_name antes
+  // de name, quando ambos vierem no user_metadata.
+  const name = (payload.user_metadata?.full_name ?? payload.user_metadata?.name ?? "").trim();
   if (name.length < NAME_MIN_LENGTH || name.length > NAME_MAX_LENGTH) {
     throw APIError.invalidArgument(`name precisa ter entre ${NAME_MIN_LENGTH} e ${NAME_MAX_LENGTH} caracteres`);
   }
