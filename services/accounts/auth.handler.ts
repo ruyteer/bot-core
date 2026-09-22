@@ -33,9 +33,17 @@ export interface AuthIssuersConfig {
   nextAuthIssuer?: string;
   /** Só para teste: injeta o fetch usado pra buscar o JWKS, sem tocar rede. */
   fetchImpl?: typeof fetch;
+  /**
+   * Audience esperada no token do emissor novo. Default: NEXT_AUTH_AUDIENCE
+   * (comportamento atual do authHandler, inalterado). Outros endpoints que
+   * aceitam o MESMO emissor/JWKS mas exigem uma audience própria (ex. POST
+   * /accounts/provision, ver provision.api.ts) passam a sua aqui — assim um
+   * token comum de API não serve nesses endpoints, e vice-versa.
+   */
+  audience?: string;
 }
 
-const NEXT_AUTH_AUDIENCE = "orionbot-core";
+export const NEXT_AUTH_AUDIENCE = "orionbot-core";
 
 // Um createRemoteJWKSet por URL de JWKS, cacheado — o jose já cacheia as
 // chaves dentro de cada JWKS set; recriar a cada request perderia esse cache
@@ -83,7 +91,7 @@ export async function verifyAuthToken(token: string, config: AuthIssuersConfig):
       ({ payload } = await jwtVerify(
         token,
         jwksFor(`${config.nextAuthIssuer}/.well-known/jwks.json`, config.fetchImpl),
-        { issuer: config.nextAuthIssuer, audience: NEXT_AUTH_AUDIENCE, algorithms: ["ES256"] },
+        { issuer: config.nextAuthIssuer, audience: config.audience ?? NEXT_AUTH_AUDIENCE, algorithms: ["ES256"] },
       ));
     } catch (e: any) {
       throw APIError.unauthenticated(`invalid or expired token: ${e?.message}`);
@@ -99,7 +107,7 @@ export async function verifyAuthToken(token: string, config: AuthIssuersConfig):
 // sem valor em produção até o app novo entrar no ar), `nextAuthIssuer()`
 // lança em ambiente deployado — o core precisa continuar de pé só com
 // Supabase, então o erro é engolido e tratado como "não configurado".
-function readOptionalSecret(fn: () => string): string {
+export function readOptionalSecret(fn: () => string): string {
   try {
     return fn() || "";
   } catch {
