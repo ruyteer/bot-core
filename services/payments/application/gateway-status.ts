@@ -21,8 +21,15 @@ export type ChargeStatus = "paid" | "pending" | "cancelled" | "expired";
 
 export interface GatewayChargeStatus {
   status:    ChargeStatus;
-  /** Valor BRUTO da cobrança em centavos, quando o gateway informa. */
+  /** Valor da cobrança em centavos, quando o gateway informa. */
   amount:    number | null;
+  /**
+   * true = `amount` é o valor BRUTO (o que o comprador pagou) e pode ser
+   * conferido contra o cobrado. WiinPay só informa `value` já líquido da taxa
+   * (ver PR #58), então lá é false — a confirmação registra `amount_is_net`
+   * em vez de recusar uma venda legítima por "valor abaixo do cobrado".
+   */
+  amountIsGross: boolean;
   /** Status cru devolvido pelo gateway (pra log/diagnóstico). */
   rawStatus: string;
   /** Id interno da transação no gateway, quando vem na resposta. */
@@ -127,11 +134,12 @@ async function syncpayToken(clientId: string, clientSecret: string): Promise<str
   return data.access_token;
 }
 
-function result(status: string | undefined, paid: Set<string>, amount: number | null, gatewayTxId: unknown, raw: unknown): GatewayChargeStatus {
+function result(status: string | undefined, paid: Set<string>, amount: number | null, gatewayTxId: unknown, raw: unknown, amountIsGross = true): GatewayChargeStatus {
   if (!status) throw new GatewayStatusUnavailableError("gateway não informou o status da cobrança");
   return {
     status:      mapStatus(status, paid),
     amount,
+    amountIsGross,
     rawStatus:   status,
     gatewayTxId: gatewayTxId === undefined || gatewayTxId === null ? null : String(gatewayTxId),
     raw,
@@ -194,7 +202,7 @@ export async function fetchChargeStatus(
       const root = obj(json) ?? {};
       const d = obj(root.payment) ?? obj(root.data) ?? root;
       return result(d.status === undefined ? undefined : String(d.status), WIINPAY_PAID_STATUSES,
-        reaisToCents(d.value ?? d.amount), d.paymentId ?? d.id, json);
+        reaisToCents(d.value ?? d.amount), d.paymentId ?? d.id, json, false);
     }
   }
 }

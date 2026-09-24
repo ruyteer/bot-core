@@ -110,11 +110,11 @@ export async function checkChargeAtGateway(payment: Payment, opts: CheckOpts = {
           externalIdCandidates: [externalId],
           provider,
           status: charge.status,
-          // Valor BRUTO devolvido pelo gateway — é o que a confirmação
-          // (checkPaidAmount) confere contra o cobrado.
+          // Valor devolvido pelo gateway. Só o BRUTO é conferido contra o
+          // cobrado (checkPaidAmount); líquido (WiinPay) confirma com registro.
           amount:      charge.amount,
-          grossAmount: charge.amount,
-          amountIsNet: false,
+          grossAmount: charge.amountIsGross ? charge.amount : null,
+          amountIsNet: !charge.amountIsGross && charge.amount !== null,
           event:  opts.eventLabel ?? `gateway:${charge.rawStatus}`,
         },
       };

@@ -158,6 +158,24 @@ describe("webhook de pagamento — confirmação ativa no gateway", () => {
     expect((await payRepo.findById(p.id))!.status).toBe("paid");
   });
 
+  it("valor BRUTO do gateway abaixo do cobrado → não confirma", async () => {
+    const p = await seedPayment("nexuspag", "nx-short");
+    gatewayStatus("nexuspag", "nx-short", { id: "nx-short", status: "paid", amount: 1.0 });
+
+    await postWebhook("nexuspag", { transaction_id: "nx-short", status: "paid", amount: 19.9 });
+
+    expect((await payRepo.findById(p.id))!.status).toBe("pending");
+  });
+
+  it("wiinpay: valor da consulta é LÍQUIDO → confirma sem recusar por 'abaixo do cobrado'", async () => {
+    const p = await seedPayment("wiinpay", "wp-net");
+    gatewayStatus("wiinpay", "wp-net", { data: { status: "PAID", value: 18.5 } });
+
+    await postWebhook("wiinpay", { data: { paymentId: "wp-net", status: "PAID" } });
+
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+  });
+
   it("gateway fora do ar na consulta → responde 503 (gateway reenvia) e não aprova", async () => {
     const p = await seedPayment("nexuspag", "nx-down");
     gatewayStatus("nexuspag", "nx-down", { message: "boom" }, 502);
