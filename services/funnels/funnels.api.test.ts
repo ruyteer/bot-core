@@ -5,7 +5,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { testDb } from "../../test/helpers/db.js";
-import { funnelOffers } from "../shared/schema/index.js";
+import { funnelNodes, funnelOffers, remarketingCampaigns, remarketingMessages } from "../shared/schema/index.js";
 import { createBot } from "../../test/helpers/seed.js";
 import { assertOfferComplete } from "./domain/offer-validation.js";
 import { FunnelDrizzleRepository } from "./infrastructure/funnel.drizzle.repository.js";
@@ -15,7 +15,7 @@ vi.mock("~encore/auth", () => ({
   getAuthData: () => (authUserId ? { userID: authUserId } : null),
 }));
 
-const { createOffer, createOffersBulk, saveFlow, activate, update } = await import("./funnels.api.js");
+const { createOffer, createOffersBulk, deleteOffer, saveFlow, activate, update } = await import("./funnels.api.js");
 const repo = new FunnelDrizzleRepository();
 
 describe("assertOfferComplete", () => {
@@ -105,6 +105,75 @@ describe("createOffersBulk — validação server-side", () => {
     const db = await testDb();
     const rows = await db.select().from(funnelOffers).where(eq(funnelOffers.botId, bot.id));
     expect(rows.length).toBe(2);
+  });
+});
+
+// Paridade Comunicação/Remarketing (backlog "excluir oferta pelos dois") — o handler
+// REAL de `DELETE /funnels/offers/:id`, não só a query isolada.
+describe("deleteOffer", () => {
+  it("dono exclui oferta sem uso em lugar nenhum", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const created = await createOffer({ botId: bot.id, name: "Produto", price: 1000, deliveryUrl: "https://x.com" });
+
+    await deleteOffer({ id: created.id });
+
+    const db = await testDb();
+    const rows = await db.select().from(funnelOffers).where(eq(funnelOffers.id, created.id));
+    expect(rows.length).toBe(0);
+  });
+
+  it("oferta inexistente -> 404", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    await expect(deleteOffer({ id: crypto.randomUUID() })).rejects.toThrow(/not found/);
+  });
+
+  it("oferta de outro usuário -> 404, não exclui", async () => {
+    const owner = await createBot();
+    authUserId = owner.userId;
+    const created = await createOffer({ botId: owner.id, name: "Produto", price: 1000, deliveryUrl: "https://x.com" });
+
+    const attacker = await createBot();
+    authUserId = attacker.userId;
+    await expect(deleteOffer({ id: created.id })).rejects.toThrow();
+
+    const db = await testDb();
+    const rows = await db.select().from(funnelOffers).where(eq(funnelOffers.id, created.id));
+    expect(rows.length).toBe(1);
+  });
+
+  it("oferta embutida num nó do funil (node_id preenchido) -> bloqueia a exclusão", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const funnel = await repo.create({ userId: bot.userId, botId: bot.id, name: "F", kind: "flow" });
+    const db = await testDb();
+    const [node] = await db.insert(funnelNodes).values({
+      funnelId: funnel.id, type: "offer", content: {},
+    }).returning();
+    const [offer] = await db.insert(funnelOffers).values({
+      botId: bot.id, funnelId: funnel.id, nodeId: node.id, name: "Produto", price: 1000, deliveryUrl: "https://x.com",
+    }).returning();
+
+    await expect(deleteOffer({ id: offer.id })).rejects.toThrow(/node/);
+
+    const rows = await db.select().from(funnelOffers).where(eq(funnelOffers.id, offer.id));
+    expect(rows.length).toBe(1);
+  });
+
+  it("oferta em uso numa mensagem de remarketing -> bloqueia a exclusão", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const created = await createOffer({ botId: bot.id, name: "Produto", price: 1000, deliveryUrl: "https://x.com" });
+
+    const db = await testDb();
+    const [campaign] = await db.insert(remarketingCampaigns).values({ botId: bot.id, name: "Camp" }).returning();
+    await db.insert(remarketingMessages).values({ campaignId: campaign.id, message: "Oi", offerId: created.id });
+
+    await expect(deleteOffer({ id: created.id })).rejects.toThrow(/in use/);
+
+    const rows = await db.select().from(funnelOffers).where(eq(funnelOffers.id, created.id));
+    expect(rows.length).toBe(1);
   });
 });
 
