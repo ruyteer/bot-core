@@ -15,7 +15,7 @@ import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastr
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import type { SimplifiedPaymentCtx, SimplifiedDeliveryItem, Payment } from "../../payments/domain/payment.entity.js";
 import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
-import { registerOrRenewVipMembership } from "./vip-membership.js";
+import { registerOrRenewVipMembership, previewVipInviteExpireEpoch } from "./vip-membership.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -506,7 +506,12 @@ export class ExecuteSimplifiedFunnelUseCase {
     } else if (item.delivery_type === "text" && item.delivery_text) {
       await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n${interpolate(item.delivery_text, leadVars)}`, protectContent: protect });
     } else if (item.delivery_type === "vip_group" && item.vip_group_id) {
-      const expireDate = (item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined;
+      // botId/lead só faltam quando chamado de fora de deliverPaid (não há
+      // outro caller hoje) — sem eles não dá pra consultar o vencimento
+      // empilhado, cai no cálculo simples (só os dias desta entrega).
+      const expireDate = botId && lead
+        ? await previewVipInviteExpireEpoch(botId, item.vip_group_id, lead.telegramChatId, item.access_days)
+        : ((item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined);
       try {
         const link = await tg.createChatInviteLink(item.vip_group_id, { memberLimit: 1, expireDate });
         await tg.sendMessage({

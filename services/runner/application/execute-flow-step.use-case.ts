@@ -26,7 +26,7 @@ import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notific
 import { sendPixMessages } from "./pix-messages.js";
 import { buildOrderBumpCard, flowBumpRawList, pixConfigForOffer, toDeliveryItemFromFlowBump } from "./order-bump.js";
 import { stopRemarketingOnLeadReply } from "../../remarketing/application/process-remarketing.use-case.js";
-import { registerOrRenewVipMembership } from "./vip-membership.js";
+import { registerOrRenewVipMembership, previewVipInviteExpireEpoch } from "./vip-membership.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -2148,7 +2148,10 @@ export class ExecuteFlowStepUseCase {
     if (offer.productType === "vip_group" && offer.telegramGroupId) {
       const [grp] = await db.select().from(botGroups).where(eq(botGroups.id, offer.telegramGroupId));
       if (grp) {
-        const expireDate = offer.accessDays > 0 ? Math.floor(Date.now() / 1000) + offer.accessDays * 86400 : undefined;
+        // Vencimento FINAL (empilhado sobre assinatura ainda ativa, ou
+        // vitalício preservado) — não só os dias desta compra isolada, senão
+        // o convite expira antes do acesso real registrado em vip_members.
+        const expireDate = await previewVipInviteExpireEpoch(bot.id, grp.telegramChatId.toString(), lead.telegramChatId, offer.accessDays);
         try {
           const link = await tg.createChatInviteLink(grp.telegramChatId.toString(), { memberLimit: 1, expireDate });
           await tg.sendMessage({
@@ -2276,7 +2279,7 @@ export class ExecuteFlowStepUseCase {
         return;
       }
       const accessDays = typeof offer.access_days === "number" ? offer.access_days : 0;
-      const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
+      const expireDate = await previewVipInviteExpireEpoch(botId, groupId, lead.telegramChatId, accessDays);
       try {
         const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
         await tg.sendMessage({
@@ -2325,7 +2328,7 @@ export class ExecuteFlowStepUseCase {
         return;
       }
       const accessDays = item.access_days || 0;
-      const expireDate = accessDays > 0 ? Math.floor(Date.now() / 1000) + accessDays * 86400 : undefined;
+      const expireDate = await previewVipInviteExpireEpoch(botId, groupId, lead.telegramChatId, accessDays);
       try {
         const link = await tg.createChatInviteLink(groupId, { memberLimit: 1, expireDate });
         await tg.sendMessage({

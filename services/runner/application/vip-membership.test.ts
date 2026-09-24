@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { testDb } from "../../../test/helpers/db.js";
 import { botGroups, vipMembers, payments, funnelOffers, bots, funnels, leads } from "../../shared/schema/index.js";
@@ -6,11 +6,12 @@ import {
   createBot, createGateway, createLead, createFlowFunnel, createSimplifiedFunnel, startUpdate, callbackUpdate,
 } from "../../../test/helpers/seed.js";
 import { getTelegramCalls, forceTelegramError } from "../../../test/helpers/fetch-mock.js";
-import { registerOrRenewVipMembership, expireDueVipMemberships } from "./vip-membership.js";
+import { registerOrRenewVipMembership, expireDueVipMemberships, previewVipInviteExpireEpoch } from "./vip-membership.js";
 import { ExecuteFlowStepUseCase } from "./execute-flow-step.use-case.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./execute-simplified-funnel.use-case.js";
 import { TelegramClient } from "./telegram.client.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
+import * as pushModule from "../../notifications/application/send-push.use-case.js";
 
 const useCase    = new ExecuteFlowStepUseCase();
 const simplified = new ExecuteSimplifiedFunnelUseCase();
@@ -98,6 +99,24 @@ describe("registerOrRenewVipMembership", () => {
     expect(daysFromNow).toBeLessThan(6); // contado a partir de agora — não herdou o vencimento vencido há 100 dias
   });
 
+  it("vitalício ATIVO não é rebaixado por uma entrega seguinte com prazo definido (ex.: bump/reenvio)", async () => {
+    const bot = await createBot();
+    await createGroup(bot.id, -100450n);
+    // 1ª entrega: oferta vitalícia (accessDays vazio).
+    await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-100450", memberTelegramChatId: 4n, accessDays: null });
+
+    // 2ª entrega pro MESMO membro/grupo, agora com prazo finito — não pode
+    // rebaixar quem já tinha vitalício, senão o job de expiração bane quem
+    // pagou por acesso vitalício.
+    await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-100450", memberTelegramChatId: 4n, accessDays: 15 });
+
+    const db = await testDb();
+    const rows = await db.select().from(vipMembers);
+    expect(rows.length).toBe(1);
+    expect(rows[0].expiresAt).toBeNull();  // continua vitalício
+    expect(rows[0].accessDays).toBeNull();
+  });
+
   it("(cenário de falha) grupo do convite não existe mais em bot_groups — não registra nada, mas não lança", async () => {
     const bot = await createBot();
 
@@ -118,6 +137,38 @@ describe("registerOrRenewVipMembership", () => {
 
     const db = await testDb();
     expect((await db.select().from(vipMembers)).length).toBe(0);
+  });
+});
+
+describe("previewVipInviteExpireEpoch", () => {
+  it("renovação de assinatura ainda ativa: expire_date do CONVITE bate com o vencimento EMPILHADO, não só os dias desta compra", async () => {
+    const bot = await createBot();
+    await createGroup(bot.id, -100460n);
+    await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-100460", memberTelegramChatId: 5n, accessDays: 20 });
+    const db = await testDb();
+    const [m] = await db.select().from(vipMembers);
+
+    const epoch = await previewVipInviteExpireEpoch(bot.id, "-100460", 5n, 20);
+
+    // Vencimento empilhado ~= atual (20 dias) + mais 20 dias da renovação —
+    // bem mais longe do que "só 20 dias a partir de agora".
+    const expectedMs = m.expiresAt!.getTime() + 20 * 86_400_000;
+    expect(Math.abs(epoch! * 1000 - expectedMs)).toBeLessThan(5_000);
+  });
+
+  it("compra vitalícia não tem expire_date no convite", async () => {
+    const bot = await createBot();
+    await createGroup(bot.id, -100470n);
+    const epoch = await previewVipInviteExpireEpoch(bot.id, "-100470", 6n, null);
+    expect(epoch).toBeUndefined();
+  });
+
+  it("assinatura atual vitalícia: convite da entrega seguinte também não tem expire_date (preserva vitalício)", async () => {
+    const bot = await createBot();
+    await createGroup(bot.id, -100480n);
+    await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-100480", memberTelegramChatId: 7n, accessDays: null });
+    const epoch = await previewVipInviteExpireEpoch(bot.id, "-100480", 7n, 10);
+    expect(epoch).toBeUndefined();
   });
 });
 
@@ -284,13 +335,13 @@ describe("expireDueVipMemberships", () => {
     expect(m.isBlocked).toBe(false);
   });
 
-  it("(falha esperada) bot sem permissão/removido do grupo (403) ainda assim marca o membro como expirado", async () => {
+  it("(falha esperada) 400 — usuário já não está no grupo/chat inválido — ainda assim marca o membro como expirado", async () => {
     const bot = await createBot();
     await createGroup(bot.id, -700500n);
     await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-700500", memberTelegramChatId: 46n, accessDays: 1 });
     const db = await testDb();
     await db.update(vipMembers).set({ expiresAt: new Date(Date.now() - 60_000) });
-    forceTelegramError("banChatMember", 403, "bot não é mais membro do grupo");
+    forceTelegramError("banChatMember", 400, "chat inválido");
 
     const n = await expireDueVipMemberships();
     expect(n).toBe(1);
@@ -298,5 +349,48 @@ describe("expireDueVipMemberships", () => {
     const [m] = await db.select().from(vipMembers);
     expect(m.expiredAt).not.toBeNull();
     expect(m.isBlocked).toBe(true);
+  });
+
+  it("(cenário de falha) 403 — bot SEM permissão de admin no grupo — o ban falhou de verdade: NÃO marca expirado, e avisa o dono", async () => {
+    const pushSpy = vi.spyOn(pushModule, "sendPushToUser").mockResolvedValue({ sent: 0, failed: 0, removed: 0 });
+    try {
+      const bot = await createBot();
+      await createGroup(bot.id, -700510n);
+      await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-700510", memberTelegramChatId: 47n, accessDays: 1 });
+      const db = await testDb();
+      await db.update(vipMembers).set({ expiresAt: new Date(Date.now() - 60_000) });
+      forceTelegramError("banChatMember", 403, "bot não é mais admin do grupo");
+
+      const n = await expireDueVipMemberships();
+      expect(n).toBe(0); // diferente de 400: o membro continua no grupo de verdade
+
+      const [m] = await db.select().from(vipMembers);
+      expect(m.expiredAt).toBeNull();
+      expect(m.isBlocked).toBe(false);
+
+      expect(pushSpy).toHaveBeenCalledTimes(1);
+      expect(pushSpy.mock.calls[0][1].eventType).toBe("vip_group_permission_lost");
+    } finally {
+      pushSpy.mockRestore();
+    }
+  });
+
+  it("(dedup) dois membros vencidos do MESMO grupo com 403 avisam o dono só uma vez", async () => {
+    const pushSpy = vi.spyOn(pushModule, "sendPushToUser").mockResolvedValue({ sent: 0, failed: 0, removed: 0 });
+    try {
+      const bot = await createBot();
+      await createGroup(bot.id, -700520n);
+      await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-700520", memberTelegramChatId: 61n, accessDays: 1 });
+      await registerOrRenewVipMembership({ botId: bot.id, groupTelegramChatId: "-700520", memberTelegramChatId: 62n, accessDays: 1 });
+      const db = await testDb();
+      await db.update(vipMembers).set({ expiresAt: new Date(Date.now() - 60_000) });
+      forceTelegramError("banChatMember", 403, "bot não é mais admin do grupo");
+
+      const n = await expireDueVipMemberships();
+      expect(n).toBe(0);
+      expect(pushSpy).toHaveBeenCalledTimes(1); // mesmo grupo — não dobra o aviso
+    } finally {
+      pushSpy.mockRestore();
+    }
   });
 });

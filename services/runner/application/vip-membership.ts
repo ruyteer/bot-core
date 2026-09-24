@@ -3,6 +3,21 @@ import { db } from "../../shared/database.js";
 import { botGroups, bots, vipMembers } from "../../shared/schema/index.js";
 import { decrypt } from "../../shared/crypto.js";
 import { TelegramClient, TelegramApiError } from "./telegram.client.js";
+import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
+
+// `bot_groups` não tem unicidade em (bot_id, telegram_chat_id) — nada impede
+// duas linhas com o mesmo chat id (ex.: grupo recriado/reimportado). Resolver
+// sempre a MAIS ANTIGA (created_at asc) torna a escolha determinística em vez
+// de depender da ordem física do Postgres, que pode mudar entre execuções.
+// Não criamos o índice único correspondente aqui — precisaria checar
+// duplicatas em produção antes (ver relatório do PR).
+async function resolveBotGroupByChatId(botId: string, telegramChatId: bigint): Promise<{ id: string } | undefined> {
+  const [group] = await db.select({ id: botGroups.id }).from(botGroups)
+    .where(and(eq(botGroups.botId, botId), eq(botGroups.telegramChatId, telegramChatId)))
+    .orderBy(botGroups.createdAt)
+    .limit(1);
+  return group;
+}
 
 // ── Registro/renovação de assinatura VIP ────────────────────────────────────
 // Achado crítico da auditoria: a entrega de convite de grupo VIP acontecia,
@@ -54,8 +69,7 @@ export async function registerOrRenewVipMembership(input: VipMembershipInput): P
     return;
   }
 
-  const [group] = await db.select({ id: botGroups.id }).from(botGroups)
-    .where(and(eq(botGroups.botId, input.botId), eq(botGroups.telegramChatId, groupChatId)));
+  const group = await resolveBotGroupByChatId(input.botId, groupChatId);
   if (!group) {
     console.warn(`[vip] grupo ${input.groupTelegramChatId} não encontrado em bot_groups (bot=${input.botId}) — acesso entregue mas assinatura não registrada (sem expiração automática)`);
     return;
@@ -83,9 +97,20 @@ export async function registerOrRenewVipMembership(input: VipMembershipInput): P
       first_name  = EXCLUDED.first_name,
       last_name   = EXCLUDED.last_name,
       is_blocked  = false,
-      access_days = EXCLUDED.access_days,
+      -- Vitalício ATUAL (expires_at/expired_at nulos, nunca expirou) não pode
+      -- ser rebaixado por uma entrega com prazo — sem isso, quem já tinha
+      -- acesso vitalício e recebe outra entrega (ex.: bump, reenvio) ganhava
+      -- um vencimento finito e era banido pelo job de expiração mais tarde.
+      -- Vitalício NOVO (EXCLUDED.access_days IS NULL) sempre vence: a compra
+      -- de agora manda.
+      access_days = CASE
+        WHEN EXCLUDED.access_days IS NULL THEN NULL
+        WHEN vip_members.expires_at IS NULL AND vip_members.expired_at IS NULL THEN NULL
+        ELSE EXCLUDED.access_days
+      END,
       expires_at  = CASE
         WHEN EXCLUDED.access_days IS NULL THEN NULL
+        WHEN vip_members.expires_at IS NULL AND vip_members.expired_at IS NULL THEN NULL
         WHEN vip_members.expires_at IS NOT NULL AND vip_members.expires_at > now() AND vip_members.expired_at IS NULL
           THEN vip_members.expires_at + (EXCLUDED.access_days * interval '1 day')
         ELSE now() + (EXCLUDED.access_days * interval '1 day')
@@ -98,9 +123,63 @@ export async function registerOrRenewVipMembership(input: VipMembershipInput): P
   `);
 }
 
+/**
+ * Calcula o `expire_date` (epoch em segundos) que o convite do Telegram deve
+ * usar — o MESMO vencimento final que `registerOrRenewVipMembership` vai
+ * persistir (empilhado sobre uma assinatura ainda ativa, ou preservando
+ * vitalício), não só os dias desta compra isolada. Sem isso, uma renovação
+ * gerava um convite que expirava em `accessDays` a partir de agora, mas o
+ * banco guardava o vencimento empilhado (mais longe) — o convite ficava
+ * "errado" mesmo com o acesso real correto.
+ *
+ * É uma LEITURA (não atômica com o upsert que vem depois): compra
+ * concorrente do mesmo lead no mesmo grupo entre o preview e o registro é uma
+ * janela de corrida teórica e rara — na pior hipótese o convite reflete um
+ * vencimento levemente desatualizado, o acesso registrado em `vip_members`
+ * (a fonte da verdade) continua correto.
+ *
+ * Retorna `undefined` quando o convite não deve ter expiração (compra
+ * vitalícia, ou assinatura atual já vitalícia e ainda não expirada).
+ */
+export async function previewVipInviteExpireEpoch(
+  botId: string, groupTelegramChatId: string, memberTelegramChatId: bigint, accessDays: number | null | undefined,
+): Promise<number | undefined> {
+  const days = typeof accessDays === "number" && Number.isFinite(accessDays) && accessDays > 0
+    ? Math.floor(accessDays)
+    : null;
+  if (days === null) return undefined; // esta compra é vitalícia
+
+  let groupChatId: bigint;
+  try {
+    groupChatId = BigInt(groupTelegramChatId);
+  } catch {
+    return Math.floor(Date.now() / 1000) + days * 86400;
+  }
+
+  const group = await resolveBotGroupByChatId(botId, groupChatId);
+  if (!group) return Math.floor(Date.now() / 1000) + days * 86400;
+
+  const [existing] = await db.select({ expiresAt: vipMembers.expiresAt, expiredAt: vipMembers.expiredAt }).from(vipMembers)
+    .where(and(eq(vipMembers.botId, botId), eq(vipMembers.groupId, group.id), eq(vipMembers.telegramChatId, memberTelegramChatId)));
+
+  if (existing && existing.expiresAt === null && existing.expiredAt === null) return undefined; // vitalício preservado
+  const activeBaseMs = existing?.expiresAt && !existing.expiredAt && existing.expiresAt.getTime() > Date.now()
+    ? existing.expiresAt.getTime()
+    : Date.now();
+  return Math.floor((activeBaseMs + days * 86_400_000) / 1000);
+}
+
 // ── Expiração automática (chamado pelo tick lento do runner) ───────────────
 
 const EXPIRE_BATCH = 40;
+
+// Evita reavisar o dono a cada retry (o claim já espaça as tentativas em
+// ~10min, mas um grupo sem o bot como admin por dias geraria dezenas de
+// pushes iguais). Em memória — reseta a cada deploy/restart, o que é
+// aceitável: o pior caso é avisar de novo depois de um restart, não deixar de
+// avisar nunca. Mesmo padrão de cooldown em memória de `botRateLimitUntil` em
+// runner.ts.
+const notifiedGroupPermissionLoss = new Set<string>();
 
 type ClaimedVipMember = {
   id:             string;
@@ -162,13 +241,35 @@ export async function expireDueVipMemberships(): Promise<number> {
         await tg.banChatMember(groupChatId, userId);
         await tg.unbanChatMember(groupChatId, userId);
       } catch (err) {
-        // 400 (usuário já não está no grupo/chat inválido) ou 403 (bot sem
-        // permissão/removido do grupo) são desfechos ESPERADOS pra um membro
-        // que já pode ter saído sozinho — não impedem marcar como expirado.
-        // Qualquer outro erro (rede, 429) propaga pro catch externo e o claim
-        // expira em 10min pro próximo tick tentar de novo.
-        const isExpectedTelegramError = err instanceof TelegramApiError && (err.errorCode === 400 || err.errorCode === 403);
-        if (!isExpectedTelegramError) throw err;
+        // 400 (usuário já não está no grupo/chat inválido) é desfecho
+        // ESPERADO pra um membro que já pode ter saído sozinho — não impede
+        // marcar como expirado.
+        const isUserAlreadyGone = err instanceof TelegramApiError && err.errorCode === 400;
+        if (isUserAlreadyGone) {
+          // segue pro update abaixo, marca expirado normalmente.
+        } else if (err instanceof TelegramApiError && err.errorCode === 403) {
+          // Bot SEM permissão de admin (ou removido) do grupo: o ban FALHOU e
+          // o membro continua lá com acesso — diferente de 400, aqui não é
+          // seguro marcar como expirado (mentiria sobre o estado real). Fica
+          // pendente: o claim (`expire_claimed_at`) só libera de novo depois
+          // de ~10min, então o retry já é espaçado, não a cada tick de 60s.
+          console.error(`[vip] bot ${member.botId} sem permissão de admin no grupo ${member.groupId} (chat ${groupChatId}) — ban falhou, membro ${member.id} continua no grupo`);
+          const notifyKey = `${member.botId}:${member.groupId}`;
+          if (!notifiedGroupPermissionLoss.has(notifyKey)) {
+            notifiedGroupPermissionLoss.add(notifyKey);
+            void sendPushToUser(bot.userId, {
+              eventType: PUSH_EVENT_TYPES.VIP_GROUP_PERMISSION_LOST,
+              title: "⚠️ Bot sem permissão no grupo VIP",
+              body:  `O bot perdeu a permissão de admin em "${group.name}" — assinaturas vencidas não conseguem mais ser removidas de lá. Adicione o bot como admin de novo.`,
+              data:  { url: "/groups" },
+            }).catch((e) => console.error("[vip] push de permissão de grupo perdida falhou:", e));
+          }
+          continue; // não marca expirado nem incrementa — vai pro próximo membro do lote
+        } else {
+          // Erro inesperado (rede, 429...) — propaga pro catch externo, mesmo
+          // efeito de espaçamento via claim.
+          throw err;
+        }
       }
 
       await db.update(vipMembers).set({ expiredAt: new Date(), isBlocked: true, updatedAt: new Date() })
