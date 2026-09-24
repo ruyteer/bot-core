@@ -16,6 +16,19 @@ export interface SimplifiedPaymentCtx {
   items:    SimplifiedDeliveryItem[];
 }
 
+// Split aplicado NO GATEWAY quando a cobrança foi criada (createPixWithFallback).
+// A confirmação usa este snapshot em vez de resolver o split de novo — a config
+// do painel pode ter mudado entre o PIX e o pagamento, e a receita/comissão tem
+// que refletir o que de fato foi retido naquela transação.
+// `cents: 0` = cobrança criada SEM split (admin, split desligado, taxa zerada).
+export interface PaymentSplitSnapshot {
+  receiver: string | null;
+  /** Taxa-alvo configurada (centavos) — base da comissão de indicação. */
+  cents:    number;
+  /** Quanto o gateway efetivamente retém (platformSplitCents) — receita da plataforma. */
+  feeCents: number;
+}
+
 export interface Payment {
   id:               string;
   userId:           string;
@@ -39,6 +52,12 @@ export interface Payment {
   nodeId:           string | null;
   paidHandle:       string | null;
   simplifiedCtx:    SimplifiedPaymentCtx | null;
+  // null = cobrança anterior à migration 0021 (sem snapshot): a confirmação cai
+  // no cálculo antigo (resolveEffectiveSplit na hora).
+  splitSnapshot:     PaymentSplitSnapshot | null;
+  // Guarda de entrega exatamente-uma-vez do evento paymentPaid (at-least-once).
+  deliveryClaimedAt: Date | null;
+  deliveredAt:       Date | null;
   createdAt:        Date;
   updatedAt:        Date;
 }

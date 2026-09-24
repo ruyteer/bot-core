@@ -95,6 +95,9 @@ describe("offer node — apresentação e compra", () => {
     expect(pay.status).toBe("pending");
     expect(pay.paidHandle).toBe(`${handle}__paid`);
     expect(pay.pixCode).toBeTruthy();
+    // Snapshot do split aplicado no PIX (sem secret de split → sem split) —
+    // a confirmação usa isto em vez de recalcular.
+    expect(pay.splitSnapshot).toEqual({ receiver: null, cents: 0, feeCents: 0 });
 
     // QR (sendPhoto) + copia-e-cola (sendMessage com <code>)
     expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0);
@@ -359,6 +362,45 @@ describe("PIX pendente — teto de idade e corrida de INSERT (revisão de segura
     expect(rows[1].status).toBe("pending");   // PIX novo, de fato gerado
     expect(rows[1].id).not.toBe(first.id);
     expect(getTelegramCalls("sendPhoto").length).toBe(2); // dois PIX gerados de verdade (1 por clique)
+  });
+
+  // Revisão do PR #58: a expiração local era um updateStatus incondicional. Se
+  // o webhook confirmasse o pagamento ENTRE o findPendingForOffer e o update,
+  // a venda PAGA virava "expired" (e ainda gerava outro PIX, cobrando de novo).
+  // Simula a corrida: findPendingForOffer devolve o pendente velho e, logo
+  // depois da leitura, o pagamento é confirmado no banco.
+  it("[simulação] webhook confirma entre a leitura e a expiração local → venda continua paga e não gera PIX novo", async () => {
+    const handle = "promo";
+    const { bot } = await setupOffer({
+      offer: { product_name: "Curso", price: 19.9, callback: handle, button_text: "Comprar" },
+      unpaidTimeout: 1,
+    });
+    await useCase.execute({ botId: bot.id, update: startUpdate(745) });
+    await useCase.execute({ botId: bot.id, update: callbackUpdate(745, "offer:0") });
+
+    const db = await testDb();
+    const first = (await db.select().from(payments))[0];
+    await db.update(payments)
+      .set({ createdAt: new Date(Date.now() - 2 * 60_000) })
+      .where(eq(payments.id, first.id));
+    const photosBefore = getTelegramCalls("sendPhoto").length;
+
+    const original = PaymentDrizzleRepository.prototype.findPendingForOffer;
+    const spy = vi.spyOn(PaymentDrizzleRepository.prototype, "findPendingForOffer")
+      .mockImplementationOnce(async function (this: PaymentDrizzleRepository, ...args) {
+        const stale = await original.apply(this, args);
+        // O webhook de pago chega agora, depois da leitura.
+        await db.update(payments).set({ status: "paid", paidAt: new Date() }).where(eq(payments.id, first.id));
+        return stale;
+      });
+    try {
+      await useCase.execute({ botId: bot.id, update: callbackUpdate(745, "offer:0") });
+    } finally { spy.mockRestore(); }
+
+    const rows = await db.select().from(payments);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("paid");
+    expect(getTelegramCalls("sendPhoto").length).toBe(photosBefore); // nenhum PIX novo
   });
 
   // Reproduzir a corrida de verdade (duas execuções concorrentes de verdade)

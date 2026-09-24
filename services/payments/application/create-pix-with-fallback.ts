@@ -1,13 +1,20 @@
-import { createPix } from "./gateway-clients.js";
+import { createPix, platformSplitCents } from "./gateway-clients.js";
 import { resolveEffectiveSplit } from "./split-config.js";
 import { GatewayDrizzleRepository } from "../infrastructure/gateway.drizzle.repository.js";
 import type { PaymentGateway, PixPaymentResult } from "../domain/gateway.entity.js";
+import type { PaymentSplitSnapshot } from "../domain/payment.entity.js";
 
 const gwRepo = new GatewayDrizzleRepository();
 
 export interface PixWithFallbackResult {
   gateway: PaymentGateway;
   pix:     PixPaymentResult;
+  /**
+   * Split efetivamente enviado a ESTE gateway nesta cobrança. Quem persiste o
+   * pagamento grava isto em payments.split_snapshot — a confirmação (webhook)
+   * usa o snapshot em vez de resolver o split de novo.
+   */
+  splitSnapshot: PaymentSplitSnapshot;
   /** Gateways que falharam antes deste dar certo (para log/diagnóstico). */
   failures: Array<{ gatewayId: string; provider: string; error: string }>;
 }
@@ -50,7 +57,10 @@ export async function createPixWithFallback(
       if (failures.length > 0) {
         console.warn(`[payments] PIX gerado no fallback ${gw.provider} (${gw.id}) após ${failures.length} falha(s)`);
       }
-      return { gateway: gw, pix, failures };
+      const splitSnapshot: PaymentSplitSnapshot = split
+        ? { receiver: split.receiver, cents: split.cents, feeCents: platformSplitCents(gw.provider, opts.amountCents, split.cents) }
+        : { receiver: null, cents: 0, feeCents: 0 };
+      return { gateway: gw, pix, splitSnapshot, failures };
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       console.error(`[payments] createPix falhou no gateway ${gw.provider} (${gw.id}):`, error);

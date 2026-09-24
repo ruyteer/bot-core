@@ -380,7 +380,42 @@ export interface NormalizedWebhookEvent {
   provider:   Provider;
   status:     "paid" | "pending" | "cancelled" | "expired" | "unknown";
   amount:     number | null;
+  // Valor BRUTO pago pelo comprador (centavos) — o ÚNICO usado pra recusar
+  // uma confirmação por valor (processWebhookEvent → checkPaidAmount). Campos
+  // conferidos em payloads reais de produção (2026-09-24):
+  //   buckpay  data.total_amount  (CENTAVOS; data.net_amount é líquido)
+  //   syncpay  data.amount        (REAIS;    data.final_amount é líquido)
+  //   nexuspag amount             (REAIS;    net_amount é líquido, fee = taxa)
+  //   wiinpay  —                  (só manda `value`, JÁ LÍQUIDO da taxa)
+  // null/ausente = não há bruto no payload: a confirmação não recusa por valor.
+  grossAmount?: number | null;
+  // true quando o valor do evento (`amount`) é LÍQUIDO (taxa descontada) e não
+  // há bruto — WiinPay sempre; demais quando só vier o campo líquido. A
+  // confirmação não recusa por ele e registra no log que é líquido.
+  amountIsNet?: boolean;
   event:      string;
+}
+
+// Valor numérico do payload: número ou string numérica ("6.90"). Payloads reais
+// já chegaram com valor e o log gravou NULL — string é a hipótese provável
+// (só `typeof === "number"` era aceito). Qualquer outra coisa → null.
+function numericValue(v: unknown): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v.trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+// Primeiro valor numérico da lista, em REAIS → centavos.
+function reaisToCents(...values: unknown[]): number | null {
+  for (const v of values) { const n = numericValue(v); if (n !== null) return Math.round(n * 100); }
+  return null;
+}
+// Primeiro valor numérico da lista, já em CENTAVOS.
+function centsValue(...values: unknown[]): number | null {
+  for (const v of values) { const n = numericValue(v); if (n !== null) return Math.round(n); }
+  return null;
 }
 
 // Junta candidatos de identificador a partir de vários campos possíveis do
@@ -413,7 +448,7 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
   // (resposta do cash-in, ver syncpayCashIn acima). SQL em produção confirmou:
   // data.id bate só 1x em 17; data.idtransaction e data.externalreference
   // NUNCA batem. Em vez de escolher um campo, tentamos todos contra o banco
-  // (processWebhookEvent -> findByAnyExternalId).
+  // (processWebhookEvent -> findAllByAnyExternalId).
   const candidates = collectCandidates(
     data.identifier, body.identifier,
     data.id, body.id,
@@ -427,14 +462,18 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
   const isCancelled   = statusRaw.includes("cancel") || statusRaw.includes("refund");
   const isExpired     = statusRaw.includes("expir");
   const status        = isPaid ? "paid" : isCancelled ? "cancelled" : isExpired ? "expired" : "pending";
-  // amount/final_amount vêm em REAIS.
-  const amountRaw     = data.final_amount ?? data.amount ?? body.amount;
+  // amount/final_amount vêm em REAIS. data.amount = bruto; final_amount =
+  // líquido (produção: amount=3, final_amount=2.65, cobrado 300).
+  const gross = reaisToCents(data.amount, body.amount);
+  const net   = reaisToCents(data.final_amount);
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "syncpay",
     status,
-    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    amount:               net ?? gross,   // final_amount segue gravado como antes
+    grossAmount:          gross,
+    amountIsNet:          gross === null && net !== null,
     event:                String((data.status ?? body.event) ?? ""),
   };
 }
@@ -449,14 +488,19 @@ export function normalizeBuckpayWebhook(body: Record<string, unknown>): Normaliz
   const statusRaw  = String(data.status ?? body.event ?? "");
   const isPaid     = statusRaw === "paid" || statusRaw === "approved" || statusRaw === "completed";
   const status     = isPaid ? "paid" : statusRaw === "cancelled" ? "cancelled" : statusRaw === "expired" ? "expired" : "pending";
-  // total_amount já vem em centavos (inteiro).
-  const amountRaw  = data.total_amount ?? data.amount;
+  // total_amount = bruto, já em CENTAVOS (produção: total_amount=600,
+  // net_amount=401, cobrado 600). net_amount = líquido, também em centavos.
+  const gross = centsValue(data.total_amount);
+  const net   = centsValue(data.net_amount);
+  const other = centsValue(data.amount); // fallback antigo, semântica não confirmada
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "buckpay",
     status,
-    amount:               typeof amountRaw === "number" ? Math.round(amountRaw) : null,
+    amount:               gross ?? other ?? net,
+    grossAmount:          gross,
+    amountIsNet:          gross === null && other === null && net !== null,
     event:                String(body.event ?? statusRaw),
   };
 }
@@ -487,13 +531,18 @@ export function normalizeNexuspagWebhook(body: Record<string, unknown>): Normali
   const isPaid    = NEXUSPAG_PAID_STATUSES.has(statusRaw) || NEXUSPAG_PAID_EVENTS.has(eventRaw);
   const status    = isPaid ? "paid" : statusRaw.includes("cancel") ? "cancelled" : statusRaw.includes("expir") ? "expired" : "pending";
   // amount em REAIS.
-  const amountRaw = tx.amount ?? tx.net_amount ?? body.amount;
+  // amount = bruto em REAIS (produção: amount=3, net_amount=2.35, fee=0.65,
+  // cobrado 300); net_amount = líquido.
+  const gross = reaisToCents(tx.amount, body.amount);
+  const net   = reaisToCents(tx.net_amount, body.net_amount);
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "nexuspag",
     status,
-    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    amount:               gross ?? net,
+    grossAmount:          gross,
+    amountIsNet:          gross === null && net !== null,
     event:                eventRaw || statusRaw,
   };
 }
@@ -507,14 +556,18 @@ export function normalizeWiinpayWebhook(body: Record<string, unknown>): Normaliz
   const statusRaw = String((data.status ?? body.status ?? body.event) ?? "").toLowerCase();
   const isPaid    = statusRaw.includes("paid") || statusRaw.includes("approved") || statusRaw.includes("complet");
   const status    = isPaid ? "paid" : statusRaw.includes("cancel") ? "cancelled" : statusRaw.includes("expir") ? "expired" : "pending";
-  // WiinPay usa `value` (REAIS), não `amount`.
-  const amountRaw = data.value ?? data.amount ?? body.value;
+  // WiinPay usa `value` (REAIS), não `amount` — e é o valor LÍQUIDO, com a
+  // taxa já descontada (produção: value=4.65, cobrado 490). Não há bruto no
+  // payload: nunca recusa por valor, só registra que é líquido.
+  const net = reaisToCents(data.value, data.amount, body.value);
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "wiinpay",
     status,
-    amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    amount:               net,
+    grossAmount:          null,
+    amountIsNet:          net !== null,
     event:                statusRaw,
   };
 }

@@ -1911,7 +1911,18 @@ export class ExecuteFlowStepUseCase {
       // constraint única (payments_pending_offer_unique) antes do INSERT
       // abaixo — enquanto essa linha continuar "pending", nenhum PIX novo
       // consegue ser criado pra este lead/nó/handle.
-      await payRepo.updateStatus(existing.id, "expired");
+      //
+      // Transição condicional (só sai de "pending"): o webhook pode confirmar
+      // o pagamento ENTRE o findPendingForOffer acima e esta linha. O
+      // updateStatus incondicional de antes rebaixava essa venda PAGA para
+      // "expired". Sem a transição, relê: se virou paga, a entrega vem pelo
+      // paymentPaid e NÃO gera outro PIX (cobraria de novo); se foi
+      // cancelada/expirada pelo gateway, a constraint já está livre e segue.
+      const expired = await payRepo.transitionStatus(existing.id, "expired");
+      if (!expired) {
+        const current = await payRepo.findById(existing.id);
+        if (current?.status === "paid") return;
+      }
     }
 
     // O lead interagiu com a oferta → cancela o timeout de "sem ação" pendente
@@ -1980,6 +1991,7 @@ export class ExecuteFlowStepUseCase {
         simplifiedCtx: bumpItems.length
           ? { kind: "plan", funnelId: prog.funnelId, items: bumpItems }
           : null,
+        splitSnapshot: result.splitSnapshot,
       });
     } catch (err) {
       // Corrida: entre o findPendingForOffer lá em cima e este INSERT, OUTRA
@@ -2078,6 +2090,7 @@ export class ExecuteFlowStepUseCase {
       userId: bot.userId, botId: bot.id, leadId: lead.id, gatewayId: gw.id,
       offerId: offer.id, offerName: offer.name, amount, status: "pending",
       externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
+      splitSnapshot: result.splitSnapshot,
     });
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —

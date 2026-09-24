@@ -336,6 +336,30 @@ const STATEMENTS: string[] = [
      WHERE t.id = ranked.id AND ranked.rn > 1`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "tracking_pixels_bot_id_provider_unique"
      ON "tracking_pixels" ("bot_id", "provider")`,
+
+  // 0021_payments_confirmation.sql — confirmação de pagamento: snapshot do
+  // split aplicado na criação do PIX (a confirmação não recalcula mais) e
+  // guarda de entrega exatamente-uma-vez do paymentPaid (at-least-once).
+  // ALTERA DADO EXISTENTE: vendas já pagas antes da 0021 são marcadas como
+  // entregues (delivered_at/delivery_claimed_at = paid_at) — o código antigo
+  // já as entregou; sem isso um pago reentregue/conciliação reentregaria
+  // produto/VIP antigo. O backfill roda UMA vez, no mesmo bloco que cria
+  // delivered_at: rodar a cada boot marcaria como entregue uma venda paga
+  // depois do deploy com a entrega ainda a caminho, e ela se perderia.
+  `ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "split_snapshot" jsonb`,
+  `ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "delivery_claimed_at" timestamp with time zone`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'payments' AND column_name = 'delivered_at'
+     ) THEN
+       ALTER TABLE "payments" ADD COLUMN "delivered_at" timestamp with time zone;
+       UPDATE "payments"
+          SET "delivered_at"        = COALESCE("paid_at", "updated_at"),
+              "delivery_claimed_at" = COALESCE("delivery_claimed_at", "paid_at", "updated_at")
+        WHERE "status" = 'paid';
+     END IF;
+   END $$`,
 ];
 
 export interface SchemaFailure {
