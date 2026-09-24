@@ -7,7 +7,7 @@
 //   5. paymentPaid at-least-once sem guarda → entrega duplicada
 //   6. sem máquina de estados → expirado/cancelado depois do pago rebaixava a venda
 import { describe, it, expect } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { testDb } from "../../test/helpers/db.js";
 import { createBot, createGateway, createProfile } from "../../test/helpers/seed.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
@@ -20,7 +20,8 @@ import { processWebhookEvent } from "./webhooks.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
-import { normalizeSyncpayWebhook } from "./application/gateway-clients.js";
+import { normalizeSyncpayWebhook, normalizeNexuspagWebhook } from "./application/gateway-clients.js";
+import { ensureSchema } from "../shared/ensure-schema.js";
 import { canTransition, checkPaidAmount } from "./domain/payment-status.js";
 import type { PaymentSplitSnapshot } from "./domain/payment.entity.js";
 import { deliverPaidOnce } from "../runner/application/deliver-paid-once.js";
@@ -391,5 +392,72 @@ describe("confirmação — máquina de estados", () => {
     expect(canTransition("paid", "expired")).toBe(false);
     expect(canTransition("expired", "expired")).toBe(false);
     expect(canTransition("pending", "pending")).toBe(false);
+  });
+});
+
+// ── Vendas pagas ANTES da 0021 (revisão do PR #58) ──────────────────────────
+// delivery_claimed_at/delivered_at nasciam NULL pra toda venda já paga. Como a
+// chave de idempotência mudou, um pago reentregue (ou a conciliação) pra venda
+// legada passava pela deduplicação, caía em already_paid, republicava
+// paymentPaid e claimDelivery aceitava → reentregava produto/VIP antigo.
+describe("vendas pagas antes da 0021 — backfill da entrega", () => {
+  it("venda legada paga + pago reentregue depois do deploy → não republica nem reentrega", async () => {
+    const db = await testDb();
+    const legacy = await seedPayment({ externalId: "legado-pago", splitSnapshot: null });
+    const paidAt = new Date("2026-05-01T12:00:00Z");
+    await db.update(payments).set({ status: "paid", paidAt }).where(eq(payments.id, legacy.id));
+    const stillPending = await seedPayment({ externalId: "legado-pendente" });
+
+    // Simula o banco de produção ANTES da 0021: a coluna ainda não existe.
+    await db.execute(sql`ALTER TABLE "payments" DROP COLUMN "delivered_at"`);
+    await db.execute(sql`UPDATE "payments" SET "delivery_claimed_at" = NULL`);
+    expect(await ensureSchema()).toEqual([]);
+
+    const backfilled = await payRepo.findById(legacy.id);
+    expect(backfilled!.deliveredAt?.toISOString()).toBe(paidAt.toISOString());
+    expect(backfilled!.deliveryClaimedAt?.toISOString()).toBe(paidAt.toISOString());
+    expect((await payRepo.findById(stillPending.id))!.deliveredAt).toBeNull();
+
+    expect(await processWebhookEvent(paid("legado-pago"), {})).toBe("already_paid");
+    expect(paidPublishes(legacy.id)).toBe(0);
+    let deliveries = 0;
+    expect(await deliverPaidOnce(legacy.id, async () => { deliveries++; })).toBe("skipped");
+    expect(deliveries).toBe(0);
+  });
+
+  it("o backfill roda uma vez só: reboot não marca como entregue venda paga depois do deploy", async () => {
+    const p = await seedPayment({ externalId: "pago-pos-deploy" });
+    await processWebhookEvent(paid("pago-pos-deploy"), {}); // pago, entrega ainda a caminho
+
+    expect(await ensureSchema()).toEqual([]); // restart do serviço
+
+    const got = await payRepo.findById(p.id);
+    expect(got!.deliveredAt).toBeNull();
+    expect(got!.deliveryClaimedAt).toBeNull();
+    let deliveries = 0;
+    expect(await deliverPaidOnce(p.id, async () => { deliveries++; })).toBe("delivered");
+    expect(deliveries).toBe(1);
+  });
+});
+
+// ── Valor só líquido (NexusPag net_amount) ──────────────────────────────────
+describe("valor só líquido no payload", () => {
+  it("NexusPag só com net_amount abaixo do cobrado: não confirma e o log diz que é valor líquido", async () => {
+    const p = await seedPayment({ externalId: "nx-liquido", provider: "nexuspag", amount: 1990 });
+    const body = { transaction_id: "nx-liquido", status: "paid", net_amount: 18.5 };
+    const event = normalizeNexuspagWebhook(body);
+    expect(event.amountIsNet).toBe(true);
+    expect(await processWebhookEvent(event, body)).toBe("amount_mismatch");
+    const [log] = await logsFor(p.id);
+    expect(log.errorMessage).toContain("valor LÍQUIDO");
+  });
+
+  it("pagamento a menor com valor bruto não ganha a observação de líquido", async () => {
+    const p = await seedPayment({ externalId: "nx-bruto", provider: "nexuspag", amount: 1990 });
+    const body = { transaction_id: "nx-bruto", status: "paid", amount: 1.0 };
+    const event = normalizeNexuspagWebhook(body);
+    expect(event.amountIsNet).toBe(false);
+    expect(await processWebhookEvent(event, body)).toBe("amount_mismatch");
+    expect((await logsFor(p.id))[0].errorMessage).not.toContain("LÍQUIDO");
   });
 });

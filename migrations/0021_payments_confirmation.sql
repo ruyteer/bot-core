@@ -13,7 +13,26 @@
 -- runner agora reivindica a entrega com UPDATE ... WHERE delivery_claimed_at
 -- IS NULL RETURNING antes de entregar.
 --
--- Só colunas novas e nullable: nenhum dado existente é alterado.
+-- ALTERA DADO EXISTENTE (backfill): toda venda JÁ PAGA antes desta migration
+-- já foi entregue pelo código antigo, mas nasceria com delivered_at NULL — e
+-- aí um webhook de pago reentregue (ou a conciliação) republicaria
+-- paymentPaid e claimDelivery aceitaria, reentregando produto/VIP de meses
+-- atrás. O backfill marca essas vendas como entregues em paid_at (ou
+-- updated_at, se paid_at faltar). Roda UMA vez, no mesmo bloco que cria a
+-- coluna delivered_at: se rodasse sempre (ensure-schema roda a cada boot),
+-- marcaria como entregue uma venda paga depois do deploy cuja entrega ainda
+-- estivesse a caminho num restart — e ela nunca seria entregue.
 ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "split_snapshot" jsonb;--> statement-breakpoint
 ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "delivery_claimed_at" timestamp with time zone;--> statement-breakpoint
-ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "delivered_at" timestamp with time zone;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'payments' AND column_name = 'delivered_at'
+  ) THEN
+    ALTER TABLE "payments" ADD COLUMN "delivered_at" timestamp with time zone;
+    UPDATE "payments"
+       SET "delivered_at"        = COALESCE("paid_at", "updated_at"),
+           "delivery_claimed_at" = COALESCE("delivery_claimed_at", "paid_at", "updated_at")
+     WHERE "status" = 'paid';
+  END IF;
+END $$;

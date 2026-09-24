@@ -104,7 +104,7 @@ export class PaymentDrizzleRepository {
   // PIX quando o mesmo botão de compra é clicado mais de uma vez antes do
   // primeiro ser pago (duplo-toque, ou um teclado antigo resolvido por escopo
   // reverso e tocado de novo). Some da busca assim que o webhook confirma
-  // (markPaid → status "paid") ou cancela/expira (updateStatus) o pagamento.
+  // (transitionStatus → "paid") ou cancela/expira (transitionStatus) o pagamento.
   async findPendingForOffer(leadId: string, nodeId: string, paidHandle: string): Promise<Payment | null> {
     const [row] = await db.select().from(payments)
       .where(and(
@@ -256,17 +256,11 @@ export class PaymentDrizzleRepository {
     await db.update(payments).set({ deliveredAt: new Date() }).where(eq(payments.id, id));
   }
 
-  async markPaid(id: string, finalAmount?: number): Promise<void> {
-    await db.update(payments).set({
-      status:      "paid",
-      paidAt:      new Date(),
-      finalAmount: finalAmount ?? undefined,
-      updatedAt:   new Date(),
-    }).where(eq(payments.id, id));
-  }
-
-  async updateStatus(id: string, status: string): Promise<void> {
-    await db.update(payments).set({ status, updatedAt: new Date() }).where(eq(payments.id, id));
+  // Nenhuma escrita de status fora da máquina de estados: o antigo
+  // updateStatus(id, qualquer) incondicional foi removido (rebaixava venda paga
+  // para "expired" na corrida com o webhook) e markPaid passa pela transição.
+  async markPaid(id: string, finalAmount?: number): Promise<Payment | null> {
+    return this.transitionStatus(id, "paid", { finalAmount });
   }
 
   async isProcessed(externalId: string, provider: string, status: string): Promise<boolean> {

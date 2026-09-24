@@ -387,6 +387,11 @@ export interface NormalizedWebhookEvent {
   // confirmação (processWebhookEvent) usa `grossAmount ?? amount`. Opcional:
   // quem não distingue (buckpay/wiinpay, testes) só preenche `amount`.
   grossAmount?: number | null;
+  // true quando o ÚNICO valor do payload é o líquido (NexusPag só com
+  // net_amount, SyncPay só com final_amount). A conferência usa esse valor
+  // mesmo assim, mas o log da divergência diz que é líquido — pra conciliação
+  // não confundir taxa descontada com pagamento a menor/fraude.
+  amountIsNet?: boolean;
   event:      string;
 }
 
@@ -444,6 +449,7 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
     status,
     amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
     grossAmount:          typeof grossRaw === "number" ? Math.round(grossRaw * 100) : null,
+    amountIsNet:          typeof data.amount !== "number" && typeof body.amount !== "number" && typeof data.final_amount === "number",
     event:                String((data.status ?? body.event) ?? ""),
   };
 }
@@ -505,6 +511,7 @@ export function normalizeNexuspagWebhook(body: Record<string, unknown>): Normali
     status,
     amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
     grossAmount:          typeof grossRaw === "number" ? Math.round(grossRaw * 100) : null,
+    amountIsNet:          typeof grossRaw !== "number" && typeof tx.net_amount === "number",
     event:                eventRaw || statusRaw,
   };
 }

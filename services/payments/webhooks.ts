@@ -252,7 +252,10 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       // reentrega/conciliação poderem reavaliar.
       const check = checkPaidAmount(payment.amount, event.grossAmount ?? event.amount);
       if (!check.ok) {
-        await logResult(false, `não confirmado: ${check.reason}`);
+        const netNote = event.amountIsNet
+          ? " — o payload só trouxe o valor LÍQUIDO (sem valor bruto): provável taxa descontada, conferir no gateway antes de tratar como pagamento a menor"
+          : "";
+        await logResult(false, `não confirmado: ${check.reason}${netNote}`);
         return "amount_mismatch";
       }
 
