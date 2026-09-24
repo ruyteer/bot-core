@@ -25,6 +25,7 @@ import { enqueuePixelEvents } from "../../bots/application/pixel-events.js";
 import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notifications/application/send-push.use-case.js";
 import { sendPixMessages } from "./pix-messages.js";
 import { buildOrderBumpCard, flowBumpRawList, pixConfigForOffer, toDeliveryItemFromFlowBump } from "./order-bump.js";
+import { stopRemarketingOnLeadReply } from "../../remarketing/application/process-remarketing.use-case.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -824,8 +825,14 @@ export class ExecuteFlowStepUseCase {
     // botão é registrado à parte, mais abaixo, junto da resposta do callback
     // (só ali dá pra tentar resolver o rótulo contra o nó do funil).
     const inboundContent = inboundContentFromMessage(update.message);
+    // Lead respondeu: para o remarketing das campanhas com stop_on_reply=true
+    // em que ele esteja inscrito (opção gravada na campanha e nunca aplicada —
+    // achado da auditoria). Dispara em qualquer mensagem inbound (texto ou
+    // anexo); o clique de botão, mais abaixo, dispara o mesmo.
+    let leadReplied = false;
     if (inboundContent) {
       await saveInbound(lead.id, botId, inboundContent);
+      leadReplied = true;
     }
 
     // Registra o /start como evento. Fica ANTES do roteamento (fluxo vs
@@ -889,6 +896,12 @@ export class ExecuteFlowStepUseCase {
         label:  described.label,
         nodeId: described.nodeId,
       });
+      leadReplied = true;
+    }
+
+    if (leadReplied) {
+      await stopRemarketingOnLeadReply(lead.id).catch((err) =>
+        console.error("[runner] falha ao parar remarketing por resposta do lead:", err));
     }
 
     // ── Compra via botão de OFERTA de broadcast/remarketing (bcast_buy_<id>) ──
