@@ -1,5 +1,23 @@
 import { Topic } from "encore.dev/pubsub";
 
+// Tipos de anexo que o Telegram manda em `message.*` — o JSON bruto do update
+// SEMPRE os inclui quando aplicável; só não estavam tipados aqui, então o
+// runner nunca sequer olhava pra eles (ver `inboundContentFromMessage` em
+// `execute-flow-step.use-case.ts`).
+export interface TelegramPhotoSize {
+  file_id: string;
+  width?:  number;
+  height?: number;
+}
+
+export interface TelegramVideo   { file_id: string; duration?: number; }
+export interface TelegramVoice   { file_id: string; duration?: number; }
+export interface TelegramAudio   { file_id: string; duration?: number; title?: string; performer?: string; }
+export interface TelegramDocument { file_id: string; file_name?: string; }
+export interface TelegramSticker  { file_id: string; emoji?: string; }
+export interface TelegramContact  { phone_number: string; first_name: string; last_name?: string; user_id?: number; }
+export interface TelegramLocation { latitude: number; longitude: number; }
+
 export interface TelegramMessageUpdate {
   message_id: number;
   chat: { id: number; type: string };
@@ -9,6 +27,18 @@ export interface TelegramMessageUpdate {
   // Mensagens de serviço de migração grupo→supergrupo (o chat ganha um id novo).
   migrate_to_chat_id?:   number;
   migrate_from_chat_id?: number;
+  // Anexos que o LEAD pode mandar — só um deles vem preenchido por mensagem
+  // (Telegram nunca manda dois no mesmo update). `caption` acompanha qualquer
+  // um dos tipos de mídia abaixo (exceto contact/location, que não têm legenda).
+  photo?:    TelegramPhotoSize[];
+  video?:    TelegramVideo;
+  voice?:    TelegramVoice;
+  audio?:    TelegramAudio;
+  document?: TelegramDocument;
+  sticker?:  TelegramSticker;
+  contact?:  TelegramContact;
+  location?: TelegramLocation;
+  caption?:  string;
 }
 
 export interface TelegramCallbackQuery {
