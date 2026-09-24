@@ -228,9 +228,26 @@ export const leadProgress = pgTable("lead_progress", {
   funnelId:      uuid("funnel_id").notNull().references(() => funnels.id, { onDelete: "cascade" }),
   currentNodeId: uuid("current_node_id").references(() => funnelNodes.id, { onDelete: "set null" }),
   status:        text("status").notNull().default("active"),
+  // Motivo (só leitura/diagnóstico) de o lead ter parado sem seguir adiante —
+  // beco sem saída do funil (botão/oferta sem aresta ligada pro caminho que o
+  // lead tomou). Nunca lido pelo runner: `status` continua sendo a única coisa
+  // que rege comportamento. Nullable — preenchido só quando o beco acontece.
+  stallReason:   text("stall_reason"),
   createdAt:     timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:     timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [uniqueIndex("lead_progress_lead_id_unique").on(t.leadId)]);
+
+// Dedupe de update do Telegram por bot: a entrega do pubsub é at-least-once
+// (`telegramUpdateReceived`, ver services/shared/events/index.ts) e o próprio
+// Telegram reentrega o mesmo update em retry de webhook — sem isto, um
+// update repetido roda o passo do funil de novo (compra em dobro, progresso
+// avançando duas vezes). `update_id` é sequencial só DENTRO de um bot, daí a
+// chave composta.
+export const processedTelegramUpdates = pgTable("processed_telegram_updates", {
+  botId:     uuid("bot_id").notNull().references(() => bots.id, { onDelete: "cascade" }),
+  updateId:  bigint("update_id", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [primaryKey({ columns: [t.botId, t.updateId] })]);
 
 export const scheduledDelays = pgTable("scheduled_delays", {
   id:          uuid("id").defaultRandom().primaryKey(),
