@@ -9,7 +9,7 @@ import {
 import { collectNodeOffers } from "../runner/application/execute-flow-step.use-case.js";
 import type { FunnelWithBots, FunnelDetail, SaveFlowInput } from "./domain/funnel.entity.js";
 import { db } from "../shared/database.js";
-import { funnelOffers, leadProgress, payments, funnelNodes, bots } from "../shared/schema/index.js";
+import { funnelOffers, leadProgress, payments, funnelNodes, bots, remarketingMessages } from "../shared/schema/index.js";
 import type { SQL } from "drizzle-orm";
 import { eq, and, inArray, sql } from "drizzle-orm";
 import { assertBotOwnership, assertBotsOwnership, assertGroupOwnership } from "../shared/bot-ownership.js";
@@ -597,6 +597,39 @@ export const createOffersBulk = api(
 
     for (const r of rows) scanSourceAsync("offer", r.id);
     return { offers: rows.map((r) => ({ id: r.id, name: r.name, price: r.price, botId: r.botId })) };
+  },
+);
+
+// DELETE /funnels/offers/:id — delete a funnel offer (used by broadcasts/remarketing "excluir oferta",
+// paridade Comunicação/Remarketing — as duas telas de UI só listavam/anexavam antes).
+export const deleteOffer = api(
+  { method: "DELETE", path: "/funnels/offers/:id", expose: true, auth: true },
+  async ({ id }: { id: string }): Promise<void> => {
+    const { userID: userId } = getAuthData()!;
+    const [offer] = await db.select().from(funnelOffers).where(eq(funnelOffers.id, id)).limit(1);
+    if (!offer) throw APIError.notFound("offer not found");
+    await assertBotOwnership(offer.botId, userId);
+
+    // Oferta embutida num nó do funil (editor visual, `node_id` preenchido) — excluir
+    // aqui deixaria o nó apontando para uma oferta inexistente sem o usuário perceber.
+    // Mesma ideia do gate de completude em `offer-validation.ts`: peça para tirar a
+    // oferta do nó (ou excluir o nó) antes de excluir a oferta em si.
+    if (offer.nodeId) {
+      throw APIError.failedPrecondition("offer is attached to a flow node — remove it from the node before deleting");
+    }
+
+    // `remarketing_messages.offer_id` é uma FK real, mas com `onDelete: "set null"` —
+    // sem esta checagem o DELETE "funcionaria" e silenciosamente tiraria o botão de
+    // compra de uma mensagem de campanha já configurada. `payments.offer_id` também é
+    // `set null`, mas ali é histórico de um pagamento já ocorrido — perder a referência
+    // não quebra nada em uso agora, então não bloqueia.
+    const [messageUsingOffer] = await db.select({ id: remarketingMessages.id }).from(remarketingMessages)
+      .where(eq(remarketingMessages.offerId, id)).limit(1);
+    if (messageUsingOffer) {
+      throw APIError.failedPrecondition("offer is in use by a remarketing campaign message");
+    }
+
+    await db.delete(funnelOffers).where(eq(funnelOffers.id, id));
   },
 );
 
