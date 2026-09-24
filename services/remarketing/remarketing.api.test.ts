@@ -157,7 +157,7 @@ describe("update — reativar campanha (isActive false→true) retoma leads paus
   });
 });
 
-describe("enroll — não reinicia do zero quem comprou, foi bloqueado, ou é bot_not_owned", () => {
+describe("enroll — não reinicia do zero quem comprou, foi bloqueado, é bot_not_owned, ou já respondeu (stop_on_reply)", () => {
   it("não reinscreve lead stopped/purchased", async () => {
     const bot = await createBot();
     authUserId = bot.userId;
@@ -201,6 +201,22 @@ describe("enroll — não reinicia do zero quem comprou, foi bloqueado, ou é bo
     const db = await testDb();
     const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
     expect(row.status).toBe("stopped");
+  });
+
+  it("não reinscreve lead stopped/lead_replied (achado da revisão do PR #60)", async () => {
+    const bot = await createBot();
+    authUserId = bot.userId;
+    const lead = await createLead(bot.id, 6605n);
+    const c = await campaign(bot.id, { filterType: "all", stopOnReply: true });
+    await state(c.id, bot.id, lead, { status: "stopped", pauseReason: "lead_replied" });
+
+    const res = await enroll({ id: c.id });
+    expect(res.enrolled).toBe(0);
+
+    const db = await testDb();
+    const [row] = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.leadId, lead));
+    expect(row.status).toBe("stopped");
+    expect(row.pauseReason).toBe("lead_replied");
   });
 
   it("reinscreve normalmente lead completed (sem compra) — comportamento mantido", async () => {

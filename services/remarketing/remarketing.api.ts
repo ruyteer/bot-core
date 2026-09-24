@@ -454,13 +454,17 @@ export const enroll = api(
     // reiniciar do zero:
     //   - stopped/purchased:      já comprou — reinscrever voltaria a mandar
     //                             mensagem de régua pra quem já converteu.
-    //   - blocked:                3+ falhas de envio seguidas (send_failed_repeatedly)
-    //                             é o proxy que este processador tem pra "o lead
-    //                             bloqueou o bot no Telegram" — reinscrever manda
-    //                             pro mesmo buraco de novo.
+    //   - blocked:                falha definitiva de envio (bot bloqueado pelo
+    //                             lead no Telegram, chat inexistente etc., ver
+    //                             classifyTelegramFailure em
+    //                             process-remarketing.use-case.ts) — reinscrever
+    //                             manda pro mesmo buraco de novo.
     //   - stopped/bot_not_owned:  campanha "suja" com bot de outro dono — nunca
     //                             volta a enviar por ele (ver defesa em
     //                             profundidade em processDueRemarketing).
+    //   - stopped/lead_replied:   stop_on_reply=true e o lead já respondeu —
+    //                             reinscrever ignoraria a própria opção que a
+    //                             campanha tem ligada.
     // completed (sem compra) e os demais estados terminais (ex.: lead_not_found,
     // not_a_user, error/bot_missing) continuam reinscritos normalmente — mantém
     // o comportamento atual pra eles.
@@ -470,7 +474,7 @@ export const enroll = api(
         eq(remarketingLeadState.campaignId, id),
         or(
           inArray(remarketingLeadState.status, ["active", "paused", "blocked"]),
-          and(eq(remarketingLeadState.status, "stopped"), inArray(remarketingLeadState.pauseReason, ["purchased", "bot_not_owned"])),
+          and(eq(remarketingLeadState.status, "stopped"), inArray(remarketingLeadState.pauseReason, ["purchased", "bot_not_owned", "lead_replied"])),
         ),
       ));
     const enrolledSet = new Set(nonReenrollable.map((r) => r.leadId));
@@ -508,7 +512,7 @@ export const enroll = api(
           updatedAt:         now,
         },
         where: sql`${remarketingLeadState.status} NOT IN ('active', 'paused', 'blocked')
-          AND NOT (${remarketingLeadState.status} = 'stopped' AND ${remarketingLeadState.pauseReason} IN ('purchased', 'bot_not_owned'))`,
+          AND NOT (${remarketingLeadState.status} = 'stopped' AND ${remarketingLeadState.pauseReason} IN ('purchased', 'bot_not_owned', 'lead_replied'))`,
       });
     }
 

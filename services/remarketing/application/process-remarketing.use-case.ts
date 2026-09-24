@@ -1,4 +1,4 @@
-import { eq, and, inArray, lte, lt, gte, ne, sql } from "drizzle-orm";
+import { eq, and, or, isNull, inArray, lte, lt, gte, ne, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   remarketingCampaigns, remarketingMessages, remarketingLeadState,
@@ -7,6 +7,7 @@ import {
 import { TelegramClient, TelegramApiError } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
+import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notifications/application/send-push.use-case.js";
 
 type Unit = "minutes" | "hours" | "days";
 const toMs = (value: number, unit: Unit) => {
@@ -181,22 +182,56 @@ function transientBackoffMs(consecutiveErrors: number): number {
   return minutes * 60_000;
 }
 
-type SendFailure = { kind: "permanent"; reason: string } | { kind: "transient" };
+type SendFailure = { kind: "permanent"; reason: string } | { kind: "transient" } | { kind: "bot_invalid_token" };
 
-// Distingue falha DEFINITIVA (lead inalcançável por este bot pra sempre — vale
-// bloquear) de TRANSITÓRIA (rede, 5xx, 429 — vale só tentar de novo depois).
-// Usa o errorCode real da API do Telegram (TelegramApiError, ver telegram.client.ts)
-// em vez de adivinhar pela mensagem genérica. Only 403 (Forbidden — bot
-// bloqueado, conta desativada, removido do chat) e o 400 específico "chat not
-// found" contam como definitivos; qualquer outro erro (incluindo outros 400,
-// timeout, erro de rede sem TelegramApiError) é tratado como transitório —
-// bloquear por engano é irreversível pro lead, então o padrão é o lado seguro.
+// Distingue falha do LEAD (definitiva ou transitória) de falha do BOT (token
+// revogado/trocado — 401). Usa o errorCode real da API do Telegram
+// (TelegramApiError, ver telegram.client.ts) em vez de adivinhar pela mensagem
+// genérica.
+//
+// - "bot_invalid_token" (401): não é sobre ESTE lead — o token não funciona
+//   pra NENHUM lead deste bot. Tratar como falha de lead (por engano, como
+//   antes desta revisão) fazia o processador martelar a API a cada tick, pra
+//   CADA lead devido daquele bot, sempre falhando do mesmo jeito.
+// - "permanent" (403 Forbidden — bot bloqueado, conta desativada, removido do
+//   chat; ou 400 "chat not found"): o LEAD é que está inalcançável — vale bloquear.
+// - "transient" (qualquer outro erro, incluindo outros 400, timeout, erro de
+//   rede): só tentar de novo depois. Bloquear por engano é irreversível pro
+//   lead, então o padrão é o lado seguro.
 function classifyTelegramFailure(err: unknown): SendFailure {
   if (err instanceof TelegramApiError) {
+    if (err.errorCode === 401) return { kind: "bot_invalid_token" };
     if (err.errorCode === 403) return { kind: "permanent", reason: "blocked_by_user" };
     if (err.errorCode === 400 && /chat not found/i.test(err.message)) return { kind: "permanent", reason: "chat_not_found" };
   }
   return { kind: "transient" };
+}
+
+// Não renotifica o dono antes de 24h (ver bots.token_invalid_notified_at,
+// migration 0024) — sem isto, cada tick do processador reenviaria o push
+// enquanto o token continuar inválido.
+const BOT_TOKEN_INVALID_RENOTIFY_MS = 24 * 3_600_000;
+
+// Avisa o dono do bot 1x a cada 24h (no mínimo) que o Telegram recusou o
+// token. CAS em token_invalid_notified_at (só quem encontra a coluna NULL ou
+// vencida consegue o UPDATE) evita duas réplicas do runner mandando o mesmo
+// push ao mesmo tempo — mesma técnica do "toque otimista" usado no claim de
+// remarketing_lead_state, ver processDueRemarketing.
+async function notifyBotTokenInvalidOnce(bot: typeof bots.$inferSelect, now: Date): Promise<void> {
+  const cutoff = new Date(now.getTime() - BOT_TOKEN_INVALID_RENOTIFY_MS);
+  const touched = await db.update(bots).set({ tokenInvalidNotifiedAt: now })
+    .where(and(
+      eq(bots.id, bot.id),
+      or(isNull(bots.tokenInvalidNotifiedAt), lt(bots.tokenInvalidNotifiedAt, cutoff)),
+    ))
+    .returning({ id: bots.id });
+  if (!touched.length) return; // avisado há menos de 24h, ou outra réplica venceu a corrida agora
+  await sendPushToUser(bot.userId, {
+    eventType: PUSH_EVENT_TYPES.BOT_TOKEN_INVALID,
+    title:     "⚠️ Token do bot inválido",
+    body:      `${formatBotHandle(bot.telegramUsername)} — o Telegram recusou o token (401). Remarketing e outros envios ficam pausados até você atualizar o token do bot.`,
+    data:      { url: "/bots", bot_id: bot.id },
+  }).catch((err) => console.error("[remarketing] falha ao notificar token inválido:", err));
 }
 
 // Quanto tempo esperar antes de checar de novo um lead pausado manualmente (ver
@@ -218,6 +253,11 @@ export async function processDueRemarketing(): Promise<number> {
   let processed = 0;
   const msgCache = new Map<string, Array<typeof remarketingMessages.$inferSelect>>();
   const botCache = new Map<string, typeof bots.$inferSelect | undefined>();
+  // Bots cujo token já deu 401 NESTE tick: martelar a API de novo pra cada
+  // outro lead devido do mesmo bot só geraria mais 401 — assim que o primeiro
+  // aparece, os demais leads desse bot são pulados sem tentar enviar (e sem
+  // penalizar o lead, que não tem nada a ver com o token estar inválido).
+  const invalidTokenBots = new Set<string>();
 
   for (const st of claimed) {
     try {
@@ -285,6 +325,15 @@ export async function processDueRemarketing(): Promise<number> {
       const bot = botCache.get(sendBotId);
       if (!bot) { await db.update(remarketingLeadState).set({ status: "error", pauseReason: "bot_missing", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
+      // Bot já deu 401 neste tick (outro lead, acima) — não tenta de novo.
+      // Devolve pra "active" sem tocar em índice/erro: a falha é do bot, não
+      // deste lead, e o próximo tick já tenta de novo sozinho (de graça, sem
+      // chamada à API) assim que o dono corrigir o token.
+      if (invalidTokenBots.has(sendBotId)) {
+        await db.update(remarketingLeadState).set({ status: "active", updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+        continue;
+      }
+
       // Defesa em profundidade: campanhas gravadas (ou corrompidas) ANTES desta checagem
       // existir com um bot_ids de outro dono — ou um lead_state com bot_id divergente —
       // nunca devem continuar enviando. Confirma que o bot que vai enviar (a) pertence ao
@@ -328,6 +377,17 @@ export async function processDueRemarketing(): Promise<number> {
       if (!sentOk) {
         const errMsg = sendError instanceof Error ? sendError.message : String(sendError);
         const failure = classifyTelegramFailure(sendError);
+        if (failure.kind === "bot_invalid_token") {
+          // Falha do BOT, não do lead: não bloqueia nem avança este (nem
+          // nenhum outro) lead do bot neste tick, e não martela a API de novo
+          // (ver o guard invalidTokenBots no topo do loop). Devolve o estado
+          // pra "active" intacto — assim que o token for corrigido, o próximo
+          // tick processa normalmente.
+          invalidTokenBots.add(sendBotId);
+          await db.update(remarketingLeadState).set({ status: "active", updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+          await notifyBotTokenInvalidOnce(bot, now);
+          continue;
+        }
         if (failure.kind === "permanent") {
           // Falha definitiva (bot bloqueado, chat inexistente etc.): bloqueia
           // JÁ, sem esperar N tentativas — esperar só adiaria o inevitável e

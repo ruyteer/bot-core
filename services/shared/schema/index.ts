@@ -51,6 +51,10 @@ export const bots = pgTable("bots", {
   // Gateway PIX padrão deste bot (usado por broadcast/remarketing/ofertas e como
   // fallback no funil/oferta quando não há um gateway específico).
   defaultGatewayId: uuid("default_gateway_id").references((): import("drizzle-orm/pg-core").AnyPgColumn => paymentGateways.id, { onDelete: "set null" }),
+  // Último aviso ao dono de que o Telegram recusou o token (401) — ver
+  // process-remarketing.use-case.ts (notifyBotTokenInvalidOnce). Evita
+  // renotificar a cada tick enquanto o token continuar inválido.
+  tokenInvalidNotifiedAt: timestamp("token_invalid_notified_at", { withTimezone: true }),
   createdAt:       timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:       timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

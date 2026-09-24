@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueRemarketing, enrollRemarketingTriggers, resumeLeadsAfterReactivation, stopRemarketingOnLeadReply } from "./application/process-remarketing.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { remarketingCampaigns, remarketingMessages, remarketingLeadState, payments, leads, funnelOffers, leadProgress } from "../shared/schema/index.js";
+import { remarketingCampaigns, remarketingMessages, remarketingLeadState, payments, leads, funnelOffers, leadProgress, bots } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway, createFlowFunnel } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 
@@ -429,6 +429,61 @@ describe("falha de envio: falha DEFINITIVA bloqueia, TRANSITÓRIA nunca bloqueia
     // usado pras demais falhas transitórias.
     expect(after.nextSendAt.getTime()).toBeGreaterThan(Date.now() + 10_000);
     expect(after.nextSendAt.getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
+  it("401 (token do bot revogado): é falha do BOT, não do lead — não bloqueia, não avança, e não martela a API pros outros leads do mesmo bot no mesmo tick", async () => {
+    const bot = await createBot();
+    const lead1 = await createLead(bot.id, 6604n);
+    const lead2 = await createLead(bot.id, 6605n);
+    const c = await campaign(bot.id);
+    await message(c.id);
+    await state(c.id, bot.id, lead1);
+    await state(c.id, bot.id, lead2);
+    forceTelegramError("sendMessage", 401, "Unauthorized");
+
+    const n = await processDueRemarketing();
+    expect(n).toBe(0);
+
+    // Só a PRIMEIRA tentativa chega a chamar a API — a segunda é pulada
+    // (mesmo bot, já sabido inválido neste tick) sem gastar uma chamada.
+    expect(getTelegramCalls("sendMessage")).toHaveLength(1);
+
+    const db = await testDb();
+    const rows = await db.select().from(remarketingLeadState).where(eq(remarketingLeadState.campaignId, c.id));
+    for (const after of rows) {
+      expect(after.status).toBe("active");
+      expect(after.pauseReason).toBeNull();
+      expect(after.nextMessageIndex).toBe(0);
+      expect(after.consecutiveErrors).toBe(0); // não é falha do lead — não conta pra ele
+    }
+
+    // Dono foi marcado como avisado (o push em si é pulado nos testes por
+    // falta de VAPID — ver test/setup.ts — mas a trava de 24h já é gravada
+    // ANTES do envio, no CAS de token_invalid_notified_at).
+    const [afterBot] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(afterBot.tokenInvalidNotifiedAt).not.toBeNull();
+  });
+
+  it("401: não renotifica o dono antes de 24h", async () => {
+    const bot = await createBot();
+    const lead = await createLead(bot.id, 6606n);
+    const c = await campaign(bot.id);
+    await message(c.id);
+    const st = await state(c.id, bot.id, lead);
+    forceTelegramError("sendMessage", 401, "Unauthorized");
+
+    await processDueRemarketing();
+    const db = await testDb();
+    const [firstNotify] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    const firstNotifiedAt = firstNotify.tokenInvalidNotifiedAt!.getTime();
+
+    // Lead segue "active" (não foi bloqueado) — fica devido de novo, e o
+    // processador tenta de novo (token ainda inválido) num tick seguinte.
+    await db.update(remarketingLeadState).set({ nextSendAt: new Date(Date.now() - 1000) }).where(eq(remarketingLeadState.id, st.id));
+    await processDueRemarketing();
+
+    const [secondNotify] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(secondNotify.tokenInvalidNotifiedAt!.getTime()).toBe(firstNotifiedAt);
   });
 });
 
