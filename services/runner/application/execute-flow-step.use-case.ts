@@ -557,7 +557,7 @@ function passesValidation(kind: unknown, value: string): boolean {
   }
 }
 
-async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
+export async function getVars(leadId: string, botId: string): Promise<Map<string, string>> {
   const rows = await db.select().from(leadVariables)
     .where(and(eq(leadVariables.leadId, leadId), eq(leadVariables.botId, botId)));
   const map = new Map(rows.map((r) => [r.variableName, r.value]));
@@ -935,39 +935,15 @@ export class ExecuteFlowStepUseCase {
         .limit(1);
       if (!activeFunnel) return;
 
-      // Find trigger node
-      const [triggerNode] = await db.select().from(funnelNodes)
-        .where(and(eq(funnelNodes.funnelId, activeFunnel.id), eq(funnelNodes.type, "trigger")));
-      if (!triggerNode) return;
-
-      // Create or replace progress
-      if (prog) {
-        // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
-        // (o "sem clique" do nó onde o lead estava, o timeout de "sem ação" de
-        // uma oferta, um nó `delay`) ficaria órfão e depois arrancaria o lead
-        // do funil recomeçado. Cancela antes de reposicionar no trigger.
-        await db.delete(scheduledDelays).where(and(
-          eq(scheduledDelays.progressId, prog.id),
-          eq(scheduledDelays.status, "pending"),
-        ));
-        await db.update(leadProgress)
-          .set({ funnelId: activeFunnel.id, currentNodeId: triggerNode.id, status: "active", updatedAt: new Date() })
-          .where(eq(leadProgress.id, prog.id));
-      } else {
-        await db.insert(leadProgress).values({
-          leadId:        lead.id,
-          funnelId:      activeFunnel.id,
-          currentNodeId: triggerNode.id,
-          status:        "active",
-        });
-      }
-
-      // Execute from the node AFTER the trigger
-      const afterTriggerId = await nextNode(activeFunnel.id, triggerNode.id);
-      if (afterTriggerId) {
-        const [newProg] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, lead.id));
-        await this.runNode(activeFunnel.id, afterTriggerId, newProg.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
-      }
+      await this.startFunnelForLead({
+        funnelId: activeFunnel.id,
+        leadId:   lead.id,
+        botId,
+        chatId:   chatIdStr,
+        tg,
+        protect:  bot.protectContent,
+        vars,
+      });
       return;
     }
 
@@ -1243,6 +1219,61 @@ export class ExecuteFlowStepUseCase {
     const [progress] = await db.select().from(leadProgress).where(eq(leadProgress.id, progressId));
     if (!progress || progress.funnelId !== funnelId) return;
     await this.runNode(funnelId, nodeId, progressId, leadId, botId, chatId, tg, protect, vars, null);
+  }
+
+  // ── Public: insere/reposiciona um lead no trigger de um funil de fluxo ──────
+  //
+  // Extraído do bloco de `/start` (mesma semântica: cancela delay pendente,
+  // cria ou substitui `lead_progress`, executa a partir do nó após o trigger).
+  // Compartilhado entre `/start` e a entrada em funil disparada por disparo
+  // (`sendBroadcast`, em services/broadcasts). O chamador é responsável por
+  // resolver e validar `funnelId` (funil de fluxo, ativo) — aqui só se garante
+  // que o funil tem um nó `trigger`; sem ele, não há efeito colateral.
+  async startFunnelForLead(params: {
+    funnelId: string;
+    leadId:   string;
+    botId:    string;
+    chatId:   string;
+    tg:       TelegramClient;
+    protect:  boolean;
+    vars:     Map<string, string>;
+  }): Promise<boolean> {
+    const { funnelId, leadId, botId, chatId, tg, protect, vars } = params;
+
+    const [triggerNode] = await db.select().from(funnelNodes)
+      .where(and(eq(funnelNodes.funnelId, funnelId), eq(funnelNodes.type, "trigger")));
+    if (!triggerNode) return false;
+
+    const [prog] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
+
+    if (prog) {
+      // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
+      // (o "sem clique" do nó onde o lead estava, o timeout de "sem ação" de
+      // uma oferta, um nó `delay`) ficaria órfão e depois arrancaria o lead
+      // do funil recomeçado. Cancela antes de reposicionar no trigger.
+      await db.delete(scheduledDelays).where(and(
+        eq(scheduledDelays.progressId, prog.id),
+        eq(scheduledDelays.status, "pending"),
+      ));
+      await db.update(leadProgress)
+        .set({ funnelId, currentNodeId: triggerNode.id, status: "active", updatedAt: new Date() })
+        .where(eq(leadProgress.id, prog.id));
+    } else {
+      await db.insert(leadProgress).values({
+        leadId,
+        funnelId,
+        currentNodeId: triggerNode.id,
+        status:        "active",
+      });
+    }
+
+    // Execute from the node AFTER the trigger
+    const afterTriggerId = await nextNode(funnelId, triggerNode.id);
+    if (afterTriggerId) {
+      const [newProg] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
+      await this.runNode(funnelId, afterTriggerId, newProg.id, leadId, botId, chatId, tg, protect, vars, null);
+    }
+    return true;
   }
 
   // ── Node runner ─────────────────────────────────────────────────────────────
