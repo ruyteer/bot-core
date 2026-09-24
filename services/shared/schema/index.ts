@@ -371,6 +371,21 @@ export const processedWebhooks = pgTable("processed_webhooks", {
   createdAt:    timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [primaryKey({ columns: [t.externalId, t.provider, t.status] })]);
 
+// Conciliação de pagamentos com o gateway (migração 0020). Uma linha por
+// cobrança, chaveada como o próprio pagamento é casado: (provider, external_id).
+// - gateway_ref: chave de CONSULTA no gateway quando difere do external_id
+//   (BuckPay só consulta pelo external_id que nós enviamos na criação).
+// - last_checked_at/check_count: backoff do job de conciliação — sem isso cada
+//   tick consultaria de novo TODO PIX pendente das últimas 24h.
+export const paymentReconciliation = pgTable("payment_reconciliation", {
+  provider:      text("provider").notNull(),
+  externalId:    text("external_id").notNull(),
+  gatewayRef:    text("gateway_ref"),
+  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+  checkCount:    integer("check_count").notNull().default(0),
+  createdAt:     timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [primaryKey({ columns: [t.provider, t.externalId] })]);
+
 // ─── BROADCASTS ───────────────────────────────────────────────────────────────
 
 export const scheduledMessages = pgTable("scheduled_messages", {

@@ -197,8 +197,13 @@ export async function buckpayCashIn(
   amountCents: number, description: string, webhookUrl: string,
   split?: EffectiveSplit | null,
 ): Promise<PixPaymentResult> {
+  // O `external_id` que NÓS mandamos é a única chave de consulta que a BuckPay
+  // oferece (GET /v1/transactions/external_id/{external_id}) — o `id` interno
+  // que gravamos em payments.external_id não serve pra consultar. Devolvido
+  // como `gatewayRef` pra conciliação poder confirmar a cobrança no gateway.
+  const externalRef = randomUUID();
   const body: Record<string, unknown> = {
-    external_id:    randomUUID(),
+    external_id:    externalRef,
     payment_method: "pix",
     amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
     postbackUrl:    webhookUrl,
@@ -237,6 +242,7 @@ export async function buckpayCashIn(
     // `photo` (não data-URI), então gera a imagem via qrserver a partir do código.
     qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
     externalId:  String(tx.id),
+    gatewayRef:  externalRef,
     amount:      amountCents,
     provider:    "buckpay",
     institution: "BuckPay",
@@ -437,7 +443,7 @@ export function collectCandidates(...values: unknown[]): string[] {
 // "paid_out" confirmado em produção (2026-08-14): é o evento webhook que a
 // SyncPay manda quando o PIX é de fato liquidado/aprovado — é o sinal final
 // de venda paga nessa conta.
-const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "paid_out", "approved", "success", "confirmed"]);
+export const SYNCPAY_PAID_STATUSES = new Set(["completed", "complete", "paid", "paid_out", "approved", "success", "confirmed"]);
 
 export function normalizeSyncpayWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {
   // O webhook novo aninha a transação em `data`; o padrão OLD (do campo
@@ -509,7 +515,7 @@ export function normalizeBuckpayWebhook(body: Record<string, unknown>): Normaliz
 // do syncpay). "payment.confirmed" é o evento confirmado em produção; o campo
 // `status` pode faltar em alguma variante de payload, então checamos os dois
 // (status E event) — qualquer um bater já é suficiente.
-const NEXUSPAG_PAID_STATUSES = new Set(["paid", "approved", "completed", "complete", "confirmed", "success"]);
+export const NEXUSPAG_PAID_STATUSES = new Set(["paid", "approved", "completed", "complete", "confirmed", "success"]);
 const NEXUSPAG_PAID_EVENTS   = new Set(["payment.confirmed", "payment.paid", "payment.approved", "transaction.paid"]);
 
 export function normalizeNexuspagWebhook(body: Record<string, unknown>): NormalizedWebhookEvent {

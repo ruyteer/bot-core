@@ -1,6 +1,7 @@
 import { createPix, platformSplitCents } from "./gateway-clients.js";
 import { resolveEffectiveSplit } from "./split-config.js";
 import { GatewayDrizzleRepository } from "../infrastructure/gateway.drizzle.repository.js";
+import { saveGatewayRef } from "./verify-with-gateway.js";
 import type { PaymentGateway, PixPaymentResult } from "../domain/gateway.entity.js";
 import type { PaymentSplitSnapshot } from "../domain/payment.entity.js";
 
@@ -54,6 +55,13 @@ export async function createPixWithFallback(
         opts.amountCents, opts.description, opts.webhookUrl(gw.provider),
         { split },
       );
+      // Chave de consulta no gateway (BuckPay): sem ela a conciliação não
+      // consegue perguntar o status desta cobrança. Não derruba o PIX — o
+      // webhook ainda pode confirmar (e grava a chave) se isto falhar.
+      if (pix.gatewayRef) {
+        await saveGatewayRef(gw.provider, pix.externalId, pix.gatewayRef).catch((err) =>
+          console.error(`[payments] falha ao guardar gateway_ref (${gw.provider}):`, err));
+      }
       if (failures.length > 0) {
         console.warn(`[payments] PIX gerado no fallback ${gw.provider} (${gw.id}) após ${failures.length} falha(s)`);
       }
