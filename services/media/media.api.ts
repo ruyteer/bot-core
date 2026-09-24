@@ -17,6 +17,25 @@ function isInlinePreviewMime(mime: string): boolean {
   return mime.startsWith("image/") || mime.startsWith("video/") || mime.startsWith("audio/");
 }
 
+// RFC 5987 ext-value: só attr-char sobrevive sem % — encodeURIComponent já
+// escapa a maioria (inclusive todo não-ASCII), falta só fechar '()* que ele
+// deixa passar cru.
+function encodeRFC5987(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+// Content-Disposition no formato RFC 6266: filename= com um fallback ASCII
+// (fora do intervalo imprimível, aspas e barra invertida viram "_" — a chave
+// hoje e sempre <uuid>.<ext>, mas a rota nao deve assumir isso) para
+// navegador antigo, e filename*=UTF-8''<percent-encoded> pros demais.
+function contentDispositionHeader(disposition: "inline" | "attachment", filename: string): string {
+  const asciiFallback = filename.split("").map((ch) => {
+    const code = ch.charCodeAt(0);
+    return code >= 0x20 && code <= 0x7e && ch !== '"' && ch !== "\\" ? ch : "_";
+  }).join("");
+  return `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encodeRFC5987(filename)}`;
+}
+
 // Espelha o limite que hoje só existe client-side (MediaUpload.tsx e afins,
 // checado em bytes antes do upload) — agora também reforçado aqui, já que o
 // backend passou a aceitar upload direto (antes o Supabase Storage era
@@ -164,7 +183,7 @@ export const getMedia = api.raw(
       "Content-Type":             contentType,
       "Cache-Control":            "public, max-age=31536000, immutable",
       "X-Content-Type-Options":   "nosniff",
-      "Content-Disposition":      `${disposition}; filename="${encodeURIComponent(filename)}"`,
+      "Content-Disposition":      contentDispositionHeader(disposition, filename),
     };
     if (obj.contentLength !== undefined) headers["Content-Length"] = String(obj.contentLength);
 

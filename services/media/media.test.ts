@@ -92,6 +92,33 @@ describe("GET /media/*key — headers de segurança", () => {
     expect(resp.headers["Content-Disposition"]).toMatch(/^inline;/);
   });
 
+  it("Content-Disposition segue RFC 6266 — filename= ASCII-safe e filename*=UTF-8'' com o nome real", async () => {
+    const { getMedia } = await import("./media.api.js");
+    const s3 = await import("./application/s3-client.js");
+    vi.mocked(s3.getObject).mockResolvedValue({
+      body: Readable.from([Buffer.from("fake-png-bytes")]),
+      contentType: "image/png",
+      contentLength: 14,
+    });
+
+    const resp = new FakeResponse();
+    await new Promise<void>((resolve) => {
+      resp.on("finish", resolve);
+      // Nome com espaço, parênteses, acento e aspas — a chave normal do
+      // upload nunca tem isso (é sempre <uuid>.<ext>), mas o header não pode
+      // quebrar nem virar um jeito de injetar algo na resposta se um dia isso
+      // mudar.
+      (getMedia as any)(fakeRequest('/media/u1/misc/relatório (final)".png'), resp);
+    });
+
+    const header = resp.headers["Content-Disposition"];
+    expect(header).toMatch(/^inline; filename="[^"]*"; filename\*=UTF-8''/);
+    // Aspas do nome original nunca terminam a quoted-string antes da hora.
+    expect(header.match(/filename="([^"]*)"/)![1]).not.toContain('"');
+    // filename* carrega o nome real, percent-encoded.
+    expect(header).toContain(encodeURIComponent('relatório (final)".png').replace(/['()*]/g, (c: string) => "%" + c.charCodeAt(0).toString(16).toUpperCase()));
+  });
+
   it("Content-Type divergente da allowlist do storage vira octet-stream (não confia cego no metadata)", async () => {
     const { getMedia } = await import("./media.api.js");
     const s3 = await import("./application/s3-client.js");

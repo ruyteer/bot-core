@@ -71,27 +71,66 @@ describe("registerTrackingClick (/r)", () => {
 });
 
 describe("registerTrackingClick — limite de replay por IP+bot", () => {
-  it("acima do limite, reaproveita o token do último clique gravado em vez de inserir outro", async () => {
+  it("acima do limite, gera um token NOVO clonando as UTMs do último clique — não reaproveita o mesmo token", async () => {
     _resetClickRateLimiterForTests();
     const bot = await botWithFunnel();
     const ip = "203.0.113.9";
 
     let lastUrl = "";
     for (let i = 0; i < CLICK_RATE_LIMIT.maxPerWindow; i++) {
-      lastUrl = (await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook" }))!.url;
+      lastUrl = (await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook", utmCampaign: "bf" }))!.url;
     }
 
     const db = await testDb();
     const rowsBeforeOverflow = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
     expect(rowsBeforeOverflow.length).toBe(CLICK_RATE_LIMIT.maxPerWindow);
 
-    // Um clique a mais estourando a janela: não grava linha nova, devolve a
-    // mesma URL (mesmo token) do último clique já gravado.
-    const overLimit = await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook" });
-    expect(overLimit!.url).toBe(lastUrl);
+    // Um clique a mais estourando a janela: grava uma linha NOVA com token
+    // DIFERENTE do último — reciclar o mesmo token quebrava com o resgate de
+    // uso único (CGNAT/rede corporativa/wifi público colocam visitantes
+    // DISTINTOS atrás do mesmo IP; cada um precisa do próprio token, senão só
+    // o primeiro fica com a atribuição e os demais perdem em silêncio).
+    const overLimit = await registerTrackingClick({ botId: bot.id, clientIp: ip, utmSource: "facebook", utmCampaign: "bf" });
+    expect(overLimit!.url).not.toBe(lastUrl);
 
     const rowsAfterOverflow = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, bot.id));
-    expect(rowsAfterOverflow.length).toBe(CLICK_RATE_LIMIT.maxPerWindow);
+    expect(rowsAfterOverflow.length).toBe(CLICK_RATE_LIMIT.maxPerWindow + 1);
+
+    // A linha nova herdou as UTMs do último clique legítimo (não ficou vazia).
+    const newToken = new URL(overLimit!.url).searchParams.get("start")!.slice(3);
+    const [newRow] = await db.select().from(trackingClicks).where(eq(trackingClicks.token, newToken));
+    expect(newRow.utmSource).toBe("facebook");
+    expect(newRow.utmCampaign).toBe("bf");
+  });
+
+  it("7 cliques do mesmo IP acima do limite (5) → 7 /start distintos, todos atribuídos", async () => {
+    _resetClickRateLimiterForTests();
+    const bot = await botWithFunnel();
+    const ip = "198.51.100.42";
+
+    const urls: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const res = await registerTrackingClick({
+        botId: bot.id, clientIp: ip, utmSource: "facebook", utmCampaign: "black_friday",
+      });
+      urls.push(res!.url);
+    }
+
+    // 7 tokens distintos — nenhum reaproveitado entre os 7 cliques.
+    const tokens = urls.map((u) => new URL(u).searchParams.get("start")!);
+    expect(new Set(tokens).size).toBe(7);
+
+    for (let i = 0; i < tokens.length; i++) {
+      await runner.execute({ botId: bot.id, update: textUpdate(7000 + i, `/start ${tokens[i]}`) });
+    }
+
+    const db = await testDb();
+    const rows = await db.select().from(leads).where(eq(leads.botId, bot.id));
+    expect(rows.length).toBe(7);
+    for (const lead of rows) {
+      expect(lead.utmSource).toBe("facebook");
+      expect(lead.utmCampaign).toBe("black_friday");
+    }
   });
 
   it("IPs diferentes no mesmo bot não competem pelo mesmo limite", async () => {

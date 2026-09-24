@@ -46,17 +46,44 @@ export async function registerTrackingClick(params: ClickParams): Promise<{ url:
   // replay sem arriscar throttle cruzado entre visitantes distintos — nesse
   // caso raro segue sem rate limit.
   if (ip && !allowClick(ip, params.botId)) {
-    // Estourou o limite: não grava clique novo (evita inflar tracking_clicks
-    // com replay), mas o visitante real não pode cair numa página de erro —
-    // reaproveita o último clique gravado desse IP+bot pra montar a mesma URL
-    // do Telegram. Existe pelo menos um, já que a janela só bloqueia depois
-    // de MAX_CLICKS_PER_WINDOW cliques terem sido gravados de verdade.
-    const [last] = await db.select({ token: trackingClicks.token })
-      .from(trackingClicks)
+    // Estourou o limite: o visitante real não pode ficar sem link funcional,
+    // mas reaproveitar o MESMO token do último clique (comportamento antigo)
+    // quebrava com o resgate atômico de uso único do /start — CGNAT, rede
+    // corporativa e wifi público colocam facilmente mais de
+    // MAX_CLICKS_PER_WINDOW visitantes DISTINTOS atrás do mesmo IP num
+    // anúncio com tráfego alto, e só o primeiro deles ficava com a
+    // atribuição; os demais perdiam em silêncio quando o token já tivesse
+    // sido consumido (ver applyStartTracking). O limite existe pra conter
+    // GRAVAÇÃO abusiva de parâmetros arbitrários (replay manipulando a query
+    // string), não pra forçar visitantes distintos a compartilhar token —
+    // clona as UTMs do último clique legítimo (gravado ainda dentro do
+    // limite, então já validado) para um token NOVO, próprio de cada
+    // visitante. Existe pelo menos um clique anterior, já que a janela só
+    // bloqueia depois de MAX_CLICKS_PER_WINDOW cliques terem sido gravados.
+    const [last] = await db.select().from(trackingClicks)
       .where(and(eq(trackingClicks.botId, params.botId), eq(trackingClicks.clientIp, ip.slice(0, 100))))
       .orderBy(desc(trackingClicks.createdAt))
       .limit(1);
-    if (last) return { url: `https://t.me/${bot.username}?start=tk_${last.token}` };
+    if (last) {
+      const clonedToken = randomUUID().replace(/-/g, "");
+      await db.insert(trackingClicks).values({
+        botId:       params.botId,
+        token:       clonedToken,
+        platform:    last.platform,
+        utmSource:   last.utmSource,
+        utmMedium:   last.utmMedium,
+        utmCampaign: last.utmCampaign,
+        utmContent:  last.utmContent,
+        utmTerm:     last.utmTerm,
+        fbclid:      last.fbclid,
+        gclid:       last.gclid,
+        ttclid:      last.ttclid,
+        kwaiClickId: last.kwaiClickId,
+        clientIp:    last.clientIp,
+        userAgent:   last.userAgent,
+      });
+      return { url: `https://t.me/${bot.username}?start=tk_${clonedToken}` };
+    }
     // Sem clique anterior achado (não deveria acontecer): segue pro fluxo
     // normal abaixo em vez de travar o redirect do visitante real.
   }
