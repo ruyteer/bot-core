@@ -366,6 +366,42 @@ const STATEMENTS: string[] = [
   // recusou o token (401), pra process-remarketing.use-case.ts não reenviar o
   // push a cada tick enquanto o token continuar inválido.
   `ALTER TABLE "bots" ADD COLUMN IF NOT EXISTS "token_invalid_notified_at" timestamp with time zone`,
+
+  // 0022_vip_members_lifecycle.sql — achado crítico da auditoria: assinatura
+  // VIP nunca expirava e `vip_members` nunca era preenchida (o convite de
+  // grupo era entregue, mas ninguém registrava quem entrou nem por quanto
+  // tempo). Adiciona o que falta pro ciclo de vida: compra que concedeu o
+  // acesso, dias de acesso e vencimento. `access_days`/`expires_at` nulos =
+  // vitalício (mesma convenção de `funnel_offers.access_days`). `expired_at` é
+  // gravado pelo job de expiração do runner (vip-membership.ts) quando o
+  // membro é banido+desbanido do grupo por vencimento — é a coluna que o
+  // gatilho `vip_expired` do remarketing pode passar a consultar.
+  // `expire_claimed_at` é o claim atômico do job (mesmo truque de `execute_at`
+  // em scheduled_delays), pra duas réplicas do runner não baterem no mesmo
+  // membro vencido ao mesmo tempo.
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "access_days" integer`,
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "expires_at" timestamp with time zone`,
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "expired_at" timestamp with time zone`,
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "expire_claimed_at" timestamp with time zone`,
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "payment_id" uuid`,
+  `ALTER TABLE "vip_members" ADD COLUMN IF NOT EXISTS "offer_id" uuid`,
+  `DO $$ BEGIN
+     ALTER TABLE "vip_members" ADD CONSTRAINT "vip_members_payment_id_payments_id_fk"
+       FOREIGN KEY ("payment_id") REFERENCES "payments"("id") ON DELETE set null ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  `DO $$ BEGIN
+     ALTER TABLE "vip_members" ADD CONSTRAINT "vip_members_offer_id_funnel_offers_id_fk"
+       FOREIGN KEY ("offer_id") REFERENCES "funnel_offers"("id") ON DELETE set null ON UPDATE no action;
+   EXCEPTION WHEN duplicate_object THEN null; END $$`,
+  // Renovação (nova compra do mesmo lead no mesmo grupo) estende/reativa a
+  // mesma linha em vez de duplicar. Parcial porque group_id é opcional (config
+  // de grupo apagada/órfã não deduplica nem expira automaticamente).
+  `CREATE UNIQUE INDEX IF NOT EXISTS "vip_members_bot_group_chat_unique"
+     ON "vip_members" USING btree ("bot_id", "group_id", "telegram_chat_id")
+     WHERE "group_id" IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS "vip_members_expires_at_idx"
+     ON "vip_members" USING btree ("expires_at")
+     WHERE "expires_at" IS NOT NULL AND "expired_at" IS NULL`,
 ];
 
 export interface SchemaFailure {

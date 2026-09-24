@@ -26,10 +26,20 @@ import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notific
 import { sendPixMessages } from "./pix-messages.js";
 import { buildOrderBumpCard, flowBumpRawList, pixConfigForOffer, toDeliveryItemFromFlowBump } from "./order-bump.js";
 import { stopRemarketingOnLeadReply } from "../../remarketing/application/process-remarketing.use-case.js";
+import { registerOrRenewVipMembership } from "./vip-membership.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
 const simplifiedUseCase = new ExecuteSimplifiedFunnelUseCase();
+
+// Identidade mínima do lead exigida por registerOrRenewVipMembership — evita
+// passar a row inteira de `leads` pros métodos privados de entrega.
+type MemberLeadInfo = {
+  telegramChatId:   bigint;
+  telegramUsername: string | null;
+  firstName:        string | null;
+  lastName:         string | null;
+};
 
 /**
  * "Este funil pertence a este bot?" — pelas DUAS vias que o produto oferece.
@@ -2147,6 +2157,13 @@ export class ExecuteFlowStepUseCase {
             replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
             protectContent: bot.protectContent,
           });
+          await registerOrRenewVipMembership({
+            botId: bot.id,
+            groupTelegramChatId: grp.telegramChatId.toString(),
+            memberTelegramChatId: lead.telegramChatId,
+            username: lead.telegramUsername, firstName: lead.firstName, lastName: lead.lastName,
+            accessDays: offer.accessDays, paymentId: payment.id, offerId: offer.id,
+          }).catch((e) => console.error("[runner] registerOrRenewVipMembership (deliverFunnelOffer):", e));
           return;
         } catch (e) { console.error("[runner] deliverFunnelOffer invite:", e); }
       }
@@ -2203,11 +2220,11 @@ export class ExecuteFlowStepUseCase {
     const offer    = collectNodeOffers(node.content as Record<string, unknown>)
       .find((x) => x.handleId === handleId)?.offer;
     if (offer) {
-      await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars)
+      await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars, bot.id, lead, payment.id)
         .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
       const extras = payment.simplifiedCtx?.items ?? [];
       for (const item of extras) {
-        await this.deliverPurchasedItem(item, chatId, tg, bot.protectContent, vars)
+        await this.deliverPurchasedItem(item, chatId, tg, bot.protectContent, vars, bot.id, lead, payment.id)
           .catch((e) => console.error("[runner] entrega do bump falhou:", e));
       }
     }
@@ -2241,6 +2258,9 @@ export class ExecuteFlowStepUseCase {
     tg:      TelegramClient,
     protect: boolean,
     vars:    Map<string, string>,
+    botId:   string,
+    lead:    MemberLeadInfo,
+    paymentId: string,
   ): Promise<void> {
     const type = typeof offer.product_type === "string" ? offer.product_type : "content";
 
@@ -2265,6 +2285,12 @@ export class ExecuteFlowStepUseCase {
           replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
           protectContent: protect,
         });
+        // Oferta embutida em node não tem linha em funnel_offers → offerId null.
+        await registerOrRenewVipMembership({
+          botId, groupTelegramChatId: groupId, memberTelegramChatId: lead.telegramChatId,
+          username: lead.telegramUsername, firstName: lead.firstName, lastName: lead.lastName,
+          accessDays, paymentId, offerId: null,
+        }).catch((e) => console.error("[runner] registerOrRenewVipMembership (deliverOffer):", e));
       } catch (err) {
         console.error("[runner] createChatInviteLink falhou:", err);
         await tg.sendMessage({ chatId, text: "✅ Pagamento confirmado! Em instantes você recebe o acesso.", protectContent: protect });
@@ -2288,6 +2314,9 @@ export class ExecuteFlowStepUseCase {
     tg: TelegramClient,
     protect: boolean,
     vars: Map<string, string>,
+    botId: string,
+    lead: MemberLeadInfo,
+    paymentId: string,
   ): Promise<void> {
     if (item.delivery_type === "vip_group") {
       const groupId = (item.vip_group_id ?? "").trim();
@@ -2305,6 +2334,11 @@ export class ExecuteFlowStepUseCase {
           replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
           protectContent: protect,
         });
+        await registerOrRenewVipMembership({
+          botId, groupTelegramChatId: groupId, memberTelegramChatId: lead.telegramChatId,
+          username: lead.telegramUsername, firstName: lead.firstName, lastName: lead.lastName,
+          accessDays, paymentId, offerId: null,
+        }).catch((e) => console.error("[runner] registerOrRenewVipMembership (deliverPurchasedItem):", e));
       } catch (err) {
         console.error("[runner] createChatInviteLink (bump) falhou:", err);
         await tg.sendMessage({ chatId, text: `✅ ${escapeHtml(item.name)} confirmado! Em instantes você recebe o acesso.`, protectContent: protect });
