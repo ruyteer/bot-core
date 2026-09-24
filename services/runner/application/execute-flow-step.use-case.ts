@@ -9,7 +9,7 @@ import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram
 import { decrypt } from "../../shared/crypto.js";
 import { isUniqueViolation } from "../../shared/db-errors.js";
 import { interpolate, mergeLeadFields } from "./interpolate.js";
-import type { TelegramUpdate, TelegramChatMemberUpdated } from "../../shared/events/index.js";
+import type { TelegramUpdate, TelegramChatMemberUpdated, TelegramMessageUpdate } from "../../shared/events/index.js";
 // Geração de PIX / persistência de cobrança vivem em `payments`, mas são código
 // puro (fetch + repositórios sobre o `db` compartilhado), sem recursos Encore —
 // importáveis aqui sem cruzar a fronteira de serviço.
@@ -584,6 +584,56 @@ async function saveInbound(leadId: string, botId: string, content: Record<string
   await db.insert(leadMessages).values({ leadId, botId, direction: "inbound", content });
 }
 
+// Conteúdo inbound de uma mensagem do lead, no formato "Formato 1" que a UI já
+// sabe ler (`content.kind` explícito — ver `lead-message-content.ts`). Antes só
+// texto virava mensagem no histórico: o `update.message` bruto do Telegram
+// SEMPRE traz um destes campos quando aplicável, mas `TelegramMessageUpdate`
+// não os tipava e ninguém olhava pra eles. Cada tipo manda só o `fileId` (não o
+// arquivo em si — evita estourar a coluna com base64; a tela já cai de volta
+// num rótulo genérico quando não há como montar uma prévia).
+function inboundContentFromMessage(msg: TelegramMessageUpdate | null | undefined): Record<string, unknown> | null {
+  if (!msg) return null;
+  if (typeof msg.text === "string" && msg.text) return { kind: "text", text: msg.text };
+
+  const caption = typeof msg.caption === "string" && msg.caption ? msg.caption : undefined;
+
+  // Maior resolução vem por último no array (contrato do Bot API).
+  const photo = Array.isArray(msg.photo) && msg.photo.length > 0 ? msg.photo[msg.photo.length - 1] : undefined;
+  if (photo?.file_id)         return { kind: "photo",    fileId: photo.file_id, caption };
+  if (msg.video?.file_id)     return { kind: "video",    fileId: msg.video.file_id, caption };
+  if (msg.voice?.file_id)     return { kind: "voice",    fileId: msg.voice.file_id, caption };
+  if (msg.audio?.file_id)     return { kind: "audio",    fileId: msg.audio.file_id, caption };
+  if (msg.document?.file_id)  return { kind: "document", fileId: msg.document.file_id, fileName: msg.document.file_name, caption };
+  if (msg.sticker?.file_id)   return { kind: "sticker",  fileId: msg.sticker.file_id, emoji: msg.sticker.emoji };
+  if (msg.contact)            return {
+    kind: "contact", phoneNumber: msg.contact.phone_number,
+    firstName: msg.contact.first_name, lastName: msg.contact.last_name,
+  };
+  if (msg.location)           return { kind: "location", latitude: msg.location.latitude, longitude: msg.location.longitude };
+
+  return null;
+}
+
+// Texto de exibição de um nó `message` pro histórico — mesma prioridade de
+// campos que a UI já usa pra ler o "Formato 2" (conteúdo cru do nó, sem
+// `kind`): `message`/`text` no nó simples, ou a junção dos blocos quando o nó
+// usa `blocks` (ver `textFromBlocks` em `lead-message-content.ts`, no nova-ui).
+// Existe só pra permitir marcar `kind: "text"` explícito SEM quebrar a leitura
+// (a UI, ao ver `kind === "text"`, olha só `content.text` — sem isto o
+// conteúdo continuaria em `content.message`/`blocks` e a bolha viraria vazia).
+function messageNodeOutboundText(c: Record<string, unknown>): string {
+  const direct = (c.message ?? c.text) as unknown;
+  if (typeof direct === "string" && direct) return direct;
+  const blocks = Array.isArray(c.blocks) ? (c.blocks as Array<Record<string, unknown>>) : [];
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    const t = (block.text ?? block.message ?? block.content ?? block.caption) as unknown;
+    if (typeof t === "string" && t) parts.push(t);
+  }
+  return parts.join("\n\n");
+}
+
 // Próximo nó a partir de uma saída do nó atual.
 //
 // COM `sourceHandle`: casa a aresta por igualdade EXATA (é o contrato dos
@@ -639,6 +689,58 @@ async function resolveScopedOriginNode(
   const nodes = await db.select().from(funnelNodes).where(eq(funnelNodes.funnelId, funnelId));
   const matches = nodes.filter((n) => nodeScopeId(n.id) === scope);
   return matches.length === 1 ? matches[0] : null;
+}
+
+// Descreve (melhor esforço, só LEITURA) um clique de botão/oferta pra registrar
+// no histórico do lead: rótulo legível quando dá pra resolver contra o conteúdo
+// de um nó do funil de FLUXO, ou `null` quando o clique não tem nó por trás —
+// funil simplificado (callbacks `sp_`/`su_`/`sd_`/`sb_*`/`sc_*`) ou handle
+// legado sem escopo. Nesses casos o `callbackData` cru ainda entra no registro,
+// então o caminho continua reconstruível, só sem nome bonito.
+// Reaproveita os mesmos parsers/resolvers do roteamento real, sem repetir a
+// lógica de decisão — só o "achar o texto do botão", sem side effect nenhum.
+async function describeInboundButtonClick(
+  funnelId:    string | null,
+  currentNode: typeof funnelNodes.$inferSelect | null,
+  callbackData: string,
+): Promise<{ label: string | null; nodeId: string | null }> {
+  if (!funnelId) return { label: null, nodeId: null };
+
+  const bump = parseFlowBumpCallback(callbackData);
+  if (bump) {
+    const originNode = await resolveScopedOriginNode(funnelId, currentNode, bump.scope);
+    if (!originNode) return { label: null, nodeId: null };
+    const picked = collectNodeOffers(originNode.content as Record<string, unknown>)[bump.offerIdx];
+    const name = picked && typeof picked.offer.product_name === "string" ? picked.offer.product_name : null;
+    const actionLabel = bump.action === "y" ? "Aceitou order bump" : bump.action === "n" ? "Recusou order bump" : "Aceitou 1 order bump";
+    return { label: name ? `${actionLabel}: ${name}` : actionLabel, nodeId: originNode.id };
+  }
+
+  if (callbackData.startsWith("offer:") || callbackData.startsWith("o:")) {
+    const scoped = parseScopedCallback(callbackData, "o");
+    const originNode = scoped ? await resolveScopedOriginNode(funnelId, currentNode, scoped.scope) : currentNode;
+    if (!originNode) return { label: null, nodeId: null };
+    const index = resolveOfferCallback(callbackData, originNode.id);
+    const picked = index !== null ? collectNodeOffers(originNode.content as Record<string, unknown>)[index] : undefined;
+    const name = picked && typeof picked.offer.product_name === "string" ? picked.offer.product_name : null;
+    return { label: name ? `Oferta: ${name}` : "Clique em oferta", nodeId: originNode.id };
+  }
+
+  const scopedBtn = parseScopedCallback(callbackData, "b");
+  const currentButtons = currentNode ? collectNodeButtons((currentNode.content ?? {}) as Record<string, unknown>) : [];
+  const looksLikeButtonClick = !!scopedBtn || callbackData.startsWith("btn:")
+    || !!(currentNode && (currentNode.type === "buttons" || currentButtons.length > 0));
+  if (looksLikeButtonClick) {
+    const originNode = scopedBtn ? await resolveScopedOriginNode(funnelId, currentNode, scopedBtn.scope) : currentNode;
+    if (!originNode) return { label: null, nodeId: null };
+    const content = (originNode.content ?? {}) as Record<string, unknown>;
+    const { handles } = resolveButtonCallback(content, callbackData, originNode.id);
+    const match = collectNodeButtons(content).find((b) => handles.includes(b.handleId));
+    const rawLabel = match ? (match.button.text ?? match.button.label) : undefined;
+    return { label: typeof rawLabel === "string" && rawLabel ? rawLabel : null, nodeId: originNode.id };
+  }
+
+  return { label: null, nodeId: null };
 }
 
 async function advanceProgress(progressId: string, nodeId: string | null, status: string): Promise<void> {
@@ -717,9 +819,13 @@ export class ExecuteFlowStepUseCase {
     // distinguimos lead novo de lead já existente nesse upsert.
     const isNewLead = lead.createdAt.getTime() === lead.updatedAt.getTime();
 
-    // Save inbound message
-    if (messageText) {
-      await saveInbound(lead.id, botId, { kind: "text", text: messageText });
+    // Save inbound message — texto e qualquer anexo que o lead mandou (foto,
+    // vídeo, áudio/voz, documento, figurinha, contato, localização). Clique de
+    // botão é registrado à parte, mais abaixo, junto da resposta do callback
+    // (só ali dá pra tentar resolver o rótulo contra o nó do funil).
+    const inboundContent = inboundContentFromMessage(update.message);
+    if (inboundContent) {
+      await saveInbound(lead.id, botId, inboundContent);
     }
 
     // Registra o /start como evento. Fica ANTES do roteamento (fluxo vs
@@ -763,6 +869,28 @@ export class ExecuteFlowStepUseCase {
       await tg.answerCallbackQuery({ callbackQueryId }).catch(() => {});
     }
 
+    // Progresso carregado cedo: usado tanto pra descrever o clique abaixo
+    // quanto pelo guard de pausa manual e pelo roteamento flow/simplificado.
+    const [prog] = await db.select().from(leadProgress)
+      .where(eq(leadProgress.leadId, lead.id));
+
+    // Save inbound: clique em botão/oferta. `callbackData` sempre entra (dá pra
+    // reconstruir o caminho mesmo sem rótulo); o rótulo só resolve quando o
+    // clique é de um botão de nó do funil de FLUXO — no simplificado (callbacks
+    // `sp_`/`su_`/`sd_`/`sb_*`/`sc_*`) ou num handle legado sem escopo, fica null.
+    if (callbackData) {
+      const clickNode = prog?.currentNodeId
+        ? (await db.select().from(funnelNodes).where(eq(funnelNodes.id, prog.currentNodeId)))[0] ?? null
+        : null;
+      const described = await describeInboundButtonClick(prog?.funnelId ?? null, clickNode, callbackData);
+      await saveInbound(lead.id, botId, {
+        kind: "button_click",
+        callbackData,
+        label:  described.label,
+        nodeId: described.nodeId,
+      });
+    }
+
     // ── Compra via botão de OFERTA de broadcast/remarketing (bcast_buy_<id>) ──
     if (callbackData && callbackData.startsWith("bcast_buy_")) {
       await this.handleBroadcastBuy(callbackData.slice("bcast_buy_".length), lead, bot, chatIdStr, tg);
@@ -770,8 +898,6 @@ export class ExecuteFlowStepUseCase {
     }
 
     // Check if lead is manually paused — drop all automation
-    const [prog] = await db.select().from(leadProgress)
-      .where(eq(leadProgress.leadId, lead.id));
     if (prog?.status === "paused_manual") return;
 
     const vars = await getVars(lead.id, botId);
@@ -1145,7 +1271,14 @@ export class ExecuteFlowStepUseCase {
     switch (node.type) {
       case "message": {
         await this.executeMessageNode(c, chatId, tg, protect, vars, node.id);
-        await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        // `kind: "text"` só quando dá pra preencher `content.text` de verdade —
+        // é o campo que a UI lê pra esse kind. Sem texto (nó só com mídia/botão
+        // e nenhuma legenda), grava sem `kind`: cai no "Formato 2" de sempre,
+        // que já sabe extrair um rótulo (mídia/botões) do conteúdo cru do nó.
+        const msgText = messageNodeOutboundText(c);
+        await saveOutbound(leadId, botId, msgText
+          ? { ...c, kind: "text", text: msgText, nodeId: node.id }
+          : { ...c, nodeId: node.id });
         // Nó de mensagem pode conter blocos de oferta (botões de compra). Se houver,
         // comporta-se como nó offer: apresenta as ofertas, espera o clique e agenda
         // o timeout de "sem ação" (ramo __pending) — não avança automaticamente.
@@ -1192,7 +1325,7 @@ export class ExecuteFlowStepUseCase {
         await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
           typeof c.caption === "string" ? c.caption : undefined);
         await this.executeMediaNode(c, chatId, tg, protect, vars);
-        await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        await saveOutbound(leadId, botId, { ...c, kind: "media", nodeId: node.id });
         break;
 
       case "audio": {
@@ -1210,7 +1343,7 @@ export class ExecuteFlowStepUseCase {
         await simulateAction(tg, chatId, !!c.simulate_typing, !!c.simulate_recording,
           typeof c.message === "string" ? c.message : undefined);
         await this.executeButtonsNode(c, chatId, tg, protect, vars, node.id);
-        await saveOutbound(leadId, botId, { ...c, nodeId: node.id });
+        await saveOutbound(leadId, botId, { ...c, kind: "buttons", nodeId: node.id });
         // Stay on this node waiting for callback
         await advanceProgress(progressId, node.id, "active");
         // Se o lead não clicar em nada, dispara o ramo `no_click` (opcional).
