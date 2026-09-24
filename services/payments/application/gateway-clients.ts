@@ -23,6 +23,37 @@ function errMsg(...cands: unknown[]): string {
   return "erro desconhecido do gateway";
 }
 
+// Timeout de rede para TODA chamada aos gateways de pagamento. Sem isso, um
+// gateway lento (ou que simplesmente não responde) deixava o fetch pendurado
+// pra sempre: a promise nunca resolve nem rejeita, então o lead fica travado
+// esperando o PIX (e, no runner, o tick inteiro trava atrás dele — nenhum
+// outro lead avança). Com o timeout, o fetch rejeita depois de
+// GATEWAY_FETCH_TIMEOUT_MS com um erro claro, e quem chama (createPix /
+// createPixWithFallback) já sabe tratar essa falha: cai pro próximo gateway
+// da cadeia ou avisa o lead sem travar nada. Mesmo padrão (AbortController +
+// setTimeout) já usado em runner/application/telegram.client.ts#call.
+const GATEWAY_FETCH_TIMEOUT_MS = 15_000;
+
+// Wrapper fino sobre `fetch` que aplica o timeout acima e troca o AbortError
+// genérico do runtime (mensagem só "This operation was aborted") por um erro
+// que já identifica o gateway e o tempo esgotado — sem isso o log não dá pra
+// saber qual chamada travou.
+async function fetchWithTimeout(gatewayLabel: string, url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GATEWAY_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    const name = err instanceof Error ? err.name : "";
+    if (name === "AbortError" || name === "TimeoutError") {
+      throw new Error(`${gatewayLabel}: tempo limite excedido (${GATEWAY_FETCH_TIMEOUT_MS}ms) ao chamar ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Recebedor do split por provider, vindo dos secrets da plataforma. Vazio (secret
 // não configurado) = split desligado nesse gateway, e o PIX segue sem split.
 // SyncPay/NexusPag/WiinPay: user_id/client_id. BuckPay: e-mail cadastrado na Buck.
@@ -74,7 +105,7 @@ export function platformSplitCents(provider: Provider, amountCents: number, targ
 const SYNCPAY_BASE = "https://api.syncpayments.com.br";
 
 async function syncpayToken(clientId: string, clientSecret: string): Promise<string> {
-  const res = await fetch(`${SYNCPAY_BASE}/api/partner/v1/auth-token`, {
+  const res = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/auth-token`, {
     method:  "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
@@ -104,7 +135,7 @@ export function __resetSyncpayWebhookCacheForTests(): void { syncpayWebhookEnsur
 async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl: string): Promise<void> {
   if (syncpayWebhookEnsured.has(clientId)) return;
   try {
-    const listRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+    const listRes = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
       headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
     });
     const listData = await listRes.json().catch(() => null) as unknown;
@@ -118,7 +149,7 @@ async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl:
     const exists = rows.some((w) => String(w.url ?? "") === webhookUrl && String(w.event ?? "") === "all");
 
     if (!exists) {
-      const createRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+      const createRes = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
         method:  "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
@@ -168,7 +199,7 @@ export async function syncpayCashIn(
   if (split) {
     body.split = [{ percentage: syncpaySplitPercentage(amountCents, split.cents), user_id: split.receiver }];
   }
-  const res = await fetch(`${SYNCPAY_BASE}/api/partner/v1/cash-in`, {
+  const res = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/cash-in`, {
     method:  "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify(body),
@@ -216,7 +247,7 @@ export async function buckpayCashIn(
     // cadastrado na Buck.
     body.splits = [{ email: split.receiver, amount_cents: split.cents }];
   }
-  const res = await fetch(`${BUCKPAY_BASE_URL}/v1/transactions`, {
+  const res = await fetchWithTimeout("BuckPay", `${BUCKPAY_BASE_URL}/v1/transactions`, {
     method:  "POST",
     headers: {
       "Content-Type": "application/json",
@@ -268,7 +299,7 @@ export async function nexuspagCashIn(
     // Valor fixo em reais (split user-to-user entre contas da plataforma).
     body.split = [{ user_id: split.receiver, amount: split.cents / 100 }];
   }
-  const res = await fetch(`${NEXUSPAG_BASE}/api/pix/create`, {
+  const res = await fetchWithTimeout("NexusPag", `${NEXUSPAG_BASE}/api/pix/create`, {
     method:  "POST",
     headers: { "Content-Type": "application/json", "x-api-key": apiKey },
     body: JSON.stringify(body),
@@ -316,7 +347,7 @@ export async function wiinpayCashIn(
     // Objeto (não array), valor fixo em reais.
     body.split = { value: split.cents / 100, user_id: split.receiver };
   }
-  const res = await fetch(`${WIINPAY_BASE}/payment/create`, {
+  const res = await fetchWithTimeout("WiinPay", `${WIINPAY_BASE}/payment/create`, {
     method:  "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),

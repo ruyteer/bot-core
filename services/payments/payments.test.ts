@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   createPix,
@@ -17,7 +17,7 @@ import {
 } from "../shared/schema/index.js";
 import { createBot, createGateway, createLead, createProfile } from "../../test/helpers/seed.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
-import { forceGatewayError, getOtherCalls } from "../../test/helpers/fetch-mock.js";
+import { forceGatewayError, forceGatewayTimeout, getOtherCalls } from "../../test/helpers/fetch-mock.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
 
 const payRepo = new PaymentDrizzleRepository();
@@ -66,6 +66,67 @@ describe("createPix", () => {
       expect(r.provider).toBe(p);
     });
   }
+});
+
+// ── Timeout de rede nos clientes de gateway ─────────────────────────────────
+// Antes desta correção, os `fetch` para syncpay/buckpay/nexuspag/wiinpay não
+// tinham timeout: um gateway lento (ou que nunca responde) deixava o fetch
+// pendurado pra sempre — a promise de createPix não resolvia nem rejeitava,
+// travando o lead indefinidamente (e o tick inteiro do runner, que fica atrás
+// dessa mesma promise). Estes testes falham sem o timeout: sem
+// fetchWithTimeout, `advanceTimersByTimeAsync` avançaria os 15s e a promise
+// continuaria pendurada, e o `await` do teste travaria até o timeout do
+// vitest (nunca cumprindo `rejects.toThrow`).
+describe("gateway HTTP clients — timeout de rede", () => {
+  const CASES = [
+    { p: "syncpay",  frag: "cash-in" },
+    { p: "buckpay",  frag: "realtechdev" },
+    { p: "nexuspag", frag: "nexuspag" },
+    { p: "wiinpay",  frag: "wiinpay" },
+  ] as const;
+
+  for (const { p, frag } of CASES) {
+    it(`${p}: gateway sem resposta rejeita com erro claro em vez de travar pra sempre`, async () => {
+      forceGatewayTimeout(frag);
+      vi.useFakeTimers();
+      try {
+        const promise = createPix(p, `client-timeout-${p}`, "secret", 1990, "Produto", "https://wh");
+        // Registra o listener de rejeição ANTES de avançar o relógio, senão o
+        // Node reclama de unhandled rejection entre o abort e o `await`.
+        const assertion = expect(promise).rejects.toThrow(/tempo limite excedido/i);
+        await vi.advanceTimersByTimeAsync(15_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it("createPixWithFallback: um gateway travado não impede o fallback pro próximo da cadeia", async () => {
+    const seller = await createProfile();
+    const gwSyncpayId = await createGateway({ userId: seller, provider: "syncpay" });
+    const gwBuckpayId = await createGateway({ userId: seller, provider: "buckpay" });
+    const chain = [
+      (await gwRepo.findByIdOwned(gwSyncpayId, seller))!,
+      (await gwRepo.findByIdOwned(gwBuckpayId, seller))!,
+    ];
+    forceGatewayTimeout("cash-in"); // só a SyncPay (1º da cadeia) trava
+
+    vi.useFakeTimers();
+    try {
+      const promise = createPixWithFallback(chain, {
+        amountCents: 1000, description: "P", webhookUrl: () => "https://wh", ownerUserId: seller,
+      });
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await promise;
+      expect(result?.gateway.provider).toBe("buckpay"); // caiu pro fallback, lead não fica preso
+      expect(result?.failures).toHaveLength(1);
+      expect(result?.failures[0].provider).toBe("syncpay");
+      expect(result?.failures[0].error).toMatch(/tempo limite excedido/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ── SyncPay: registro do webhook na conta ───────────────────────────────────
@@ -539,6 +600,79 @@ describe("processWebhookEvent — receita e comissão seguem o split efetivo", (
       expect(commissions[0].baseFeeCents).toBe(40);
       expect(commissions[0].amountCents).toBe(8); // 20% de 40
     } finally { delete process.env.TEST_SECRET_BUCKPAY_SPLIT_EMAIL; }
+  });
+
+  // Bug: a comissão de indicação usava a taxa NOMINAL configurada
+  // (SYNCPAY_SPLIT_FEE_CENTS) direto, em vez do valor que a SyncPay
+  // efetivamente retém. A SyncPay só aceita split em PERCENTUAL INTEIRO
+  // (syncpaySplitPercentage arredonda pra CIMA até atingir a taxa nominal —
+  // ver gateway-clients.ts), então o valor de fato retido pode ser MAIOR que
+  // a taxa nominal. Fórmula usada aqui: percentage = ceil(targetCents*100 /
+  // amountCents); fee = round(amountCents*percentage/100).
+  // amount=1000, target=15 → percentage=ceil(15*100/1000)=ceil(1.5)=2% →
+  // fee=round(1000*0.02)=20 (> 15, a taxa nominal configurada).
+  it("syncpay: split percentual arredonda pra cima — receita E comissão de indicação usam o valor RETIDO, não a taxa nominal", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-sync";
+    try {
+      const db = await testDb();
+      const referrer = await createProfile();
+      const bot = await createBot();
+      const seller = bot.userId;
+      await db.insert(referrals).values({ referredUserId: seller, referrerUserId: referrer });
+      await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_FEE_CENTS", value: "15" });
+      const gwId = await createGateway({ userId: seller, provider: "syncpay" });
+      const p = await payRepo.create({
+        userId: seller, botId: bot.id, gatewayId: gwId,
+        amount: 1000, status: "pending", externalId: "wh-syncpay-round-up", pixCode: "PIX", leadId: null,
+      });
+
+      await processWebhookEvent({ externalId: "wh-syncpay-round-up", provider: "syncpay", status: "paid", amount: 1000, event: "paid" }, {});
+
+      const revenue = await db.select().from(paymentRevenueCredits).where(eq(paymentRevenueCredits.paymentId, p.id));
+      expect(revenue).toHaveLength(1);
+      expect(revenue[0].amount).toBe(20); // valor retido (2% de 1000), não os 15 nominais
+
+      const commissions = await db.select().from(referralCommissions).where(eq(referralCommissions.paymentId, p.id));
+      expect(commissions).toHaveLength(1);
+      expect(commissions[0].baseFeeCents).toBe(20); // idem: base é o valor retido, não a taxa nominal (15)
+      expect(commissions[0].amountCents).toBe(4); // 20% de 20 (antes do fix: 20% de 15 = 3)
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
+  });
+
+  // Bug: a base usada pra calcular quanto a plataforma retém era o valor
+  // NOMINAL da cobrança (payment.amount, decidido na criação do PIX), não o
+  // valor que o PRÓPRIO webhook confirma como efetivamente cobrado/recebido
+  // (event.amount — vem de `final_amount` na SyncPay quando o payload traz
+  // esse campo, ver normalizeSyncpayWebhook). Os dois podem divergir entre a
+  // criação da cobrança e a confirmação do pagamento.
+  // nominal=2000, confirmado=1000, target=90 →
+  //   correto (base=confirmado):  percentage=ceil(90*100/1000)=9%  → fee=round(1000*0.09)=90
+  //   bug (base=nominal):         percentage=ceil(90*100/2000)=5%  → fee=round(2000*0.05)=100
+  it("syncpay: valor confirmado pelo webhook diverge do nominal da criação — comissão usa o valor CONFIRMADO", async () => {
+    process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID = "rc-sync";
+    try {
+      const db = await testDb();
+      const referrer = await createProfile();
+      const bot = await createBot();
+      const seller = bot.userId;
+      await db.insert(referrals).values({ referredUserId: seller, referrerUserId: referrer });
+      await db.insert(platformConfig).values({ key: "SYNCPAY_SPLIT_FEE_CENTS", value: "90" });
+      const gwId = await createGateway({ userId: seller, provider: "syncpay" });
+      const p = await payRepo.create({
+        userId: seller, botId: bot.id, gatewayId: gwId,
+        amount: 2000, status: "pending", externalId: "wh-syncpay-final-amount", pixCode: "PIX", leadId: null,
+      });
+
+      await processWebhookEvent({ externalId: "wh-syncpay-final-amount", provider: "syncpay", status: "paid", amount: 1000, event: "paid" }, {});
+
+      const revenue = await db.select().from(paymentRevenueCredits).where(eq(paymentRevenueCredits.paymentId, p.id));
+      expect(revenue).toHaveLength(1);
+      expect(revenue[0].amount).toBe(90); // base = 1000 (confirmado), não 2000 (nominal) → daria 100
+
+      const commissions = await db.select().from(referralCommissions).where(eq(referralCommissions.paymentId, p.id));
+      expect(commissions[0].baseFeeCents).toBe(90);
+      expect(commissions[0].amountCents).toBe(18); // 20% de 90
+    } finally { delete process.env.TEST_SECRET_SYNCPAY_SPLIT_USER_ID; }
   });
 });
 
