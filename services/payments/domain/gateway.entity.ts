@@ -41,6 +41,10 @@ export interface PixPaymentResult {
   pixCode:     string;
   qrImage:     string;
   externalId:  string;
+  // Chave de consulta da cobrança no gateway quando ela é DIFERENTE do
+  // externalId (hoje só BuckPay: consulta pelo external_id que nós enviamos).
+  // Persistida em payment_reconciliation para a conciliação/verificação.
+  gatewayRef?: string;
   amount:      number;
   provider:    Provider;
   institution: string;

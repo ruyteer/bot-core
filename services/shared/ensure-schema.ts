@@ -337,6 +337,20 @@ const STATEMENTS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "tracking_pixels_bot_id_provider_unique"
      ON "tracking_pixels" ("bot_id", "provider")`,
 
+  // 0020_payment_reconciliation.sql — conciliação de pagamentos pendentes com
+  // o gateway (payments/reconcile.ts): chave de consulta no gateway
+  // (gateway_ref, hoje só BuckPay) + backoff por cobrança. Tabela nova, não
+  // toca em dado existente.
+  `CREATE TABLE IF NOT EXISTS "payment_reconciliation" (
+     "provider"         text NOT NULL,
+     "external_id"      text NOT NULL,
+     "gateway_ref"      text,
+     "last_checked_at"  timestamp with time zone,
+     "check_count"      integer DEFAULT 0 NOT NULL,
+     "created_at"       timestamp with time zone DEFAULT now() NOT NULL,
+     CONSTRAINT "payment_reconciliation_provider_external_id_pk" PRIMARY KEY ("provider", "external_id")
+   )`,
+
   // 0021_payments_confirmation.sql — confirmação de pagamento: snapshot do
   // split aplicado na criação do PIX (a confirmação não recalcula mais) e
   // guarda de entrega exatamente-uma-vez do paymentPaid (at-least-once).
