@@ -48,7 +48,14 @@ export function canTransition(from: string, to: PaymentStatus): boolean {
  */
 export const AMOUNT_TOLERANCE_CENTS = 1;
 
-export type AmountCheck = { ok: true } | { ok: false; reason: string };
+export type AmountCheck =
+  | { ok: true; verified: true }
+  // Confirmado SEM conferir o valor — registrado no log com este código.
+  //   amount_is_net     só veio o valor líquido (WiinPay sempre)
+  //   amount_not_gross  veio um valor, mas quem montou o evento não diz se é bruto
+  //   amount_unknown    nenhum valor legível no payload
+  | { ok: true; verified: false; code: "amount_is_net" | "amount_not_gross" | "amount_unknown"; reason: string }
+  | { ok: false; reason: string };
 
 function brl(cents: number): string {
   return `R$ ${(cents / 100).toFixed(2)}`;
@@ -57,18 +64,38 @@ function brl(cents: number): string {
 /**
  * Confere o valor pago contra o cobrado antes de confirmar a venda.
  *
- * - Sem valor no evento → não confirma: não há como saber se bate.
- * - Pago abaixo do cobrado (além da tolerância) → não confirma.
- * - Pago acima do cobrado → confirma. O QR dinâmico fixa o valor, então isso só
- *   aparece quando o gateway soma alguma taxa paga pelo comprador ao total —
- *   o vendedor recebeu o que cobrou, recusar só deixaria o comprador sem produto.
+ * Só RECUSA quando o payload traz o valor BRUTO e ele é menor que o cobrado
+ * (além da tolerância). Conferido em produção (2026-09-24): a WiinPay só manda
+ * o valor líquido, e vários webhooks legítimos chegaram sem valor legível —
+ * recusar nesses casos barraria vendas reais. Neles a venda é confirmada e o
+ * log registra `amount_is_net` / `amount_unknown`. A autenticidade do evento
+ * não depende disto: é garantida pela autenticação/verificação ativa no
+ * gateway (webhooks/conciliação).
+ *
+ * Bruto ACIMA do cobrado confirma: o QR dinâmico fixa o valor, então isso só
+ * aparece quando o gateway soma ao total alguma taxa paga pelo comprador.
  */
-export function checkPaidAmount(chargedCents: number, paidCents: number | null | undefined): AmountCheck {
-  if (paidCents === null || paidCents === undefined || !Number.isFinite(paidCents)) {
-    return { ok: false, reason: `webhook de pagamento sem valor: não dá pra conferir contra o cobrado (${brl(chargedCents)})` };
+export function checkPaidAmount(
+  chargedCents: number,
+  paid: { grossAmount?: number | null; amount?: number | null; amountIsNet?: boolean },
+): AmountCheck {
+  const gross = paid.grossAmount;
+  if (typeof gross === "number" && Number.isFinite(gross)) {
+    if (gross < chargedCents - AMOUNT_TOLERANCE_CENTS) {
+      return { ok: false, reason: `valor bruto pago (${brl(gross)}) menor que o cobrado (${brl(chargedCents)})` };
+    }
+    return { ok: true, verified: true };
   }
-  if (paidCents < chargedCents - AMOUNT_TOLERANCE_CENTS) {
-    return { ok: false, reason: `valor pago (${brl(paidCents)}) menor que o cobrado (${brl(chargedCents)})` };
+  const amount = paid.amount;
+  if (typeof amount === "number" && Number.isFinite(amount)) {
+    const kind = paid.amountIsNet ? "líquido (taxa já descontada)" : "sem indicação de bruto";
+    return {
+      ok: true, verified: false, code: paid.amountIsNet ? "amount_is_net" : "amount_not_gross",
+      reason: `valor não conferido: o payload só trouxe valor ${kind} (${brl(amount)}), cobrado ${brl(chargedCents)}`,
+    };
   }
-  return { ok: true };
+  return {
+    ok: true, verified: false, code: "amount_unknown",
+    reason: `valor não conferido: webhook sem valor legível, cobrado ${brl(chargedCents)}`,
+  };
 }

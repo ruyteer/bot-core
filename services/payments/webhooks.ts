@@ -247,24 +247,23 @@ export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayl
       await logResult(false, `transição inválida: ${payment.status} → paid — pagamento recebido para cobrança ${payment.status}; ignorado, conferir manualmente`);
       outcome = "invalid_transition";
     } else {
-      // Confirma só se o valor pago bater com o cobrado. Divergência é falha
-      // registrada, NÃO venda paga — e não marca como processado, pra
-      // reentrega/conciliação poderem reavaliar.
-      const check = checkPaidAmount(payment.amount, event.grossAmount ?? event.amount);
+      // Recusa só com valor BRUTO abaixo do cobrado: falha registrada, NÃO
+      // venda paga — e não marca como processado, pra reentrega/conciliação
+      // poderem reavaliar. Sem bruto (WiinPay, payload sem valor legível),
+      // confirma e registra no log que o valor não foi conferido.
+      const check = checkPaidAmount(payment.amount, event);
       if (!check.ok) {
-        const netNote = event.amountIsNet
-          ? " — o payload só trouxe o valor LÍQUIDO (sem valor bruto): provável taxa descontada, conferir no gateway antes de tratar como pagamento a menor"
-          : "";
-        await logResult(false, `não confirmado: ${check.reason}${netNote}`);
+        await logResult(false, `não confirmado: ${check.reason}`);
         return "amount_mismatch";
       }
+      const amountNote = check.verified ? undefined : `${check.code}: ${check.reason}`;
 
       // Transição atômica pending/expired → paid (UPDATE ... WHERE status IN
       // (...) RETURNING). Dois webhooks concorrentes passam juntos pela
       // idempotência acima; só um recebe a linha de volta e dispara os efeitos.
       const paid = await payRepo.transitionStatus(payment.id, "paid", { finalAmount: event.amount });
       if (paid) {
-        await logResult(true);
+        await logResult(true, amountNote);
         await onPaymentConfirmed(paid, event);
         outcome = "confirmed";
       } else {

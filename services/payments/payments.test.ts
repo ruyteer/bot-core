@@ -403,7 +403,7 @@ describe("processWebhookEvent", () => {
   // logs nunca marcava um webhook como "ok", nem os que confirmaram a venda.
   it("pagamento encontrado → log gravado com processed=true e amount preenchido", async () => {
     await seed("wh-log-ok");
-    await processWebhookEvent({ externalId: "wh-log-ok", provider: "buckpay", status: "paid", amount: 1990, event: "paid" }, { any: "payload" });
+    await processWebhookEvent({ externalId: "wh-log-ok", provider: "buckpay", status: "paid", amount: 1990, grossAmount: 1990, event: "paid" }, { any: "payload" });
     const db = await testDb();
     const [log] = await db.select().from(paymentWebhookLogs)
       .where(eq(paymentWebhookLogs.externalId, "wh-log-ok"));

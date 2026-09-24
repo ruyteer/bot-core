@@ -20,7 +20,9 @@ import { processWebhookEvent } from "./webhooks.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
 import { GatewayDrizzleRepository } from "./infrastructure/gateway.drizzle.repository.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
-import { normalizeSyncpayWebhook, normalizeNexuspagWebhook } from "./application/gateway-clients.js";
+import {
+  normalizeSyncpayWebhook, normalizeNexuspagWebhook, normalizeBuckpayWebhook, normalizeWiinpayWebhook,
+} from "./application/gateway-clients.js";
 import { ensureSchema } from "../shared/ensure-schema.js";
 import { canTransition, checkPaidAmount } from "./domain/payment-status.js";
 import type { PaymentSplitSnapshot } from "./domain/payment.entity.js";
@@ -59,8 +61,10 @@ async function logsFor(paymentId: string) {
   return db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, paymentId));
 }
 
+// Evento de pago com valor BRUTO declarado (como os normalizadores fazem) — só
+// o bruto pode recusar uma confirmação por valor.
 const paid = (externalId: string, amount: number | null = 1990, extra: Record<string, unknown> = {}) =>
-  ({ externalId, provider: "buckpay" as const, status: "paid" as const, amount, event: "paid", ...extra });
+  ({ externalId, provider: "buckpay" as const, status: "paid" as const, amount, grossAmount: amount, event: "paid", ...extra });
 
 // ── 1. Match escopado ───────────────────────────────────────────────────────
 describe("confirmação — match do pagamento escopado", () => {
@@ -107,7 +111,7 @@ describe("confirmação — match do pagamento escopado", () => {
 
 // ── 2. Valor pago ───────────────────────────────────────────────────────────
 describe("confirmação — valor pago precisa bater com o cobrado", () => {
-  it("pago com valor MENOR que o cobrado → não confirma, registra a falha e não consome a idempotência", async () => {
+  it("valor BRUTO menor que o cobrado → não confirma, registra a falha e não consome a idempotência", async () => {
     const p = await seedPayment({ externalId: "valor-menor", amount: 1990 });
 
     expect(await processWebhookEvent(paid("valor-menor", 100), {})).toBe("amount_mismatch");
@@ -127,38 +131,120 @@ describe("confirmação — valor pago precisa bater com o cobrado", () => {
     expect((await payRepo.findById(p.id))!.status).toBe("paid");
   });
 
-  it("pago SEM valor no payload → não confirma", async () => {
-    const p = await seedPayment({ externalId: "sem-valor" });
-    expect(await processWebhookEvent(paid("sem-valor", null), {})).toBe("amount_mismatch");
-    expect((await payRepo.findById(p.id))!.status).toBe("pending");
-    expect((await logsFor(p.id))[0].errorMessage).toContain("sem valor");
-  });
-
-  it("diferença de 1 centavo (arredondamento reais→centavos) é tolerada; valor maior também confirma", async () => {
+  it("diferença de 1 centavo (arredondamento reais→centavos) é tolerada; bruto maior também confirma", async () => {
     const a = await seedPayment({ externalId: "um-centavo", amount: 1990 });
     const b = await seedPayment({ externalId: "a-maior", amount: 1990 });
     expect(await processWebhookEvent(paid("um-centavo", 1989), {})).toBe("confirmed");
     expect(await processWebhookEvent(paid("a-maior", 2090), {})).toBe("confirmed");
     expect((await payRepo.findById(a.id))!.status).toBe("paid");
     expect((await payRepo.findById(b.id))!.status).toBe("paid");
+    expect((await logsFor(a.id))[0].errorMessage).toBeNull(); // conferido, sem observação
   });
 
-  it("SyncPay: confere pelo valor BRUTO (amount), não pelo final_amount líquido", async () => {
-    const p = await seedPayment({ externalId: "sp-bruto", provider: "syncpay", amount: 1990 });
-    const body = { data: { identifier: "sp-bruto", status: "paid_out", amount: 19.9, final_amount: 18.5 } };
-    const event = normalizeSyncpayWebhook(body);
-    expect(await processWebhookEvent(event, body)).toBe("confirmed");
-    const got = await payRepo.findById(p.id);
-    expect(got!.status).toBe("paid");
-    expect(got!.finalAmount).toBe(1850); // final_amount segue gravado como antes
+  it("webhook SEM valor legível → confirma e registra amount_unknown (não recusa venda legítima)", async () => {
+    const p = await seedPayment({ externalId: "sem-valor" });
+    expect(await processWebhookEvent(paid("sem-valor", null), {})).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    const [log] = await logsFor(p.id);
+    expect(log.processed).toBe(true);
+    expect(log.errorMessage).toContain("amount_unknown");
   });
 
   it("checkPaidAmount: regra isolada", () => {
-    expect(checkPaidAmount(1990, 1990).ok).toBe(true);
-    expect(checkPaidAmount(1990, 1989).ok).toBe(true);
-    expect(checkPaidAmount(1990, 1988).ok).toBe(false);
-    expect(checkPaidAmount(1990, null).ok).toBe(false);
-    expect(checkPaidAmount(1990, Number.NaN).ok).toBe(false);
+    expect(checkPaidAmount(1990, { grossAmount: 1990 })).toEqual({ ok: true, verified: true });
+    expect(checkPaidAmount(1990, { grossAmount: 1989 }).ok).toBe(true);
+    expect(checkPaidAmount(1990, { grossAmount: 1988 }).ok).toBe(false);
+    expect(checkPaidAmount(1990, { grossAmount: null, amount: 100, amountIsNet: true }))
+      .toMatchObject({ ok: true, verified: false, code: "amount_is_net" });
+    expect(checkPaidAmount(1990, { amount: 1990 }))
+      .toMatchObject({ ok: true, verified: false, code: "amount_not_gross" });
+    expect(checkPaidAmount(1990, { grossAmount: null, amount: null }))
+      .toMatchObject({ ok: true, verified: false, code: "amount_unknown" });
+    expect(checkPaidAmount(1990, { grossAmount: Number.NaN, amount: null }))
+      .toMatchObject({ ok: true, verified: false, code: "amount_unknown" });
+  });
+});
+
+// Formatos REAIS de payload de pago (produção, 2026-09-24), anonimizados: só
+// os campos de valor + ids fictícios. Com a regra anterior (recusar sem bruto
+// ou abaixo do cobrado lendo o campo errado) vários destes eram recusados.
+describe("confirmação — formatos reais de payload de pago", () => {
+  it("BuckPay: bruto em data.total_amount (CENTAVOS), net_amount líquido → confirma conferido", async () => {
+    const p = await seedPayment({ externalId: "bk-real-1", provider: "buckpay", amount: 600 });
+    const body = {
+      event: "transaction.processed",
+      data: { id: "bk-real-1", status: "paid", total_amount: 600, net_amount: 401, offer: { discount_price: 600 } },
+    };
+    const event = normalizeBuckpayWebhook(body);
+    expect(event).toMatchObject({ grossAmount: 600, amount: 600, amountIsNet: false });
+    expect(await processWebhookEvent(event, body)).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    expect((await logsFor(p.id))[0].errorMessage).toBeNull();
+  });
+
+  it("BuckPay sem `offer`: total_amount=600, net_amount=371 → confirma", async () => {
+    const p = await seedPayment({ externalId: "bk-real-2", provider: "buckpay", amount: 600 });
+    const body = { event: "transaction.processed", data: { id: "bk-real-2", status: "paid", total_amount: 600, net_amount: 371 } };
+    expect(await processWebhookEvent(normalizeBuckpayWebhook(body), body)).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+  });
+
+  it("NexusPag: bruto `amount` em REAIS, net_amount/fee → confirma conferido", async () => {
+    const p = await seedPayment({ externalId: "nx-real-1", provider: "nexuspag", amount: 300 });
+    const body = { transaction_id: "nx-real-1", status: "paid", event: "payment.confirmed", amount: 3, net_amount: 2.35, fee: 0.65 };
+    const event = normalizeNexuspagWebhook(body);
+    expect(event).toMatchObject({ grossAmount: 300, amountIsNet: false });
+    expect(await processWebhookEvent(event, body)).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    expect((await logsFor(p.id))[0].errorMessage).toBeNull();
+  });
+
+  it("SyncPay: bruto data.amount em REAIS, final_amount líquido → confirma (antes era 'abaixo do cobrado')", async () => {
+    const p = await seedPayment({ externalId: "sp-real-1", provider: "syncpay", amount: 300 });
+    const body = { data: { identifier: "sp-real-1", status: "PAID_OUT", amount: 3, final_amount: 2.65 } };
+    const event = normalizeSyncpayWebhook(body);
+    expect(event).toMatchObject({ grossAmount: 300, amount: 265 });
+    expect(await processWebhookEvent(event, body)).toBe("confirmed");
+    const got = await payRepo.findById(p.id);
+    expect(got!.status).toBe("paid");
+    expect(got!.finalAmount).toBe(265); // final_amount segue gravado como antes
+  });
+
+  it("SyncPay só com data.amount (caso que o log gravou sem valor) → confirma conferido", async () => {
+    const p = await seedPayment({ externalId: "sp-real-2", provider: "syncpay", amount: 690 });
+    const body = { data: { identifier: "sp-real-2", status: "PAID_OUT", amount: 6.9 } };
+    expect(await processWebhookEvent(normalizeSyncpayWebhook(body), body)).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+  });
+
+  it("WiinPay: só `value` LÍQUIDO (abaixo do cobrado) → confirma, marca amountIsNet e registra no log", async () => {
+    const p = await seedPayment({ externalId: "wp-real-1", provider: "wiinpay", amount: 490 });
+    const body = { data: { paymentId: "wp-real-1", status: "PAID", value: 4.65 } };
+    const event = normalizeWiinpayWebhook(body);
+    expect(event).toMatchObject({ grossAmount: null, amount: 465, amountIsNet: true });
+    expect(await processWebhookEvent(event, body)).toBe("confirmed");
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    const [log] = await logsFor(p.id);
+    expect(log.processed).toBe(true);
+    expect(log.errorMessage).toContain("amount_is_net");
+    expect(log.errorMessage).toContain("líquido");
+  });
+
+  it("valores como STRING numérica também são lidos (hipótese dos logs com valor nulo)", () => {
+    expect(normalizeSyncpayWebhook({ data: { identifier: "s", status: "PAID_OUT", amount: "6.90" } }).grossAmount).toBe(690);
+    expect(normalizeBuckpayWebhook({ data: { id: "b", status: "paid", total_amount: "600" } }).grossAmount).toBe(600);
+    expect(normalizeNexuspagWebhook({ transaction_id: "n", status: "paid", amount: "3" }).grossAmount).toBe(300);
+    expect(normalizeWiinpayWebhook({ data: { paymentId: "w", status: "PAID", value: "4.65" } }).amount).toBe(465);
+    expect(normalizeWiinpayWebhook({ data: { paymentId: "w", status: "PAID", value: "abc" } }).amount).toBeNull();
+  });
+
+  it("bruto REALMENTE abaixo do cobrado (BuckPay total_amount=300, cobrado 600) → recusa", async () => {
+    const p = await seedPayment({ externalId: "bk-abaixo", provider: "buckpay", amount: 600 });
+    const body = { event: "transaction.processed", data: { id: "bk-abaixo", status: "paid", total_amount: 300, net_amount: 200 } };
+    expect(await processWebhookEvent(normalizeBuckpayWebhook(body), body)).toBe("amount_mismatch");
+    expect((await payRepo.findById(p.id))!.status).toBe("pending");
+    expect(paidPublishes(p.id)).toBe(0);
+    expect((await logsFor(p.id))[0].errorMessage).toContain("valor bruto pago");
   });
 });
 
@@ -442,22 +528,13 @@ describe("vendas pagas antes da 0021 — backfill da entrega", () => {
 
 // ── Valor só líquido (NexusPag net_amount) ──────────────────────────────────
 describe("valor só líquido no payload", () => {
-  it("NexusPag só com net_amount abaixo do cobrado: não confirma e o log diz que é valor líquido", async () => {
+  it("NexusPag só com net_amount: confirma, marca amountIsNet e o log diz que não conferiu", async () => {
     const p = await seedPayment({ externalId: "nx-liquido", provider: "nexuspag", amount: 1990 });
     const body = { transaction_id: "nx-liquido", status: "paid", net_amount: 18.5 };
     const event = normalizeNexuspagWebhook(body);
-    expect(event.amountIsNet).toBe(true);
-    expect(await processWebhookEvent(event, body)).toBe("amount_mismatch");
+    expect(event).toMatchObject({ grossAmount: null, amount: 1850, amountIsNet: true });
+    expect(await processWebhookEvent(event, body)).toBe("confirmed");
     const [log] = await logsFor(p.id);
-    expect(log.errorMessage).toContain("valor LÍQUIDO");
-  });
-
-  it("pagamento a menor com valor bruto não ganha a observação de líquido", async () => {
-    const p = await seedPayment({ externalId: "nx-bruto", provider: "nexuspag", amount: 1990 });
-    const body = { transaction_id: "nx-bruto", status: "paid", amount: 1.0 };
-    const event = normalizeNexuspagWebhook(body);
-    expect(event.amountIsNet).toBe(false);
-    expect(await processWebhookEvent(event, body)).toBe("amount_mismatch");
-    expect((await logsFor(p.id))[0].errorMessage).not.toContain("LÍQUIDO");
+    expect(log.errorMessage).toContain("amount_is_net");
   });
 });
