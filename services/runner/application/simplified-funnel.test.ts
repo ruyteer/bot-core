@@ -6,7 +6,7 @@ import { TelegramClient } from "./telegram.client.js";
 import { PaymentDrizzleRepository } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { testDb } from "../../../test/helpers/db.js";
 import { bots, leads, funnels, payments, simplifiedScheduledTasks, leadProgress } from "../../shared/schema/index.js";
-import { createBot, createGateway, createSimplifiedFunnel, createLead, startUpdate, callbackUpdate } from "../../../test/helpers/seed.js";
+import { createBot, createGateway, createSimplifiedFunnel, createFlowFunnel, createLead, startUpdate, textUpdate, callbackUpdate } from "../../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, rejectUnescapedTelegramHtml } from "../../../test/helpers/fetch-mock.js";
 
 const simplified = new ExecuteSimplifiedFunnelUseCase();
@@ -158,6 +158,38 @@ describe("simplified — roteamento via execute-flow-step", () => {
     const { bot, chatId } = await baseFunnel({ welcome: { text: "Olá simplificado" } });
     await flow.execute({ botId: bot.id, update: { ...startUpdate(Number(chatId)) } });
     expect(getSentMessages().some((m) => m.includes("Olá simplificado"))).toBe(true);
+  });
+
+  // Achado da integração com o PR do funil de fluxo: o simplificado passou a
+  // gravar uma linha em lead_progress (achado 6, pra pausa manual funcionar).
+  // Se o dono trocar o bot de simplificado pra fluxo, essa linha continua
+  // apontando pro funil simplificado antigo — sem o guard em
+  // execute-flow-step.use-case.ts (progIsSimplified), `isStartCommand || !prog`
+  // dava falso pra sempre e qualquer mensagem que não fosse /start ficava sem
+  // resposta, mesmo com um funil de fluxo novo ativo.
+  it("lead com progresso do simplificado entra no funil de FLUXO ao trocar o bot de tipo (mensagem comum, sem /start)", async () => {
+    const { bot, chatId } = await baseFunnel({ welcome: { text: "Olá simplificado" } });
+
+    // 1ª interação: roteada pro simplificado, cria a linha em lead_progress.
+    await flow.execute({ botId: bot.id, update: { ...startUpdate(Number(chatId)) } });
+    expect(getSentMessages().some((m) => m.includes("Olá simplificado"))).toBe(true);
+
+    // Dono troca o bot: desativa o simplificado, ativa um funil de FLUXO novo.
+    const db = await testDb();
+    await db.update(funnels).set({ isActive: false }).where(eq(funnels.botId, bot.id));
+    await createFlowFunnel({
+      userId: bot.userId, botId: bot.id,
+      nodes: [
+        { key: "t", type: "trigger" },
+        { key: "m", type: "message", content: { message: "Bem-vindo ao fluxo!" } },
+      ],
+      connections: [{ from: "t", to: "m" }],
+    });
+
+    // Mensagem comum (NÃO /start): antes do fix, ficava sem resposta porque
+    // lead_progress ainda apontava pro funil simplificado desativado.
+    await flow.execute({ botId: bot.id, update: textUpdate(Number(chatId), "oi") });
+    expect(getSentMessages().some((m) => m.includes("Bem-vindo ao fluxo!"))).toBe(true);
   });
 });
 

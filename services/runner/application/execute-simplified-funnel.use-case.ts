@@ -201,7 +201,17 @@ export class ExecuteSimplifiedFunnelUseCase {
     const [existingProgress] = await db.select({ id: leadProgress.id, status: leadProgress.status })
       .from(leadProgress).where(eq(leadProgress.leadId, lead.id));
     if (!existingProgress) {
-      await db.insert(leadProgress).values({ leadId: lead.id, funnelId: funnel.id, status: "active" });
+      // onConflictDoNothing sem target: dois updates concorrentes do MESMO
+      // lead (reentrega at-least-once do update do Telegram) podem ler "sem
+      // linha" antes de qualquer um inserir. Hoje isso só cria uma linha
+      // duplicada inofensiva (lead_progress não tem unique em lead_id ainda);
+      // quando o índice único de lead_progress(lead_id) existir (PR do funil
+      // de fluxo), o segundo INSERT vai colidir — sem a guarda, a requisição
+      // cairia com erro em vez de simplesmente não inserir de novo. Sem target:
+      // pega QUALQUER unique/exclusion violation da tabela, então não depende
+      // de coordenar o NOME da constraint entre os dois PRs.
+      await db.insert(leadProgress).values({ leadId: lead.id, funnelId: funnel.id, status: "active" })
+        .onConflictDoNothing();
     } else if (existingProgress.status === "paused_manual") {
       // Pausado manualmente (atendimento humano): não processa nada — nem
       // mensagem, nem callback, nem gera PIX.
