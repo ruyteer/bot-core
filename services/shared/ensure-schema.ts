@@ -360,6 +360,12 @@ const STATEMENTS: string[] = [
         WHERE "status" = 'paid';
      END IF;
    END $$`,
+
+  // 0024_bots_token_invalid_notified_at.sql — revisão do PR #60 (remarketing):
+  // guarda quando o dono do bot foi avisado por último de que o Telegram
+  // recusou o token (401), pra process-remarketing.use-case.ts não reenviar o
+  // push a cada tick enquanto o token continuar inválido.
+  `ALTER TABLE "bots" ADD COLUMN IF NOT EXISTS "token_invalid_notified_at" timestamp with time zone`,
 ];
 
 export interface SchemaFailure {

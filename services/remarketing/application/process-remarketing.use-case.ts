@@ -1,12 +1,13 @@
-import { eq, and, inArray, lte, lt, ne, sql } from "drizzle-orm";
+import { eq, and, or, isNull, inArray, lte, lt, gte, ne, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   remarketingCampaigns, remarketingMessages, remarketingLeadState,
-  bots, leads, payments, funnelOffers,
+  bots, leads, payments, funnelOffers, leadProgress,
 } from "../../shared/schema/index.js";
-import { TelegramClient } from "../../runner/application/telegram.client.js";
+import { TelegramClient, TelegramApiError } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
+import { sendPushToUser, PUSH_EVENT_TYPES, formatBotHandle } from "../../notifications/application/send-push.use-case.js";
 
 type Unit = "minutes" | "hours" | "days";
 const toMs = (value: number, unit: Unit) => {
@@ -63,8 +64,16 @@ export async function enrollRemarketingTriggers(): Promise<number> {
 
     if (camp.triggerType === "pix_unpaid") {
       const cutoff = new Date(now.getTime() - Math.max(1, Number(cfg.wait_minutes) || 30) * 60_000);
+      // Piso de data: sem isto, ligar este gatilho pegava PIX pendente de
+      // QUALQUER época — inclusive de anos antes da campanha existir — e
+      // inscrevia tudo de uma vez. Dois limites, o mais recente vale:
+      // (a) nunca antes da campanha ter sido criada, e (b) uma janela razoável
+      // (padrão 7 dias, configurável via trigger_config.max_age_days) — PIX
+      // pendente há meses não é mais "recente" o bastante pra justificar remarketing.
+      const maxAgeDays = Math.max(1, Number(cfg.max_age_days) || 7);
+      const floor = new Date(Math.max(camp.createdAt.getTime(), now.getTime() - maxAgeDays * 86_400_000));
       const rows = await db.select({ leadId: payments.leadId, botId: payments.botId }).from(payments)
-        .where(and(inArray(payments.botId, botIdList), eq(payments.status, "pending"), lt(payments.createdAt, cutoff))).limit(500);
+        .where(and(inArray(payments.botId, botIdList), eq(payments.status, "pending"), lt(payments.createdAt, cutoff), gte(payments.createdAt, floor))).limit(500);
       pairs = rows.filter((r) => r.leadId).map((r) => ({ leadId: r.leadId!, botId: r.botId }));
     } else if (camp.triggerType === "buyers") {
       const cutoff = new Date(now.getTime() - Math.max(0, Number(cfg.wait_minutes) || 0) * 60_000);
@@ -141,8 +150,93 @@ export async function resumeLeadsAfterReactivation(campaignId: string): Promise<
   return res.rows.length;
 }
 
+// ── Lead respondeu: para remarketing das campanhas com stop_on_reply ────────────
+// `stop_on_reply` é gravado na criação/edição da campanha (remarketing.api.ts)
+// mas nunca era lido em lugar nenhum — o runner ignorava a opção e continuava
+// mandando mensagem mesmo depois do lead responder. Chamado pelo runner (ver
+// execute-flow-step.use-case.ts) sempre que UMA mensagem inbound do lead é
+// salva em lead_messages (texto, mídia ou clique de botão), para toda campanha
+// com essa opção ligada em que o lead ainda esteja inscrito e ativo/pausado —
+// nunca reabre um estado já 'stopped'/'blocked'/'completed' por outro motivo.
+export async function stopRemarketingOnLeadReply(leadId: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE remarketing_lead_state rls
+    SET status = 'stopped', pause_reason = 'lead_replied', updated_at = now()
+    FROM remarketing_campaigns c
+    WHERE rls.campaign_id = c.id
+      AND rls.lead_id = ${leadId}
+      AND c.stop_on_reply = true
+      AND rls.status IN ('active', 'paused')
+  `);
+}
+
 // ── Processa estados vencidos (envia a próxima mensagem da sequência) ───────────
-const MAX_CONSECUTIVE_ERRORS = 3;
+
+// Backoff exponencial para falha TRANSITÓRIA de envio (rede, 5xx, 429 sem
+// retry_after informado): 5min, 15min, 45min, 2h15... até um teto de 6h. Falha
+// transitória nunca bloqueia o lead (ver classifyTelegramFailure) — sem um
+// backoff crescente, uma instabilidade prolongada do Telegram martelaria a API
+// a cada tick em vez de dar espaço pra ela se recuperar.
+function transientBackoffMs(consecutiveErrors: number): number {
+  const minutes = Math.min(5 * 3 ** Math.max(0, consecutiveErrors - 1), 360);
+  return minutes * 60_000;
+}
+
+type SendFailure = { kind: "permanent"; reason: string } | { kind: "transient" } | { kind: "bot_invalid_token" };
+
+// Distingue falha do LEAD (definitiva ou transitória) de falha do BOT (token
+// revogado/trocado — 401). Usa o errorCode real da API do Telegram
+// (TelegramApiError, ver telegram.client.ts) em vez de adivinhar pela mensagem
+// genérica.
+//
+// - "bot_invalid_token" (401): não é sobre ESTE lead — o token não funciona
+//   pra NENHUM lead deste bot. Tratar como falha de lead (por engano, como
+//   antes desta revisão) fazia o processador martelar a API a cada tick, pra
+//   CADA lead devido daquele bot, sempre falhando do mesmo jeito.
+// - "permanent" (403 Forbidden — bot bloqueado, conta desativada, removido do
+//   chat; ou 400 "chat not found"): o LEAD é que está inalcançável — vale bloquear.
+// - "transient" (qualquer outro erro, incluindo outros 400, timeout, erro de
+//   rede): só tentar de novo depois. Bloquear por engano é irreversível pro
+//   lead, então o padrão é o lado seguro.
+function classifyTelegramFailure(err: unknown): SendFailure {
+  if (err instanceof TelegramApiError) {
+    if (err.errorCode === 401) return { kind: "bot_invalid_token" };
+    if (err.errorCode === 403) return { kind: "permanent", reason: "blocked_by_user" };
+    if (err.errorCode === 400 && /chat not found/i.test(err.message)) return { kind: "permanent", reason: "chat_not_found" };
+  }
+  return { kind: "transient" };
+}
+
+// Não renotifica o dono antes de 24h (ver bots.token_invalid_notified_at,
+// migration 0024) — sem isto, cada tick do processador reenviaria o push
+// enquanto o token continuar inválido.
+const BOT_TOKEN_INVALID_RENOTIFY_MS = 24 * 3_600_000;
+
+// Avisa o dono do bot 1x a cada 24h (no mínimo) que o Telegram recusou o
+// token. CAS em token_invalid_notified_at (só quem encontra a coluna NULL ou
+// vencida consegue o UPDATE) evita duas réplicas do runner mandando o mesmo
+// push ao mesmo tempo — mesma técnica do "toque otimista" usado no claim de
+// remarketing_lead_state, ver processDueRemarketing.
+async function notifyBotTokenInvalidOnce(bot: typeof bots.$inferSelect, now: Date): Promise<void> {
+  const cutoff = new Date(now.getTime() - BOT_TOKEN_INVALID_RENOTIFY_MS);
+  const touched = await db.update(bots).set({ tokenInvalidNotifiedAt: now })
+    .where(and(
+      eq(bots.id, bot.id),
+      or(isNull(bots.tokenInvalidNotifiedAt), lt(bots.tokenInvalidNotifiedAt, cutoff)),
+    ))
+    .returning({ id: bots.id });
+  if (!touched.length) return; // avisado há menos de 24h, ou outra réplica venceu a corrida agora
+  await sendPushToUser(bot.userId, {
+    eventType: PUSH_EVENT_TYPES.BOT_TOKEN_INVALID,
+    title:     "⚠️ Token do bot inválido",
+    body:      `${formatBotHandle(bot.telegramUsername)} — o Telegram recusou o token (401). Remarketing e outros envios ficam pausados até você atualizar o token do bot.`,
+    data:      { url: "/bots", bot_id: bot.id },
+  }).catch((err) => console.error("[remarketing] falha ao notificar token inválido:", err));
+}
+
+// Quanto tempo esperar antes de checar de novo um lead pausado manualmente (ver
+// guard "Lead em atendimento humano" abaixo).
+const PAUSED_RECHECK_MS = 30 * 60_000;
 
 export async function processDueRemarketing(): Promise<number> {
   const now = new Date();
@@ -159,6 +253,11 @@ export async function processDueRemarketing(): Promise<number> {
   let processed = 0;
   const msgCache = new Map<string, Array<typeof remarketingMessages.$inferSelect>>();
   const botCache = new Map<string, typeof bots.$inferSelect | undefined>();
+  // Bots cujo token já deu 401 NESTE tick: martelar a API de novo pra cada
+  // outro lead devido do mesmo bot só geraria mais 401 — assim que o primeiro
+  // aparece, os demais leads desse bot são pulados sem tentar enviar (e sem
+  // penalizar o lead, que não tem nada a ver com o token estar inválido).
+  const invalidTokenBots = new Set<string>();
 
   for (const st of claimed) {
     try {
@@ -203,6 +302,20 @@ export async function processDueRemarketing(): Promise<number> {
       // Grupo/canal (id negativo) nunca é alvo de remarketing.
       if (lead.telegramChatId <= 0n) { await db.update(remarketingLeadState).set({ status: "stopped", pauseReason: "not_a_user", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
 
+      // Lead em atendimento humano (pausado manualmente — leads.api.ts PATCH
+      // .../pause seta leadProgress.status='paused_manual', mesmo flag que o
+      // runner respeita pra travar a automação do funil, ver execute-flow-step
+      // .use-case.ts) não deve receber remarketing enquanto durar a pausa. Só
+      // adia a próxima tentativa (mantém status/índice intactos) em vez de
+      // marcar o estado como parado — quando o atendente retomar, a sequência
+      // volta sozinha no próximo tick, sem precisar de rotina de reativação.
+      const [pausedProgress] = await db.select({ id: leadProgress.id }).from(leadProgress)
+        .where(and(eq(leadProgress.leadId, st.leadId), eq(leadProgress.status, "paused_manual"))).limit(1);
+      if (pausedProgress) {
+        await db.update(remarketingLeadState).set({ status: "active", nextSendAt: new Date(now.getTime() + PAUSED_RECHECK_MS), updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+        continue;
+      }
+
       // Envia SEMPRE pelo bot do estado, não pelo bot principal da campanha:
       // uma campanha com vários `bot_ids` inscreve o lead de cada bot, e usar
       // camp.botId fazia a mesma pessoa receber a mesma mensagem duas vezes
@@ -211,6 +324,15 @@ export async function processDueRemarketing(): Promise<number> {
       if (!botCache.has(sendBotId)) { const [b] = await db.select().from(bots).where(eq(bots.id, sendBotId)); botCache.set(sendBotId, b); }
       const bot = botCache.get(sendBotId);
       if (!bot) { await db.update(remarketingLeadState).set({ status: "error", pauseReason: "bot_missing", updatedAt: now }).where(eq(remarketingLeadState.id, st.id)); continue; }
+
+      // Bot já deu 401 neste tick (outro lead, acima) — não tenta de novo.
+      // Devolve pra "active" sem tocar em índice/erro: a falha é do bot, não
+      // deste lead, e o próximo tick já tenta de novo sozinho (de graça, sem
+      // chamada à API) assim que o dono corrigir o token.
+      if (invalidTokenBots.has(sendBotId)) {
+        await db.update(remarketingLeadState).set({ status: "active", updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+        continue;
+      }
 
       // Defesa em profundidade: campanhas gravadas (ou corrompidas) ANTES desta checagem
       // existir com um bot_ids de outro dono — ou um lead_state com bot_id divergente —
@@ -246,14 +368,54 @@ export async function processDueRemarketing(): Promise<number> {
       const replyMarkup = kb.length ? { inline_keyboard: kb } : undefined;
 
       let sentOk = true;
+      let sendError: unknown = null;
       try {
         if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, replyMarkup, bot.protectContent);
         else if (text) await tg.sendMessage({ chatId, text, replyMarkup, protectContent: bot.protectContent });
-      } catch (e) { sentOk = false; console.error("[remarketing] envio falhou:", st.id, e); }
+      } catch (e) { sentOk = false; sendError = e; console.error("[remarketing] envio falhou:", st.id, e); }
 
-      const newConsecutive = sentOk ? 0 : (st.consecutiveErrors || 0) + 1;
-      if (!sentOk && newConsecutive >= MAX_CONSECUTIVE_ERRORS) {
-        await db.update(remarketingLeadState).set({ status: "blocked", pauseReason: "send_failed_repeatedly", consecutiveErrors: newConsecutive, lastError: "send failed", lastSentAt: now, updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+      if (!sentOk) {
+        const errMsg = sendError instanceof Error ? sendError.message : String(sendError);
+        const failure = classifyTelegramFailure(sendError);
+        if (failure.kind === "bot_invalid_token") {
+          // Falha do BOT, não do lead: não bloqueia nem avança este (nem
+          // nenhum outro) lead do bot neste tick, e não martela a API de novo
+          // (ver o guard invalidTokenBots no topo do loop). Devolve o estado
+          // pra "active" intacto — assim que o token for corrigido, o próximo
+          // tick processa normalmente.
+          invalidTokenBots.add(sendBotId);
+          await db.update(remarketingLeadState).set({ status: "active", updatedAt: now }).where(eq(remarketingLeadState.id, st.id));
+          await notifyBotTokenInvalidOnce(bot, now);
+          continue;
+        }
+        if (failure.kind === "permanent") {
+          // Falha definitiva (bot bloqueado, chat inexistente etc.): bloqueia
+          // JÁ, sem esperar N tentativas — esperar só adiaria o inevitável e
+          // continuaria consumindo o índice da sequência à toa. NÃO avança
+          // nextMessageIndex/cyclesCompleted: a mensagem nunca vai chegar de
+          // qualquer forma, e blocked é terminal (não há próxima tentativa).
+          await db.update(remarketingLeadState).set({
+            status: "blocked", pauseReason: failure.reason, lastError: errMsg,
+            consecutiveErrors: (st.consecutiveErrors || 0) + 1, updatedAt: now,
+          }).where(eq(remarketingLeadState.id, st.id));
+          continue;
+        }
+        // Falha TRANSITÓRIA (rede, 5xx, 429, timeout): nunca bloqueia o lead.
+        // Não avança nextMessageIndex — a mensagem que falhou é reenviada na
+        // próxima tentativa em vez de "pulada" silenciosamente (bug original).
+        // 429 é um caso à parte: o Telegram já diz exatamente quanto esperar
+        // (retry_after), então usamos isso direto (+ jitter, mesma fórmula do
+        // resgate de delays de funil em runner.ts) em vez do backoff genérico
+        // — que existe justamente para quando NÃO sabemos quanto esperar.
+        const newConsecutive = (st.consecutiveErrors || 0) + 1;
+        const isRateLimit = sendError instanceof TelegramApiError && sendError.isRateLimit;
+        const waitMs = isRateLimit
+          ? ((sendError as TelegramApiError).retryAfter ?? 30) * 1000 + 5000 + Math.floor(Math.random() * 15000)
+          : transientBackoffMs(newConsecutive);
+        await db.update(remarketingLeadState).set({
+          nextSendAt: new Date(now.getTime() + waitMs),
+          lastError: errMsg, consecutiveErrors: newConsecutive, status: "active", updatedAt: now,
+        }).where(eq(remarketingLeadState.id, st.id));
         continue;
       }
 
@@ -266,8 +428,8 @@ export async function processDueRemarketing(): Promise<number> {
 
       await db.update(remarketingLeadState).set({
         nextMessageIndex: nextIdx, nextSendAt: nextSend, cyclesCompleted: newCycles,
-        totalSent: (st.totalSent || 0) + (sentOk ? 1 : 0), lastSentAt: now,
-        lastError: sentOk ? null : "send failed", consecutiveErrors: newConsecutive,
+        totalSent: (st.totalSent || 0) + 1, lastSentAt: now,
+        lastError: null, consecutiveErrors: 0,
         pauseReason: maxedOut ? "max_cycles" : null, status: maxedOut ? "completed" : "active", updatedAt: now,
       }).where(eq(remarketingLeadState.id, st.id));
 

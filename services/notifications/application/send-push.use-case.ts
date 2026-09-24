@@ -13,9 +13,13 @@ import { vapidPublicKey, vapidPrivateKey, vapidSubject } from "../../config/secr
 // por evento, `userNotificationPreferences.eventPrefs`). `admin_announcement` é
 // emitido fora dessa lista (broadcast do admin, sem preferência por evento).
 export const PUSH_EVENT_TYPES = {
-  SALE_APPROVED: "sale_approved",
-  PIX_GENERATED: "pix_generated",
-  NEW_LEAD:      "new_lead",
+  SALE_APPROVED:     "sale_approved",
+  PIX_GENERATED:     "pix_generated",
+  NEW_LEAD:          "new_lead",
+  // Telegram recusou o token do bot (401) — ver process-remarketing.use-case.ts.
+  // Não tem toggle na UI (como as 3 de cima); "sem preferência salva" cai no
+  // padrão "habilitado" do próprio sendPushToUser.
+  BOT_TOKEN_INVALID: "bot_token_invalid",
 } as const;
 
 // Formata o @handle do bot pra identificar, no corpo do push, qual dos bots
