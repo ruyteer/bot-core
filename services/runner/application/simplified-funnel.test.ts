@@ -91,6 +91,7 @@ describe("simplified — planos, bumps e PIX", () => {
     const [pay] = await db.select().from(payments);
     expect(pay.amount).toBe(1990);
     expect((pay.simplifiedCtx as { kind: string }).kind).toBe("plan");
+    expect(pay.splitSnapshot).toEqual({ receiver: null, cents: 0, feeCents: 0 }); // snapshot do split do PIX
     expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0); // QR
   });
 

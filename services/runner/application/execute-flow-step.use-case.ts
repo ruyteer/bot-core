@@ -1980,6 +1980,7 @@ export class ExecuteFlowStepUseCase {
         simplifiedCtx: bumpItems.length
           ? { kind: "plan", funnelId: prog.funnelId, items: bumpItems }
           : null,
+        splitSnapshot: result.splitSnapshot,
       });
     } catch (err) {
       // Corrida: entre o findPendingForOffer lá em cima e este INSERT, OUTRA
@@ -2078,6 +2079,7 @@ export class ExecuteFlowStepUseCase {
       userId: bot.userId, botId: bot.id, leadId: lead.id, gatewayId: gw.id,
       offerId: offer.id, offerName: offer.name, amount, status: "pending",
       externalId: pix.externalId, pixCode: pix.pixCode, description: offer.name,
+      splitSnapshot: result.splitSnapshot,
     });
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —

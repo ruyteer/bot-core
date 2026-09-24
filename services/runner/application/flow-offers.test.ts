@@ -95,6 +95,9 @@ describe("offer node — apresentação e compra", () => {
     expect(pay.status).toBe("pending");
     expect(pay.paidHandle).toBe(`${handle}__paid`);
     expect(pay.pixCode).toBeTruthy();
+    // Snapshot do split aplicado no PIX (sem secret de split → sem split) —
+    // a confirmação usa isto em vez de recalcular.
+    expect(pay.splitSnapshot).toEqual({ receiver: null, cents: 0, feeCents: 0 });
 
     // QR (sendPhoto) + copia-e-cola (sendMessage com <code>)
     expect(getTelegramCalls("sendPhoto").length).toBeGreaterThan(0);

@@ -18,6 +18,7 @@ import {
   type NormalizedWebhookEvent,
 } from "./application/gateway-clients.js";
 import { resolveEffectiveSplit, type EffectiveSplit } from "./application/split-config.js";
+import { canTransition, checkPaidAmount } from "./domain/payment-status.js";
 
 // Valor em centavos -> "R$ 12,34"
 function formatBRL(cents: number): string {
@@ -29,9 +30,20 @@ const payRepo = new PaymentDrizzleRepository();
 // ── Receita da plataforma (payment_revenue_credits) ───────────────────────────
 // O split é aplicado NO PROVEDOR na criação do PIX (createPix) e nunca voltava
 // pra cá — `payment_revenue_credits` ficava vazia e o card "Taxas" do admin
-// mostrava R$ 0,00 pra sempre. Aqui reconstruímos o mesmo valor que o split
-// carregou, na confirmação do pagamento, usando a mesma fonte da verdade da
-// criação do PIX: split-config.ts#resolveEffectiveSplit.
+// mostrava R$ 0,00 pra sempre. Aqui persistimos o valor que o split carregou.
+//
+// Fonte: o snapshot gravado NA CRIAÇÃO da cobrança (payments.split_snapshot,
+// via createPixWithFallback). Antes a confirmação resolvia o split de novo na
+// hora do webhook — se o painel mudasse entre o PIX e o pagamento (split
+// desligado/ligado, taxa do usuário alterada), receita e comissão divergiam do
+// que o gateway de fato reteve.
+
+interface ConfirmationSplit {
+  /** Taxa-alvo (centavos) — base da comissão de indicação. */
+  cents:    number;
+  /** Quanto o gateway reteve de fato — receita da plataforma. */
+  feeCents: number;
+}
 
 // resolveEffectiveSplit não pode derrubar a confirmação da venda — mesmo
 // espírito de isPlatformAdmin (roles.ts): falha silenciosa vira "sem split".
@@ -44,19 +56,26 @@ async function safeResolveSplit(provider: Provider, ownerUserId: string): Promis
   }
 }
 
+// Split desta venda: o snapshot da criação; só cobranças anteriores à
+// migration 0021 (sem snapshot) caem no cálculo antigo, feito na hora.
+async function splitForConfirmation(payment: Payment, provider: Provider): Promise<ConfirmationSplit | null> {
+  const snap = payment.splitSnapshot;
+  if (snap) return snap.cents > 0 ? { cents: snap.cents, feeCents: snap.feeCents } : null;
+  const split = await safeResolveSplit(provider, payment.userId);
+  if (!split) return null;
+  return { cents: split.cents, feeCents: platformSplitCents(provider, payment.amount, split.cents) };
+}
+
 // Lança o crédito de receita da plataforma. Idempotente pela PK composta
 // (payment_id, user_id) — o webhook pode ser reentregue. Nunca derruba a
 // confirmação da venda.
-async function creditPlatformRevenue(payment: Payment, provider: Provider, split: EffectiveSplit | null): Promise<void> {
+async function creditPlatformRevenue(payment: Payment, provider: Provider, split: ConfirmationSplit | null): Promise<void> {
   try {
-    if (!split) return; // admin, gateway com split desligado, ou taxa zerada — nada a creditar
-    // Base = o mesmo amountCents passado ao createPix na criação da cobrança.
-    const fee = platformSplitCents(provider, payment.amount, split.cents);
-    if (fee <= 0) return;
+    if (!split || split.feeCents <= 0) return; // admin, split desligado, ou taxa zerada — nada a creditar
     await db.insert(paymentRevenueCredits).values({
       paymentId: payment.id,
       userId:    payment.userId,
-      amount:    fee,
+      amount:    split.feeCents,
       provider,
     }).onConflictDoNothing();
   } catch (err) {
@@ -64,124 +83,233 @@ async function creditPlatformRevenue(payment: Payment, provider: Provider, split
   }
 }
 
-// ── Shared handler ────────────────────────────────────────────────────────────
+// Efeitos IDEMPOTENTES da venda paga: receita (PK), comissão (UNIQUE
+// payment_id) e o evento paymentPaid (o subscriber do runner reivindica a
+// entrega com claimDelivery — mensagem repetida não entrega de novo). Por serem
+// seguros de repetir, rodam também na recuperação de um "pago" que ficou sem
+// entrega (ver ramo already_paid em processWebhookEvent).
+async function applyIdempotentPaidEffects(payment: Payment, provider: Provider): Promise<void> {
+  const split = await splitForConfirmation(payment, provider);
 
-export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<void> {
+  // Receita da plataforma (card "Taxas" do admin). Trata os próprios erros.
+  await creditPlatformRevenue(payment, provider, split);
+
+  // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
+  await paymentPaid.publish({ paymentId: payment.id });
+
+  // Indique e Ganhe: credita a comissão do indicador do seller (se houver
+  // split real nesta venda — sem split, não há taxa da plataforma sobre a
+  // qual comissionar). Trata os próprios erros — nunca bloqueia a venda.
+  if (split) {
+    await accrueReferralCommission(payment.id, payment.userId, split.cents);
+  }
+}
+
+// Efeitos da venda que acabou de ser confirmada — roda só pra quem ganhou a
+// transição atômica pending/expired → paid, ou seja, uma vez por venda.
+async function onPaymentConfirmed(payment: Payment, event: NormalizedWebhookEvent): Promise<void> {
+  await applyIdempotentPaidEffects(payment, event.provider);
+
+  // Pixels: Purchase para cada pixel ativo do bot (enviado pelo tick do
+  // runner). NÃO é idempotente — por isso só aqui, depois da transição.
+  await enqueuePixelEvents(payment.botId, "Purchase", {
+    leadId: payment.leadId, paymentId: payment.id,
+  });
+
+  // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
+  // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.
+  // Diferente do runner, aqui só temos o payment em mãos — sem o bot já
+  // carregado em escopo — daí o lookup extra por telegramUsername.
+  const amount = event.amount ?? payment.amount;
+  const pushBot = await db.select({ telegramUsername: bots.telegramUsername })
+    .from(bots).where(eq(bots.id, payment.botId)).limit(1)
+    .then((rows) => rows[0])
+    .catch((err) => { console.error("[payments] lookup de bot p/ push falhou:", err); return undefined; });
+  void sendPushToUser(payment.userId, {
+    eventType: PUSH_EVENT_TYPES.SALE_APPROVED,
+    title:     "💰 Venda aprovada!",
+    body:      `${formatBotHandle(pushBot?.telegramUsername)} · ${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
+    data:      { url: "/sales", payment_id: payment.id },
+  }).catch((err) => console.error("[payments] push de venda falhou:", err));
+}
+
+// ── Caso de uso de confirmação ────────────────────────────────────────────────
+
+/**
+ * Desfecho do processamento de um evento de pagamento. Quem só quer "processar
+ * e seguir" (os 4 endpoints de webhook) ignora o retorno; a conciliação pode
+ * usá-lo pra saber o que aconteceu com cada cobrança.
+ */
+export type WebhookOutcome =
+  | "no_id"               // payload sem nenhum identificador reconhecível
+  | "not_found"           // nenhum pagamento deste provider/dono com esses ids
+  | "ambiguous"           // os ids casam com MAIS DE UM pagamento — nada é aplicado
+  | "duplicate"           // (pagamento, provider, status) já processado antes
+  | "amount_mismatch"     // "pago", mas o valor não confere com o cobrado — não confirma
+  | "confirmed"           // pending/expired → paid: venda confirmada agora
+  | "already_paid"        // "pago" de novo para uma venda já paga — sem efeitos repetidos
+  | "status_updated"      // pending → cancelled/expired
+  | "invalid_transition"  // transição fora da máquina de estados — registrada e ignorada
+  | "ignored";            // status sem transição (pending/unknown)
+
+function describeMatches(matches: Payment[]): string {
+  return matches.map((m) => `${m.id} (external_id=${m.externalId}, status=${m.status})`).join(", ");
+}
+
+export async function processWebhookEvent(event: NormalizedWebhookEvent, rawPayload: unknown, sourceIp?: string): Promise<WebhookOutcome> {
   // Candidatos = TODOS os ids plausíveis extraídos do payload (normalizeXWebhook).
   // Para buckpay/wiinpay isso é só [externalId] de sempre; para syncpay/nexuspag
   // pode ter vários, porque o campo que bate com payments.external_id varia
-  // entre criação e webhook (ver gateway-clients.ts). primaryId é o candidato
-  // #1, usado só pra idempotência/log — o match de verdade tenta todos.
+  // entre criação e webhook (ver gateway-clients.ts).
   const candidates = event.externalIdCandidates && event.externalIdCandidates.length > 0
     ? event.externalIdCandidates
     : (event.externalId ? [event.externalId] : []);
   const primaryId = event.externalId || candidates[0] || "";
 
+  const baseLog = {
+    provider: event.provider,
+    event:    event.event,
+    payload:  rawPayload,
+    status:   event.status,
+    amount:   event.amount,
+    sourceIp,
+  };
+
   // Um `return` mudo aqui era o pior lugar possível para não deixar rastro: é
   // exatamente o caso em que o payload do provedor não bate com o que o
   // normalizador espera, e o único jeito de descobrir a forma real é vendo o
-  // corpo que ele mandou. Sem log, "o provedor nunca chamou" e "chamou e não
-  // entendemos" ficam indistinguíveis — e é a primeira pergunta de qualquer
-  // investigação de venda não confirmada. Registra e só então desiste.
+  // corpo que ele mandou. Registra e só então desiste.
   if (candidates.length === 0) {
     await payRepo.logWebhook({
-      provider:     event.provider,
-      event:        event.event,
-      payload:      rawPayload,
-      status:       event.status,
-      amount:       event.amount,
-      sourceIp,
+      ...baseLog,
       errorMessage: "sem identificador: o normalizador não achou nenhum id de transação neste payload",
     });
-    return;
+    return "no_id";
   }
 
-  // Idempotency — skip if already processed with the SAME status. Status faz
-  // parte da chave de propósito: uma venda gera vários webhooks com o mesmo
-  // externalId ao longo do tempo (ex.: SyncPay manda "pending"/
-  // "waiting_for_approval" na criação e só depois "paid_out" na confirmação)
-  // — dedupar só por (externalId, provider) fazia o primeiro webhook (quase
-  // sempre o de venda pendente) travar a venda pra sempre, descartando o
-  // webhook de pagamento confirmado antes mesmo dele ser logado.
-  const already = await payRepo.isProcessed(primaryId, event.provider, event.status);
-  if (already) return;
+  const matches = await payRepo.findAllByAnyExternalId(candidates, event.provider);
 
-  const payment = await payRepo.findByAnyExternalId(candidates, event.provider);
-
-  await payRepo.logWebhook({
-    provider:          event.provider,
-    externalId:        primaryId,
-    event:             event.event,
-    payload:           rawPayload,
-    status:            event.status,
-    amount:            event.amount,
-    sourceIp,
-    matchedPaymentId:  payment?.id,
-    // processed=true só quando achamos o pagamento; sem isso todo webhook
-    // ficava com processed=false pra sempre e a tela de logs nunca marcava
-    // nada como "ok" — mesmo os que confirmaram vendas com sucesso.
-    processed:         !!payment,
-    // Nenhum candidato bateu: quase sempre significa que gravamos um id na
-    // criação e o provedor devolve outro(s) no webhook. Lista os candidatos
-    // tentados — é assim que confirmamos em produção se o fix pegou todos os
-    // casos ou se falta mais um campo pra cobrir.
-    ...(payment ? {} : {
+  // Nenhum candidato bateu: quase sempre significa que gravamos um id na
+  // criação e o provedor devolve outro(s) no webhook. Lista os candidatos
+  // tentados — é assim que confirmamos em produção se falta mais um campo.
+  // NÃO marca como processado: se o webhook chegou antes do INSERT da cobrança
+  // (createPix responde antes de payRepo.create gravar), a reentrega ainda
+  // precisa conseguir confirmar a venda.
+  if (matches.length === 0) {
+    await payRepo.logWebhook({
+      ...baseLog,
+      externalId:   primaryId,
       errorMessage: `id "${primaryId}" não corresponde a nenhum pagamento de ${event.provider} (candidatos tentados: [${candidates.join(", ")}])`,
-    }),
+    });
+    return "not_found";
+  }
+
+  // Mais de um pagamento casa com os ids deste payload (id colidindo entre
+  // vendedores do mesmo provider, ou candidatos diferentes batendo em cobranças
+  // diferentes). Confirmar "o primeiro" era confirmar a venda errada — registra
+  // e não aplica nada; resolve-se na conciliação/manualmente.
+  if (matches.length > 1) {
+    await payRepo.logWebhook({
+      ...baseLog,
+      externalId:   primaryId,
+      errorMessage: `ambíguo: os ids [${candidates.join(", ")}] casam com ${matches.length} pagamentos de ${event.provider} — nada aplicado: ${describeMatches(matches)}`,
+    });
+    return "ambiguous";
+  }
+
+  const payment = matches[0];
+
+  // Idempotência — chave = o external_id GRAVADO na cobrança (canônico), não o
+  // candidato #1 do payload: a ordem/forma dos candidatos pode variar entre
+  // reentregas do mesmo evento (e o #1 nem sempre é o que bateu), o que furava
+  // a deduplicação. Status faz parte da chave de propósito: uma venda gera
+  // vários webhooks com o mesmo id ao longo do tempo (ex.: SyncPay manda
+  // "pending" na criação e só depois "paid_out") — dedupar só por id travava a
+  // venda no primeiro webhook. A garantia contra efeito duplicado é a
+  // transição atômica abaixo; isto aqui só poupa trabalho e log repetido.
+  const idemKey = payment.externalId ?? primaryId;
+  if (await payRepo.isProcessed(idemKey, event.provider, event.status)) return "duplicate";
+
+  const logResult = (processed: boolean, errorMessage?: string) => payRepo.logWebhook({
+    ...baseLog,
+    externalId:       idemKey,
+    matchedPaymentId: payment.id,
+    processed,
+    ...(errorMessage ? { errorMessage } : {}),
   });
 
-  if (payment) {
-    if (event.status === "paid") {
-      await payRepo.markPaid(payment.id, event.amount ?? undefined);
+  let outcome: WebhookOutcome;
 
-      // Split efetivo desta venda — MESMO resolver usado na criação do PIX
-      // (split-config.ts), calculado uma vez e reusado abaixo. Sem isso, a
-      // receita da plataforma e a comissão de indicação podiam divergir do
-      // que de fato foi cobrado no gateway (ex.: acumular comissão mesmo com
-      // o split desligado pro gateway no painel).
-      const split = await safeResolveSplit(event.provider, payment.userId);
-
-      // Receita da plataforma (card "Taxas" do admin): persiste o valor que o
-      // split reteve nesta transação. Idempotente; trata os próprios erros.
-      await creditPlatformRevenue(payment, event.provider, split);
-
-      // Notifica o runner p/ entregar o produto e retomar o funil (ramo __paid).
-      await paymentPaid.publish({ paymentId: payment.id });
-
-      // Indique e Ganhe: credita a comissão do indicador do seller (se houver
-      // split real nesta venda — sem split, não há taxa da plataforma sobre a
-      // qual comissionar). Trata os próprios erros — nunca bloqueia a venda.
-      if (split) {
-        await accrueReferralCommission(payment.id, payment.userId, split.cents);
+  if (event.status === "paid") {
+    if (payment.status === "paid") {
+      outcome = await handleAlreadyPaid(payment, event.provider, logResult);
+    } else if (!canTransition(payment.status, "paid")) {
+      await logResult(false, `transição inválida: ${payment.status} → paid — pagamento recebido para cobrança ${payment.status}; ignorado, conferir manualmente`);
+      outcome = "invalid_transition";
+    } else {
+      // Confirma só se o valor pago bater com o cobrado. Divergência é falha
+      // registrada, NÃO venda paga — e não marca como processado, pra
+      // reentrega/conciliação poderem reavaliar.
+      const check = checkPaidAmount(payment.amount, event.grossAmount ?? event.amount);
+      if (!check.ok) {
+        await logResult(false, `não confirmado: ${check.reason}`);
+        return "amount_mismatch";
       }
 
-      // Pixels: Purchase para cada pixel ativo do bot (enviado pelo tick do
-      // runner). Idempotente pelo processedWebhooks — este bloco roda uma vez.
-      await enqueuePixelEvents(payment.botId, "Purchase", {
-        leadId: payment.leadId, paymentId: payment.id,
-      });
-
-      // Push para o dono do bot. Não bloqueia nem derruba a confirmação da venda:
-      // sendPushToUser trata os próprios erros, e o catch aqui é só cinto extra.
-      // Diferente do runner, aqui só temos o payment em mãos — sem o bot já
-      // carregado em escopo — daí o lookup extra por telegramUsername.
-      const amount = event.amount ?? payment.amount;
-      const pushBot = await db.select({ telegramUsername: bots.telegramUsername })
-        .from(bots).where(eq(bots.id, payment.botId)).limit(1)
-        .then((rows) => rows[0])
-        .catch((err) => { console.error("[payments] lookup de bot p/ push falhou:", err); return undefined; });
-      void sendPushToUser(payment.userId, {
-        eventType: PUSH_EVENT_TYPES.SALE_APPROVED,
-        title:     "💰 Venda aprovada!",
-        body:      `${formatBotHandle(pushBot?.telegramUsername)} · ${payment.offerName || "Pagamento"} — ${formatBRL(amount)}`,
-        data:      { url: "/sales", payment_id: payment.id },
-      }).catch((err) => console.error("[payments] push de venda falhou:", err));
-    } else if (event.status === "cancelled" || event.status === "expired") {
-      await payRepo.updateStatus(payment.id, event.status);
+      // Transição atômica pending/expired → paid (UPDATE ... WHERE status IN
+      // (...) RETURNING). Dois webhooks concorrentes passam juntos pela
+      // idempotência acima; só um recebe a linha de volta e dispara os efeitos.
+      const paid = await payRepo.transitionStatus(payment.id, "paid", { finalAmount: event.amount });
+      if (paid) {
+        await logResult(true);
+        await onPaymentConfirmed(paid, event);
+        outcome = "confirmed";
+      } else {
+        // Perdeu a corrida: outra requisição mudou o status entre a leitura e o UPDATE.
+        const current = await payRepo.findById(payment.id);
+        if (current?.status === "paid") {
+          outcome = await handleAlreadyPaid(current, event.provider, logResult);
+        } else {
+          await logResult(false, `transição inválida: status mudou para ${current?.status ?? "?"} antes de aplicar paid — ignorado`);
+          outcome = "invalid_transition";
+        }
+      }
     }
+  } else if (event.status === "cancelled" || event.status === "expired") {
+    if (!canTransition(payment.status, event.status)) {
+      // Ex.: estorno/expiração depois do pago. Antes rebaixava a venda paga.
+      await logResult(false, `transição inválida: ${payment.status} → ${event.status} — ignorada`);
+      outcome = "invalid_transition";
+    } else if (await payRepo.transitionStatus(payment.id, event.status)) {
+      await logResult(true);
+      outcome = "status_updated";
+    } else {
+      await logResult(false, `transição inválida: status mudou antes de aplicar ${event.status} — ignorada`);
+      outcome = "invalid_transition";
+    }
+  } else {
+    // pending/unknown: nada a aplicar (webhook de criação, status desconhecido).
+    await logResult(true);
+    outcome = "ignored";
   }
 
-  await payRepo.markProcessed(primaryId, event.provider, event.status);
+  await payRepo.markProcessed(idemKey, event.provider, event.status);
+  return outcome;
+}
+
+// "Pago" para uma venda que já está paga (webhook repetido com outra forma,
+// concorrente que perdeu a corrida, conciliação). Nada de push/pixel de novo.
+// Se a entrega nunca foi reivindicada (a confirmação anterior caiu entre a
+// transição e o publish), republica: receita, comissão e evento são
+// idempotentes e o subscriber do runner só entrega uma vez.
+async function handleAlreadyPaid(
+  payment: Payment,
+  provider: Provider,
+  logResult: (processed: boolean, errorMessage?: string) => Promise<void>,
+): Promise<WebhookOutcome> {
+  await logResult(true);
+  if (!payment.deliveryClaimedAt) await applyIdempotentPaidEffects(payment, provider);
+  return "already_paid";
 }
 
 // ── Helper p/ os 4 endpoints raw (lê body JSON, responde 200, processa) ─────────

@@ -336,6 +336,14 @@ const STATEMENTS: string[] = [
      WHERE t.id = ranked.id AND ranked.rn > 1`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "tracking_pixels_bot_id_provider_unique"
      ON "tracking_pixels" ("bot_id", "provider")`,
+
+  // 0021_payments_confirmation.sql — confirmação de pagamento: snapshot do
+  // split aplicado na criação do PIX (a confirmação não recalcula mais) e
+  // guarda de entrega exatamente-uma-vez do paymentPaid (at-least-once).
+  // Só colunas novas e nullable — nenhum dado existente é alterado.
+  `ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "split_snapshot" jsonb`,
+  `ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "delivery_claimed_at" timestamp with time zone`,
+  `ALTER TABLE "payments" ADD COLUMN IF NOT EXISTS "delivered_at" timestamp with time zone`,
 ];
 
 export interface SchemaFailure {

@@ -6,7 +6,6 @@ import { scheduledDelays, bots, leads, leadVariables, platformConfig } from "../
 import { telegramUpdateReceived, paymentPaid } from "../shared/events/index.js";
 import { ExecuteFlowStepUseCase } from "./application/execute-flow-step.use-case.js";
 import { ExecuteSimplifiedFunnelUseCase } from "./application/execute-simplified-funnel.use-case.js";
-import { PaymentDrizzleRepository } from "../payments/infrastructure/payment.drizzle.repository.js";
 import { decrypt } from "../shared/crypto.js";
 import { TelegramClient, TelegramApiError } from "./application/telegram.client.js";
 import { mergeLeadFields } from "./application/interpolate.js";
@@ -15,10 +14,10 @@ import { processDueRemarketing, enrollRemarketingTriggers } from "../remarketing
 import { ensureSchemaAtBoot } from "../shared/ensure-schema.js";
 import { processPendingConversionEvents } from "../bots/application/pixel-events.js";
 import { routePaidPayment } from "./application/paid-routing.js";
+import { deliverPaidOnce } from "./application/deliver-paid-once.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
-const payRepo           = new PaymentDrizzleRepository();
 
 // ── Telegram update subscriber ────────────────────────────────────────────────
 
@@ -38,12 +37,14 @@ const _sub = new Subscription(telegramUpdateReceived, "runner-process-update", {
 const _paidSub = new Subscription(paymentPaid, "runner-payment-paid", {
   handler: async (event) => {
     try {
-      const payment = await payRepo.findById(event.paymentId);
-      if (!payment) return;
-      // Simplificado: entrega itens + agenda upsells. Flow: entrega a oferta
-      // (e os bumps aceitos) e retoma pelo handle __paid. Ver routePaidPayment.
-      if (routePaidPayment(payment) === "simplified") await simplifiedFunnel.deliverPaid(payment);
-      else                                             await executeFlowStep.handlePaidOffer(payment);
+      // Tópico at-least-once: deliverPaidOnce reivindica a entrega antes (só
+      // uma mensagem entrega). Simplificado: entrega itens + agenda upsells.
+      // Flow: entrega a oferta (e os bumps aceitos) e retoma pelo handle
+      // __paid. Ver routePaidPayment.
+      await deliverPaidOnce(event.paymentId, (payment) =>
+        routePaidPayment(payment) === "simplified"
+          ? simplifiedFunnel.deliverPaid(payment)
+          : executeFlowStep.handlePaidOffer(payment));
     } catch (err) {
       console.error(`[runner] error handling paid payment ${event.paymentId}:`, err);
     }

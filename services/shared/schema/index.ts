@@ -286,6 +286,12 @@ export const payments = pgTable("payments", {
   // Snapshot do contexto de entrega do funil SIMPLIFICADO (não tem nós/funnel_offers):
   // { kind: "plan"|"upsell"|"downsell", funnelId, planId?, items: [{name, delivery_type, ...}] }
   simplifiedCtx:    jsonb("simplified_ctx"),
+  // 0021 — split aplicado no gateway na criação do PIX ({ receiver, cents, feeCents });
+  // a confirmação usa este snapshot em vez de recalcular. null = cobrança antiga.
+  splitSnapshot:     jsonb("split_snapshot"),
+  // 0021 — guarda de entrega exatamente-uma-vez do evento paymentPaid.
+  deliveryClaimedAt: timestamp("delivery_claimed_at", { withTimezone: true }),
+  deliveredAt:       timestamp("delivered_at", { withTimezone: true }),
   createdAt:        timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:        timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [

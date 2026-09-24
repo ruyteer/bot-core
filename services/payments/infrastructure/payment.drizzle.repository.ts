@@ -1,10 +1,11 @@
-import { eq, and, inArray, gte, lte, sql } from "drizzle-orm";
+import { eq, and, or, asc, inArray, isNull, gte, lt, lte, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   payments, paymentGateways, bots, leads,
   paymentWebhookLogs, processedWebhooks,
 } from "../../shared/schema/index.js";
-import type { Payment, PaymentWithMeta, SimplifiedPaymentCtx } from "../domain/payment.entity.js";
+import type { Payment, PaymentWithMeta, PaymentSplitSnapshot, SimplifiedPaymentCtx } from "../domain/payment.entity.js";
+import { allowedSourcesFor, type PaymentStatus } from "../domain/payment-status.js";
 
 /**
  * Valores aceitos em `payments.sale_type`. São EXATAMENTE os literais que o
@@ -39,6 +40,9 @@ export class PaymentDrizzleRepository {
       nodeId:           row.nodeId,
       paidHandle:       row.paidHandle,
       simplifiedCtx:    (row.simplifiedCtx as SimplifiedPaymentCtx | null) ?? null,
+      splitSnapshot:     (row.splitSnapshot as PaymentSplitSnapshot | null) ?? null,
+      deliveryClaimedAt: row.deliveryClaimedAt ?? null,
+      deliveredAt:       row.deliveredAt ?? null,
       createdAt:        row.createdAt,
       updatedAt:        row.updatedAt,
     };
@@ -63,6 +67,8 @@ export class PaymentDrizzleRepository {
     nodeId?:          string | null;
     paidHandle?:      string | null;
     simplifiedCtx?:   SimplifiedPaymentCtx | null;
+    /** Split aplicado no gateway ao gerar o PIX (createPixWithFallback → splitSnapshot). */
+    splitSnapshot?:   PaymentSplitSnapshot | null;
   }): Promise<Payment> {
     const [row] = await db.insert(payments).values({
       userId:           data.userId,
@@ -83,6 +89,7 @@ export class PaymentDrizzleRepository {
       nodeId:           data.nodeId,
       paidHandle:       data.paidHandle,
       simplifiedCtx:    data.simplifiedCtx ?? null,
+      splitSnapshot:    data.splitSnapshot ?? null,
     }).returning();
     return this.toPayment(row);
   }
@@ -167,17 +174,86 @@ export class PaymentDrizzleRepository {
   // e o webhook de confirmação — o payload chega com vários candidatos
   // plausíveis (ver application/gateway-clients.ts normalizeXWebhook) e só um
   // deles (às vezes nenhum, às vezes o "errado" primeiro) bate com o que foi
-  // gravado. Em vez de escolher um candidato e falhar, tentamos TODOS de uma
-  // vez com IN — mais barato que um loop de findByExternalId e evita o bug de
-  // "achei o webhook mas usei o campo errado" que nunca aprovava a venda.
-  async findByAnyExternalId(candidates: string[], provider: string): Promise<Payment | null> {
-    const ids = candidates.filter((c) => c && c.trim());
-    if (ids.length === 0) return null;
-    const [row] = await db.select().from(payments)
-      .where(and(inArray(payments.externalId, ids), sql`${payments.gatewayId} IN (
-        SELECT id FROM payment_gateways WHERE provider = ${provider}
-      )`));
+  // gravado. Tentamos TODOS de uma vez com IN.
+  //
+  // Devolve TODOS os pagamentos que casam, não "o primeiro": antes era um
+  // `[row]` sem ORDER BY — se um id colidisse entre dois pagamentos (dois
+  // vendedores no mesmo provider, ou candidatos diferentes do mesmo payload
+  // batendo em cobranças diferentes), confirmava um arbitrário. Quem chama
+  // (processWebhookEvent) trata mais de um resultado como ambíguo e não
+  // confirma nada. Escopo: o gateway da cobrança tem que ser do provider que
+  // mandou o webhook E do MESMO dono do pagamento (findChainForBot só usa
+  // gateways do dono do bot — um descasamento aqui é dado inconsistente, não
+  // venda legítima). Status fica de fora de propósito: a máquina de estados
+  // (transitionStatus) é quem decide o que fazer com um pagamento já pago/
+  // cancelado, e precisa enxergá-lo pra registrar a transição inválida.
+  async findAllByAnyExternalId(candidates: string[], provider: string): Promise<Payment[]> {
+    const ids = [...new Set(candidates.map((c) => (c ?? "").trim()).filter(Boolean))];
+    if (ids.length === 0) return [];
+    const rows = await db.select({ payment: payments })
+      .from(payments)
+      .innerJoin(paymentGateways, eq(paymentGateways.id, payments.gatewayId))
+      .where(and(
+        inArray(payments.externalId, ids),
+        eq(paymentGateways.provider, provider),
+        eq(paymentGateways.userId, payments.userId),
+      ))
+      .orderBy(asc(payments.createdAt), asc(payments.id))
+      .limit(10);
+    return rows.map((r) => this.toPayment(r.payment));
+  }
+
+  /**
+   * Transição de status ATÔMICA, validada pela máquina de estados
+   * (domain/payment-status.ts): `UPDATE ... WHERE status IN (<origens válidas>)
+   * RETURNING`. Devolve o pagamento atualizado, ou null se a transição não
+   * aconteceu (status atual não é uma origem válida — já pago, já cancelado —
+   * ou outra requisição concorrente chegou antes). Só quem recebe o pagamento
+   * de volta dispara os efeitos da transição (entrega, receita, push...).
+   */
+  async transitionStatus(
+    id: string,
+    to: PaymentStatus,
+    opts: { finalAmount?: number | null } = {},
+  ): Promise<Payment | null> {
+    const from = allowedSourcesFor(to);
+    if (from.length === 0) return null;
+    const now = new Date();
+    const [row] = await db.update(payments).set({
+      status:    to,
+      updatedAt: now,
+      ...(to === "paid" ? { paidAt: now, finalAmount: opts.finalAmount ?? undefined } : {}),
+    })
+      .where(and(eq(payments.id, id), inArray(payments.status, [...from])))
+      .returning();
     return row ? this.toPayment(row) : null;
+  }
+
+  /**
+   * Reivindica a entrega de um pagamento pago — o tópico paymentPaid é
+   * at-least-once e a mesma mensagem pode chegar mais de uma vez (ou ser
+   * republicada pela recuperação do webhook). Só UMA chamada recebe o
+   * pagamento de volta; as demais recebem null e não entregam.
+   *
+   * Uma reivindicação sem `delivered_at` há mais de `staleAfterMs` (processo
+   * morreu no meio da entrega) pode ser retomada — mesmo espírito da
+   * recuperação de órfãos dos scheduled_delays.
+   */
+  async claimDelivery(id: string, staleAfterMs = 10 * 60_000): Promise<Payment | null> {
+    const staleBefore = new Date(Date.now() - staleAfterMs);
+    const [row] = await db.update(payments).set({ deliveryClaimedAt: new Date() })
+      .where(and(
+        eq(payments.id, id),
+        eq(payments.status, "paid"),
+        isNull(payments.deliveredAt),
+        or(isNull(payments.deliveryClaimedAt), lt(payments.deliveryClaimedAt, staleBefore)),
+      ))
+      .returning();
+    return row ? this.toPayment(row) : null;
+  }
+
+  async markDelivered(id: string): Promise<void> {
+    await db.update(payments).set({ deliveredAt: new Date() }).where(eq(payments.id, id));
   }
 
   async markPaid(id: string, finalAmount?: number): Promise<void> {

@@ -447,10 +447,12 @@ describe("processWebhookEvent", () => {
     expect((await payRepo.findById(p.id))!.status).toBe("cancelled");
   });
 
-  it("externalId sem payment correspondente não quebra", async () => {
-    await expect(processWebhookEvent({ externalId: "nao-existe", provider: "buckpay", status: "paid", amount: 1, event: "paid" }, {})).resolves.toBeUndefined();
+  // Sem pagamento correspondente NÃO marca como processado: se o webhook chegou
+  // antes do INSERT da cobrança, a reentrega ainda precisa conseguir confirmar.
+  it("externalId sem payment correspondente não quebra e não consome a idempotência", async () => {
+    await expect(processWebhookEvent({ externalId: "nao-existe", provider: "buckpay", status: "paid", amount: 1, event: "paid" }, {})).resolves.toBe("not_found");
     const db = await testDb();
-    expect((await db.select().from(processedWebhooks).where(eq(processedWebhooks.externalId, "nao-existe"))).length).toBe(1);
+    expect((await db.select().from(processedWebhooks).where(eq(processedWebhooks.externalId, "nao-existe"))).length).toBe(0);
   });
 
   // Investigar "venda não confirmou" começa por olhar o que o provedor mandou.

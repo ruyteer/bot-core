@@ -443,6 +443,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       description:      productName,
       funnelId:         ctx.funnelId,
       simplifiedCtx:    ctx,
+      splitSnapshot:    result.splitSnapshot,
     });
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —

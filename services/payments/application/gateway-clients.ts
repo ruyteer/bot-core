@@ -380,6 +380,13 @@ export interface NormalizedWebhookEvent {
   provider:   Provider;
   status:     "paid" | "pending" | "cancelled" | "expired" | "unknown";
   amount:     number | null;
+  // Valor BRUTO pago pelo comprador (centavos), quando o payload distingue
+  // bruto de líquido. `amount` da SyncPay prefere `final_amount` (e a NexusPag
+  // cai em `net_amount`), que podem vir já descontados de taxa/split — conferir
+  // o valor pago contra o cobrado com eles recusaria vendas legítimas. A
+  // confirmação (processWebhookEvent) usa `grossAmount ?? amount`. Opcional:
+  // quem não distingue (buckpay/wiinpay, testes) só preenche `amount`.
+  grossAmount?: number | null;
   event:      string;
 }
 
@@ -413,7 +420,7 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
   // (resposta do cash-in, ver syncpayCashIn acima). SQL em produção confirmou:
   // data.id bate só 1x em 17; data.idtransaction e data.externalreference
   // NUNCA batem. Em vez de escolher um campo, tentamos todos contra o banco
-  // (processWebhookEvent -> findByAnyExternalId).
+  // (processWebhookEvent -> findAllByAnyExternalId).
   const candidates = collectCandidates(
     data.identifier, body.identifier,
     data.id, body.id,
@@ -429,12 +436,14 @@ export function normalizeSyncpayWebhook(body: Record<string, unknown>): Normaliz
   const status        = isPaid ? "paid" : isCancelled ? "cancelled" : isExpired ? "expired" : "pending";
   // amount/final_amount vêm em REAIS.
   const amountRaw     = data.final_amount ?? data.amount ?? body.amount;
+  const grossRaw      = data.amount ?? body.amount ?? data.final_amount;
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "syncpay",
     status,
     amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    grossAmount:          typeof grossRaw === "number" ? Math.round(grossRaw * 100) : null,
     event:                String((data.status ?? body.event) ?? ""),
   };
 }
@@ -488,12 +497,14 @@ export function normalizeNexuspagWebhook(body: Record<string, unknown>): Normali
   const status    = isPaid ? "paid" : statusRaw.includes("cancel") ? "cancelled" : statusRaw.includes("expir") ? "expired" : "pending";
   // amount em REAIS.
   const amountRaw = tx.amount ?? tx.net_amount ?? body.amount;
+  const grossRaw  = tx.amount ?? body.amount;
   return {
     externalId:           candidates[0] ?? "",
     externalIdCandidates: candidates,
     provider:             "nexuspag",
     status,
     amount:               typeof amountRaw === "number" ? Math.round(amountRaw * 100) : null,
+    grossAmount:          typeof grossRaw === "number" ? Math.round(grossRaw * 100) : null,
     event:                eventRaw || statusRaw,
   };
 }
