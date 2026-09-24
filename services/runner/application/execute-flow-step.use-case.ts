@@ -856,7 +856,7 @@ export class ExecuteFlowStepUseCase {
       // o clique salvo pelo /r) ou "/start src_x__m_y" (orgânico, UTMs no
       // próprio payload). Grava UTMs/click ids no lead; nunca lança.
       const startPayload = messageText.slice("/start".length).trim();
-      if (startPayload) await applyStartTracking(lead.id, startPayload);
+      if (startPayload) await applyStartTracking(lead.id, startPayload, botId);
 
       // Pixels: evento Lead no PRIMEIRO /start (o registro que acabou de entrar
       // é o nº 1). Roda depois do applyStartTracking, para o payload do clique

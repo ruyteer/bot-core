@@ -8,6 +8,34 @@ import { isPlatformAdmin } from "../shared/roles.js";
 import { putObject, getObject } from "./application/s3-client.js";
 import { isAllowedMime, matchesFileSignature, sanitizeFolder, extFromFilename } from "./application/validation.js";
 
+// Tipos que fazem sentido pré-visualizar embutido no navegador (preview no
+// editor de funil, avatar etc.). Documentos (pdf/doc/docx/texto) não têm por
+// que abrir inline — forçar download evita depender do visualizador interno
+// de cada navegador (histórico de bugs de XSS/plugin em viewers de PDF, por
+// exemplo) para conteúdo que veio de upload de usuário.
+function isInlinePreviewMime(mime: string): boolean {
+  return mime.startsWith("image/") || mime.startsWith("video/") || mime.startsWith("audio/");
+}
+
+// RFC 5987 ext-value: só attr-char sobrevive sem % — encodeURIComponent já
+// escapa a maioria (inclusive todo não-ASCII), falta só fechar '()* que ele
+// deixa passar cru.
+function encodeRFC5987(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+// Content-Disposition no formato RFC 6266: filename= com um fallback ASCII
+// (fora do intervalo imprimível, aspas e barra invertida viram "_" — a chave
+// hoje e sempre <uuid>.<ext>, mas a rota nao deve assumir isso) para
+// navegador antigo, e filename*=UTF-8''<percent-encoded> pros demais.
+function contentDispositionHeader(disposition: "inline" | "attachment", filename: string): string {
+  const asciiFallback = filename.split("").map((ch) => {
+    const code = ch.charCodeAt(0);
+    return code >= 0x20 && code <= 0x7e && ch !== '"' && ch !== "\\" ? ch : "_";
+  }).join("");
+  return `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encodeRFC5987(filename)}`;
+}
+
 // Espelha o limite que hoje só existe client-side (MediaUpload.tsx e afins,
 // checado em bytes antes do upload) — agora também reforçado aqui, já que o
 // backend passou a aceitar upload direto (antes o Supabase Storage era
@@ -138,9 +166,24 @@ export const getMedia = api.raw(
       return;
     }
 
+    // Content-Type nunca fora da allowlist de upload — o objeto só devia
+    // existir com um tipo validado, mas não confia cegamente no metadata do
+    // storage (defesa em profundidade: um valor fora do esperado vira
+    // octet-stream, que o navegador só baixa, nunca renderiza).
+    const contentType = isAllowedMime(obj.contentType) ? obj.contentType : "application/octet-stream";
+
+    // Arquivo enviado por usuário nunca pode ser sniffado pelo navegador como
+    // HTML/JS a partir do conteúdo — sem isto, um Content-Type divergente (ou
+    // um navegador que ignora o header) podia executar o corpo do arquivo no
+    // contexto da própria origem da API. Documentos forçam download
+    // (Content-Disposition: attachment) em vez de abrir inline.
+    const filename = key.split("/").pop() ?? "arquivo";
+    const disposition = isInlinePreviewMime(contentType) ? "inline" : "attachment";
     const headers: Record<string, string> = {
-      "Content-Type":  obj.contentType,
-      "Cache-Control": "public, max-age=31536000, immutable",
+      "Content-Type":             contentType,
+      "Cache-Control":            "public, max-age=31536000, immutable",
+      "X-Content-Type-Options":   "nosniff",
+      "Content-Disposition":      contentDispositionHeader(disposition, filename),
     };
     if (obj.contentLength !== undefined) headers["Content-Length"] = String(obj.contentLength);
 
