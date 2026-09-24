@@ -416,6 +416,35 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "vip_members_expires_at_idx"
      ON "vip_members" USING btree ("expires_at")
      WHERE "expires_at" IS NOT NULL AND "expired_at" IS NULL`,
+
+  // 0023_payments_pending_offer_ref_unique.sql — fecha a janela de corrida do
+  // dedupe de PIX do funil SIMPLIFICADO (auditoria de 24/09): generatePix fazia
+  // check-then-act sem lock/transação entre o SELECT de "já existe pendente" e
+  // o INSERT (com uma chamada de rede ao gateway no meio) — dois cliques
+  // concorrentes no mesmo plano/upsell/downsell geravam dois PIX. Só um
+  // "pending" por (lead_id, offer_external_ref) por vez — mesmo padrão de
+  // payments_pending_offer_unique (0014), mas pela chave do simplificado.
+  //
+  // Produção já tem grupos de (lead_id, offer_external_ref) com mais de um
+  // "pending" (o próprio bug que esta migration fecha), então o CREATE UNIQUE
+  // INDEX abaixo falharia direto neles. Antes: mantém o "pending" mais recente
+  // de cada grupo e marca os mais antigos como "expired" — nunca apaga
+  // (pagamento é registro financeiro; expired → paid continua aceito pela
+  // confirmação de pagamento). Idempotente: sem duplicata sobrando, não
+  // atualiza nada.
+  `WITH ranked AS (
+     SELECT "id", ROW_NUMBER() OVER (
+       PARTITION BY "lead_id", "offer_external_ref"
+       ORDER BY "created_at" DESC, "id" DESC
+     ) AS rn
+     FROM "payments"
+     WHERE "status" = 'pending' AND "offer_external_ref" IS NOT NULL
+   )
+   UPDATE "payments" SET "status" = 'expired', "updated_at" = now()
+   WHERE "id" IN (SELECT "id" FROM ranked WHERE rn > 1)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "payments_pending_offer_ref_unique"
+     ON "payments" USING btree ("lead_id", "offer_external_ref")
+     WHERE "status" = 'pending' AND "offer_external_ref" IS NOT NULL`,
 ];
 
 export interface SchemaFailure {

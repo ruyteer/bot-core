@@ -945,7 +945,21 @@ export class ExecuteFlowStepUseCase {
     // do orgânico): antes só o "/start" seco reiniciava o funil de um lead com
     // progresso — quem voltava por um link rastreado ficava sem resposta.
     const isStartCommand = typeof messageText === "string" && /^\/start(\s|$)/.test(messageText);
-    if (isStartCommand || !prog) {
+
+    // Progresso do funil SIMPLIFICADO: ele não navega por nós — a linha em
+    // lead_progress existe só pra pausa manual "pousar" (ver
+    // execute-simplified-funnel.use-case.ts, achado da auditoria de 24/09).
+    // Sem este check, `isStartCommand || !prog` dava falso pra sempre depois
+    // que o dono trocasse o bot de simplificado pra fluxo: `prog` continuava
+    // existindo (apontando pro funil simplificado antigo), e qualquer
+    // mensagem que não fosse `/start` ficava sem resposta — o lead parecia
+    // preso. `startFunnelForLead` já sabe reaproveitar um `prog` existente
+    // (reposiciona no trigger do NOVO funil), então só falta cair nesse
+    // ramo quando o progresso é órfão assim.
+    const progIsSimplified = prog
+      ? (await db.select({ kind: funnels.kind }).from(funnels).where(eq(funnels.id, prog.funnelId)))[0]?.kind === "simplified"
+      : false;
+    if (isStartCommand || !prog || progIsSimplified) {
       // Só funis de fluxo são executáveis aqui (o simplificado não tem nós).
       // orderBy + limit p/ ser determinístico quando há mais de um ativo.
       const [activeFunnel] = await db.select().from(funnels)

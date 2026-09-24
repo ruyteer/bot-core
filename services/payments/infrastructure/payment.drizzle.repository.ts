@@ -118,6 +118,26 @@ export class PaymentDrizzleRepository {
     return row ? this.toPayment(row) : null;
   }
 
+  // Pagamento PENDENTE já gerado pra este lead+refKey (oferta+bumps+valor) do
+  // funil SIMPLIFICADO — usado por generatePix (execute-simplified-funnel.use-case.ts)
+  // pra NÃO reemitir PIX quando o mesmo plano/upsell/downsell é clicado mais de
+  // uma vez antes do primeiro ser pago. refKey já muda se os bumps escolhidos
+  // mudarem, então nunca reaproveita PIX de uma combinação diferente. Some da
+  // busca assim que o webhook confirma (markPaid) ou cancela/expira
+  // (transitionStatus) o pagamento. Mesmo papel de findPendingForOffer, mas pela chave do
+  // simplificado (offer_external_ref) em vez de (node_id, paid_handle) do flow.
+  async findPendingByOfferRef(leadId: string, offerExternalRef: string): Promise<Payment | null> {
+    const [row] = await db.select().from(payments)
+      .where(and(
+        eq(payments.leadId, leadId),
+        eq(payments.offerExternalRef, offerExternalRef),
+        eq(payments.status, "pending"),
+      ))
+      .orderBy(sql`${payments.createdAt} DESC`)
+      .limit(1);
+    return row ? this.toPayment(row) : null;
+  }
+
   async findByBotIds(botIds: string[], startDate?: Date, endDate?: Date): Promise<PaymentWithMeta[]> {
     if (botIds.length === 0) return [];
 

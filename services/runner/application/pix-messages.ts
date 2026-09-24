@@ -20,12 +20,17 @@ export function replacePixVariables(
   vars: { nome?: string; valor?: string; produto?: string; descricao?: string; mensagem?: string },
 ): string {
   if (!text) return text || "";
+  // Escapa cada VALOR antes de entrar no lugar do placeholder — o template
+  // (pix_caption_template etc.) é do dono do bot e pode ter <b>/<code> de
+  // propósito, mas nome/produto podem vir de first_name do lead ou de texto
+  // livre do painel: cru, um `<`/`&` quebra o parser HTML do Telegram e a
+  // mensagem de PIX nem chega (Achado 5 da auditoria).
   return text
-    .replace(/\{nome\}/gi, vars.nome || "")
-    .replace(/\{valor\}/gi, vars.valor || "")
-    .replace(/\{produto\}/gi, vars.produto || "")
-    .replace(/\{descricao\}/gi, vars.descricao || "")
-    .replace(/\{mensagem\}/gi, vars.mensagem || "");
+    .replace(/\{nome\}/gi, escapeHtml(vars.nome || ""))
+    .replace(/\{valor\}/gi, escapeHtml(vars.valor || ""))
+    .replace(/\{produto\}/gi, escapeHtml(vars.produto || ""))
+    .replace(/\{descricao\}/gi, escapeHtml(vars.descricao || ""))
+    .replace(/\{mensagem\}/gi, escapeHtml(vars.mensagem || ""));
 }
 
 function asNonEmpty(v: unknown): string | undefined {
@@ -69,7 +74,7 @@ export async function sendPixMessages(opts: {
     ? replacePixVariables(customCaption, pixVars)
     : opts.fallback === "flow"
       ? `💠 <b>${escapeHtml(productName)}</b>\nValor: R$ ${amountReais.toFixed(2)}\n\nPague com o PIX copia-e-cola abaixo 👇`
-      : `🛒 ${productName}\n\n💰 Total: ${fmtBRL(amountReais)}\n\nEscaneie o QR Code para pagar!`;
+      : `🛒 ${escapeHtml(productName)}\n\n💰 Total: ${fmtBRL(amountReais)}\n\nEscaneie o QR Code para pagar!`;
 
   // Flow sem pix_copy_text: só o <code> (comportamento legado). Simplificado
   // sempre tem um texto de copia (configurado ou fallback).
@@ -80,9 +85,7 @@ export async function sendPixMessages(opts: {
       : "👆 Ou copie o código acima e cole no app do seu banco.";
 
   const sendMode = payCfg.pix_send_mode === "combined" ? "combined" : "separate";
-  const pixCodeHtml = opts.fallback === "flow"
-    ? `<code>${escapeHtml(pixCode)}</code>`
-    : `<code>${pixCode}</code>`;
+  const pixCodeHtml = `<code>${escapeHtml(pixCode)}</code>`;
   const copyButtonMarkup = pixCopyButtonMarkup(
     pixCode,
     typeof payCfg.pix_copy_button_label === "string" ? payCfg.pix_copy_button_label : undefined,

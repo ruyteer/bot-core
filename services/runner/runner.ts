@@ -219,6 +219,24 @@ async function recoverStuckProcessingDelays(): Promise<void> {
   }
 }
 
+// Mesma recuperação, agora pra tarefas do funil SIMPLIFICADO (upsell/downsell)
+// — o claim atômico de processDueTasks (execute-simplified-funnel.use-case.ts)
+// também marca "processing" antes de executar; sem isso, uma tarefa presa por
+// um processo morto no meio ficaria órfã para sempre.
+async function recoverStuckSimplifiedTasks(): Promise<void> {
+  try {
+    const res = await db.execute(sql`
+      UPDATE simplified_scheduled_tasks SET status = 'pending'
+      WHERE status = 'processing' AND execute_at < now() - interval '10 minutes'
+    `);
+    if ((res.rowCount ?? 0) > 0) {
+      console.log(`[runner] ${res.rowCount} tarefa(s) simplificada(s) presa(s) em processing devolvida(s) à fila`);
+    }
+  } catch (err) {
+    console.error("[runner] recuperação de tarefas simplificadas presas falhou:", err);
+  }
+}
+
 // ── Resgate one-shot dos delays mortos pelo incidente de 429 (2026-08-07) ────
 // Delays marcados "failed" nas últimas 24h eram, na maioria, 429 do Telegram —
 // os leads não receberam NADA, então reprocessar é o correto. Escalonados a 2s
@@ -347,6 +365,7 @@ async function tickSlow(): Promise<void> {
       const enrolled = await enrollRemarketingTriggers();
       const rmk = await processDueRemarketing();
       await recoverStuckProcessingDelays();
+      await recoverStuckSimplifiedTasks();
       const px = await processPendingConversionEvents();
       const vipExpired = await expireDueVipMemberships();
       if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);

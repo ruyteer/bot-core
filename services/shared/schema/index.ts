@@ -338,6 +338,13 @@ export const payments = pgTable("payments", {
   uniqueIndex("payments_pending_offer_unique")
     .on(t.leadId, t.nodeId, t.paidHandle)
     .where(sql`${t.status} = 'pending'`),
+  // Mesma proteção, pra chave do funil SIMPLIFICADO (que não tem node_id/
+  // paid_handle — é interpretado, sem nós): só um "pending" por (lead_id,
+  // offer_external_ref) por vez. offer_external_ref só é preenchido pelo
+  // simplificado, então não colide com a constraint acima (migration 0023).
+  uniqueIndex("payments_pending_offer_ref_unique")
+    .on(t.leadId, t.offerExternalRef)
+    .where(sql`${t.status} = 'pending' AND ${t.offerExternalRef} IS NOT NULL`),
 ]);
 
 export const paymentWebhookLogs = pgTable("payment_webhook_logs", {
