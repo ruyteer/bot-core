@@ -1,10 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   createPix,
   normalizeSyncpayWebhook, normalizeBuckpayWebhook,
   normalizeNexuspagWebhook, normalizeWiinpayWebhook,
   __resetSyncpayWebhookCacheForTests,
+  GATEWAY_TIMEOUT_MS,
 } from "./application/gateway-clients.js";
 import { resolveEffectiveSplit } from "./application/split-config.js";
 import { PaymentDrizzleRepository } from "./infrastructure/payment.drizzle.repository.js";
@@ -17,7 +18,7 @@ import {
 } from "../shared/schema/index.js";
 import { createBot, createGateway, createLead, createProfile } from "../../test/helpers/seed.js";
 import { published } from "../../test/stubs/encore-pubsub.js";
-import { forceGatewayError, getOtherCalls } from "../../test/helpers/fetch-mock.js";
+import { forceGatewayError, forceGatewayTimeout, getOtherCalls } from "../../test/helpers/fetch-mock.js";
 import { createPixWithFallback } from "./application/create-pix-with-fallback.js";
 
 const payRepo = new PaymentDrizzleRepository();
@@ -68,6 +69,82 @@ describe("createPix", () => {
   }
 });
 
+// ── Timeout de rede nos clientes de gateway ─────────────────────────────────
+// Antes desta correção, os `fetch` para syncpay/buckpay/nexuspag/wiinpay não
+// tinham nenhum timeout/AbortSignal. Isso não travava "pra sempre" — o fetch
+// nativo (undici) desiste sozinho de uma conexão parada depois de ~300s —,
+// mas era tempo demais: este fluxo roda dentro do handler de uma assinatura
+// pubsub AT-LEAST-ONCE (`runner-process-update`, ver runner.ts), e estourar o
+// prazo de ack faz o Encore reentregar o evento e reprocessar a compra do
+// zero. Estes testes falham sem o timeout: sem runWithGatewayTimeout,
+// `advanceTimersByTimeAsync` avançaria o relógio e a promise continuaria
+// pendurada, e o `await` do teste travaria até o próprio timeout do vitest
+// (nunca cumprindo `rejects.toThrow`).
+describe("gateway HTTP clients — timeout de rede", () => {
+  // toFake restrito a estes dois: useFakeTimers "cru" também finge Date/
+  // process.hrtime/etc, o que arrisca interferir com o PGlite (testDb) e com
+  // o cálculo de prazo por Date.now() em create-pix-with-fallback.ts.
+  const fakeTimersOpts: Parameters<typeof vi.useFakeTimers>[0] = { toFake: ["setTimeout", "clearTimeout"] };
+
+  const CASES = [
+    { p: "syncpay",  frag: "cash-in" },
+    { p: "buckpay",  frag: "realtechdev" },
+    { p: "nexuspag", frag: "nexuspag" },
+    { p: "wiinpay",  frag: "wiinpay" },
+  ] as const;
+
+  for (const { p, frag } of CASES) {
+    it(`${p}: gateway sem resposta rejeita com erro claro em vez de travar o handler`, async () => {
+      forceGatewayTimeout(frag);
+      vi.useFakeTimers(fakeTimersOpts);
+      try {
+        const promise = createPix(p, `client-timeout-${p}`, "secret", 1990, "Produto", "https://wh");
+        // Registra o listener de rejeição ANTES de avançar o relógio, senão o
+        // Node reclama de unhandled rejection entre o abort e o `await`.
+        const assertion = expect(promise).rejects.toThrow(/tempo limite excedido/i);
+        // O setTimeout de runWithGatewayTimeout é criado de forma síncrona
+        // (antes do primeiro await), mas esperar ele existir antes de avançar
+        // o relógio é mais robusto que confiar nessa ordem de execução.
+        await vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0));
+        await vi.advanceTimersByTimeAsync(GATEWAY_TIMEOUT_MS);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it("createPixWithFallback: um gateway travado não impede o fallback pro próximo da cadeia", async () => {
+    const seller = await createProfile();
+    const gwSyncpayId = await createGateway({ userId: seller, provider: "syncpay" });
+    const gwBuckpayId = await createGateway({ userId: seller, provider: "buckpay" });
+    const chain = [
+      (await gwRepo.findByIdOwned(gwSyncpayId, seller))!,
+      (await gwRepo.findByIdOwned(gwBuckpayId, seller))!,
+    ];
+    forceGatewayTimeout("cash-in"); // só a SyncPay (1º da cadeia) trava
+
+    vi.useFakeTimers(fakeTimersOpts);
+    try {
+      const promise = createPixWithFallback(chain, {
+        amountCents: 1000, description: "P", webhookUrl: () => "https://wh", ownerUserId: seller,
+      });
+      // O orçamento do 1º gateway (GATEWAY_TIMEOUT_MS) é o que precisa
+      // esgotar pra cair no fallback; o 2º (BuckPay) responde na hora pelo
+      // mock, sem precisar de mais avanço de relógio.
+      await vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0));
+      await vi.advanceTimersByTimeAsync(GATEWAY_TIMEOUT_MS);
+      const result = await promise;
+      expect(result?.gateway.provider).toBe("buckpay"); // caiu pro fallback, lead não fica preso
+      expect(result?.failures).toHaveLength(1);
+      expect(result?.failures[0].provider).toBe("syncpay");
+      expect(result?.failures[0].error).toMatch(/tempo limite excedido/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // ── SyncPay: registro do webhook na conta ───────────────────────────────────
 // A SyncPay ignora o webhook_url do cash-in: sem POST /webhooks registrado na
 // conta, a confirmação de venda nunca chega. O evento registrado é "all":
@@ -76,6 +153,10 @@ describe("syncpay — registro automático do webhook", () => {
   it("primeiro PIX registra o webhook; o segundo usa o cache e não repete", async () => {
     __resetSyncpayWebhookCacheForTests();
     await createPix("syncpay", "client_a", "secret", 1990, "Produto", "https://core/payments/webhook/syncpay");
+    // ensureSyncpayWebhook não bloqueia mais o cash-in (roda em paralelo, sem
+    // await) — createPix já resolveu antes dela necessariamente terminar.
+    // Um tick vazio deixa o mock (só promises, sem timer real) drenar.
+    await new Promise((r) => setImmediate(r));
 
     const posts = getOtherCalls().filter((c) =>
       c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "all");
@@ -87,6 +168,7 @@ describe("syncpay — registro automático do webhook", () => {
     });
 
     await createPix("syncpay", "client_a", "secret", 500, "Outro", "https://core/payments/webhook/syncpay");
+    await new Promise((r) => setImmediate(r));
     const postsAfter = getOtherCalls().filter((c) =>
       c.url.includes("/api/partner/v1/webhooks") && c.body?.event === "all");
     expect(postsAfter).toHaveLength(1); // cache — não registra de novo
