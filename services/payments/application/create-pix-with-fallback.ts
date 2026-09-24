@@ -1,4 +1,4 @@
-import { createPix, platformSplitCents } from "./gateway-clients.js";
+import { createPix, platformSplitCents, GATEWAY_TIMEOUT_MS } from "./gateway-clients.js";
 import { resolveEffectiveSplit } from "./split-config.js";
 import { GatewayDrizzleRepository } from "../infrastructure/gateway.drizzle.repository.js";
 import { saveGatewayRef } from "./verify-with-gateway.js";
@@ -6,6 +6,16 @@ import type { PaymentGateway, PixPaymentResult } from "../domain/gateway.entity.
 import type { PaymentSplitSnapshot } from "../domain/payment.entity.js";
 
 const gwRepo = new GatewayDrizzleRepository();
+
+// Teto pra cadeia de fallback INTEIRA (soma de todas as tentativas, não só a
+// primeira) — abaixo do prazo de ack da assinatura pubsub AT-LEAST-ONCE que
+// aciona este fluxo (`runner-process-update`, ver runner.ts): estourar esse
+// prazo faz o Encore reentregar o evento e o handler reprocessar a compra
+// inteira do zero. Cada gateway tentado usa o que sobrar desse teto (até
+// GATEWAY_TIMEOUT_MS) — sem isso, uma cadeia de 2 gateways que os dois
+// travassem gastaria até 2x GATEWAY_TIMEOUT_MS somados (40s), estourando
+// qualquer prazo de ack razoável.
+const GATEWAY_CHAIN_TIMEOUT_MS = 24_000;
 
 export interface PixWithFallbackResult {
   gateway: PaymentGateway;
@@ -43,8 +53,21 @@ export async function createPixWithFallback(
   if (chain.length === 0) return null;
 
   const failures: PixWithFallbackResult["failures"] = [];
+  // Prazo-limite (timestamp) da cadeia inteira — ver GATEWAY_CHAIN_TIMEOUT_MS.
+  const chainDeadline = Date.now() + GATEWAY_CHAIN_TIMEOUT_MS;
 
   for (const gw of chain) {
+    const remainingMs = chainDeadline - Date.now();
+    if (remainingMs <= 0) {
+      // As tentativas anteriores já esgotaram o teto da cadeia inteira — não
+      // vale tentar mais um gateway com orçamento zero/negativo. Registra e
+      // para por aqui em vez de seguir tentando os demais (mesmo destino).
+      failures.push({
+        gatewayId: gw.id, provider: gw.provider,
+        error: `pulado: teto de ${GATEWAY_CHAIN_TIMEOUT_MS}ms da cadeia de fallback já esgotado pelas tentativas anteriores`,
+      });
+      break;
+    }
     try {
       const { clientId, clientSecret } = gwRepo.decryptCredentials(gw);
       // Resolvido por gateway: cada um pode ter uma configuração de split
@@ -53,7 +76,7 @@ export async function createPixWithFallback(
       const pix = await createPix(
         gw.provider, clientId, clientSecret,
         opts.amountCents, opts.description, opts.webhookUrl(gw.provider),
-        { split },
+        { split, timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, remainingMs) },
       );
       // Chave de consulta no gateway (BuckPay): sem ela a conciliação não
       // consegue perguntar o status desta cobrança. Não derruba o PIX — o

@@ -23,34 +23,73 @@ function errMsg(...cands: unknown[]): string {
   return "erro desconhecido do gateway";
 }
 
-// Timeout de rede para TODA chamada aos gateways de pagamento. Sem isso, um
-// gateway lento (ou que simplesmente não responde) deixava o fetch pendurado
-// pra sempre: a promise nunca resolve nem rejeita, então o lead fica travado
-// esperando o PIX (e, no runner, o tick inteiro trava atrás dele — nenhum
-// outro lead avança). Com o timeout, o fetch rejeita depois de
-// GATEWAY_FETCH_TIMEOUT_MS com um erro claro, e quem chama (createPix /
-// createPixWithFallback) já sabe tratar essa falha: cai pro próximo gateway
-// da cadeia ou avisa o lead sem travar nada. Mesmo padrão (AbortController +
-// setTimeout) já usado em runner/application/telegram.client.ts#call.
-const GATEWAY_FETCH_TIMEOUT_MS = 15_000;
+// Orçamento total por OPERAÇÃO de gateway (uma chamada a createPix pra um
+// provider) — não por requisição HTTP individual. A SyncPay encadeia até 3
+// chamadas em série numa única operação de cash-in (token, ensureWebhook em
+// paralelo à parte, cash-in em si); um timeout por chamada isolada somaria
+// até 2-3x esse valor no pior caso. Um único AbortController, criado uma vez
+// por operação (runWithGatewayTimeout abaixo) e compartilhado entre as
+// chamadas HTTP dela, cobre a operação inteira do início ao fim — headers E
+// corpo da resposta inclusive: o timer só é limpo depois que a função inteira
+// termina (sucesso ou erro), nunca logo após o primeiro fetch retornar os
+// headers (senão uma leitura de corpo lenta ficava sem proteção nenhuma).
+//
+// O `fetch` nativo do Node (undici) não fica pendurado "pra sempre" sozinho —
+// ele desiste de uma conexão parada por conta própria depois de ~300s — mas
+// isso ainda é tempo demais aqui: este código roda dentro do handler de uma
+// assinatura pubsub AT-LEAST-ONCE (`runner-process-update`, ver runner.ts).
+// Estourar o prazo de ack da assinatura faz o Encore reentregar o evento e o
+// handler reprocessar a compra inteira do zero.
+//
+// Valor default do orçamento por gateway; createPixWithFallback (que decide a
+// cadeia de fallback) encolhe esse valor pros gateways seguintes da cadeia,
+// pra nunca deixar a SOMA de todas as tentativas passar do teto da cadeia
+// inteira (ver GATEWAY_CHAIN_TIMEOUT_MS lá).
+export const GATEWAY_TIMEOUT_MS = 20_000;
 
-// Wrapper fino sobre `fetch` que aplica o timeout acima e troca o AbortError
-// genérico do runtime (mensagem só "This operation was aborted") por um erro
-// que já identifica o gateway e o tempo esgotado — sem isso o log não dá pra
-// saber qual chamada travou.
-async function fetchWithTimeout(gatewayLabel: string, url: string, init: RequestInit): Promise<Response> {
+// Roda `fn` com um AbortSignal compartilhado que dispara depois de
+// `timeoutMs` — `fn` deve passar esse signal pra TODA chamada HTTP que fizer
+// (podem ser várias em sequência). O timer só é limpo no `finally`, depois de
+// `fn` terminar (sucesso ou erro) — inclusive depois de qualquer leitura de
+// corpo (`res.json()`/`res.text()`) que `fn` tenha feito, não só depois dos
+// headers da primeira chamada. Troca o AbortError/TimeoutError genérico do
+// runtime (mensagem só "This operation was aborted") por um erro que já
+// identifica o gateway e o tempo esgotado — sem isso o log não dá pra saber
+// qual operação travou.
+async function runWithGatewayTimeout<T>(
+  gatewayLabel: string, timeoutMs: number, fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GATEWAY_FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fn(controller.signal);
   } catch (err) {
     const name = err instanceof Error ? err.name : "";
     if (name === "AbortError" || name === "TimeoutError") {
-      throw new Error(`${gatewayLabel}: tempo limite excedido (${GATEWAY_FETCH_TIMEOUT_MS}ms) ao chamar ${url}`);
+      throw new Error(`${gatewayLabel}: tempo limite excedido (${timeoutMs}ms)`);
     }
     throw err;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// A chamada que CRIA a cobrança é a única com efeito colateral mesmo sem
+// resposta: se o timeout estourar bem nessa hora (fetch rejeita com abort),
+// o gateway PODE já ter criado a cobrança do lado dele antes da gente saber o
+// pix_code/id. Não tem como recuperar esse PIX órfão daqui — nenhum provider
+// expõe idempotency key nem busca por payload —, então só registramos pra
+// diagnóstico: se aparecer uma cobrança "fantasma" na conta do gateway sem
+// nenhum payment nosso correspondente, é por aqui.
+async function fetchChargeCreation(gatewayLabel: string, url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    console.error(
+      `[${gatewayLabel.toLowerCase()}] falha ao criar a cobrança (se foi timeout, o gateway PODE já ter criado a cobrança sem a gente ter recebido a resposta)`,
+      { url, err },
+    );
+    throw err;
   }
 }
 
@@ -104,11 +143,12 @@ export function platformSplitCents(provider: Provider, amountCents: number, targ
 // Domínio antigo api.syncpay.pro está MORTO; o atual é api.syncpayments.com.br.
 const SYNCPAY_BASE = "https://api.syncpayments.com.br";
 
-async function syncpayToken(clientId: string, clientSecret: string): Promise<string> {
-  const res = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/auth-token`, {
+async function syncpayToken(clientId: string, clientSecret: string, signal: AbortSignal): Promise<string> {
+  const res = await fetch(`${SYNCPAY_BASE}/api/partner/v1/auth-token`, {
     method:  "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+    signal,
   });
   const data = await res.json() as { access_token?: string; message?: string };
   if (!data.access_token) throw new Error(data.message ?? "SyncPay auth failed");
@@ -132,53 +172,62 @@ async function syncpayToken(clientId: string, clientSecret: string): Promise<str
 const syncpayWebhookEnsured = new Set<string>();
 export function __resetSyncpayWebhookCacheForTests(): void { syncpayWebhookEnsured.clear(); }
 
+// Tem seu PRÓPRIO orçamento/timeout, independente do da operação de cash-in
+// que a chama (ver syncpayCashIn abaixo) — desde que ela passou a não esperar
+// esta função terminar, o timer da operação principal pode ser limpo antes
+// desta aqui acabar, e ela ficaria sem proteção nenhuma se dependesse dele.
 async function ensureSyncpayWebhook(token: string, clientId: string, webhookUrl: string): Promise<void> {
   if (syncpayWebhookEnsured.has(clientId)) return;
   try {
-    const listRes = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
-      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-    });
-    const listData = await listRes.json().catch(() => null) as unknown;
-    const rows: Array<Record<string, unknown>> =
-      Array.isArray(listData) ? listData as Array<Record<string, unknown>>
-      : Array.isArray((listData as { data?: unknown })?.data) ? (listData as { data: Array<Record<string, unknown>> }).data
-      : [];
-    // Exige "all" especificamente: uma conta com só "cashin" registrado (do
-    // código antigo, ou de uma tentativa anterior) NÃO conta como "resolvido"
-    // — é exatamente a configuração que causava o bug de vendas nunca aprovadas.
-    const exists = rows.some((w) => String(w.url ?? "") === webhookUrl && String(w.event ?? "") === "all");
-
-    if (!exists) {
-      const createRes = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          title: "OrionBot — confirmação de venda (todos os eventos)",
-          url:   webhookUrl,
-          event: "all",
-          trigger_all_products: true,
-        }),
+    await runWithGatewayTimeout("SyncPay", GATEWAY_TIMEOUT_MS, async (signal) => {
+      const listRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+        signal,
       });
-      const responseBody = await createRes.text().catch(() => "");
-      if (!createRes.ok) {
-        // Alto-falante: sem esse cadastro NENHUMA venda deste gateway é
-        // aprovada, e isso não derruba nada — precisa aparecer bem alto nos
-        // logs do Railway pra diagnóstico. Sem cache → tenta de novo no
-        // próximo PIX deste mesmo processo (não fica preso num estado de
-        // "falhou pra sempre" até o processo reiniciar).
-        console.error("[syncpay] registro do webhook FALHOU — vendas deste gateway não serão aprovadas até isso ser corrigido", {
+      const listData = await listRes.json().catch(() => null) as unknown;
+      const rows: Array<Record<string, unknown>> =
+        Array.isArray(listData) ? listData as Array<Record<string, unknown>>
+        : Array.isArray((listData as { data?: unknown })?.data) ? (listData as { data: Array<Record<string, unknown>> }).data
+        : [];
+      // Exige "all" especificamente: uma conta com só "cashin" registrado (do
+      // código antigo, ou de uma tentativa anterior) NÃO conta como "resolvido"
+      // — é exatamente a configuração que causava o bug de vendas nunca aprovadas.
+      const exists = rows.some((w) => String(w.url ?? "") === webhookUrl && String(w.event ?? "") === "all");
+
+      if (!exists) {
+        const createRes = await fetch(`${SYNCPAY_BASE}/api/partner/v1/webhooks`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            title: "OrionBot — confirmação de venda (todos os eventos)",
+            url:   webhookUrl,
+            event: "all",
+            trigger_all_products: true,
+          }),
+          signal,
+        });
+        const responseBody = await createRes.text().catch(() => "");
+        if (!createRes.ok) {
+          // Alto-falante: sem esse cadastro NENHUMA venda deste gateway é
+          // aprovada, e isso não derruba nada — precisa aparecer bem alto nos
+          // logs do Railway pra diagnóstico. Sem cache → tenta de novo no
+          // próximo PIX deste mesmo processo (não fica preso num estado de
+          // "falhou pra sempre" até o processo reiniciar).
+          console.error("[syncpay] registro do webhook FALHOU — vendas deste gateway não serão aprovadas até isso ser corrigido", {
+            clientId, webhookUrl, event: "all", status: createRes.status, responseBody,
+          });
+          return;
+        }
+        console.log("[syncpay] webhook registrado com sucesso", {
           clientId, webhookUrl, event: "all", status: createRes.status, responseBody,
         });
-        return;
       }
-      console.log("[syncpay] webhook registrado com sucesso", {
-        clientId, webhookUrl, event: "all", status: createRes.status, responseBody,
-      });
-    }
-    syncpayWebhookEnsured.add(clientId);
+      syncpayWebhookEnsured.add(clientId);
+    });
   } catch (err) {
-    // Exceção (rede, parse, etc.) — também não cacheia, também retryable.
-    console.error("[syncpay] ensureWebhook falhou com exceção — nova tentativa no próximo PIX", {
+    // Exceção (rede, timeout, parse, etc.) — também não cacheia, também
+    // retryable no próximo PIX deste mesmo processo.
+    console.error("[syncpay] ensureWebhook falhou — nova tentativa no próximo PIX", {
       clientId, webhookUrl, err,
     });
   }
@@ -188,32 +237,42 @@ export async function syncpayCashIn(
   clientId: string, clientSecret: string,
   amountCents: number, description: string, webhookUrl: string,
   split?: EffectiveSplit | null,
+  timeoutMs = GATEWAY_TIMEOUT_MS,
 ): Promise<PixPaymentResult> {
-  const token = await syncpayToken(clientId, clientSecret);
-  await ensureSyncpayWebhook(token, clientId, webhookUrl);
-  const body: Record<string, unknown> = {
-    amount:      amountCents / 100, // reais
-    description,
-    webhook_url: webhookUrl,
-  };
-  if (split) {
-    body.split = [{ percentage: syncpaySplitPercentage(amountCents, split.cents), user_id: split.receiver }];
-  }
-  const res = await fetchWithTimeout("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/cash-in`, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
+  return runWithGatewayTimeout("SyncPay", timeoutMs, async (signal) => {
+    const token = await syncpayToken(clientId, clientSecret, signal);
+    // Não aguarda: o cadastro do webhook só precisa existir ANTES da
+    // confirmação chegar (quando o PIX for pago), não antes do PIX ser
+    // gerado. Bloquear o cash-in nisso atrasava (e podia até estourar o
+    // orçamento da operação) por causa de uma chamada que não precisa
+    // acontecer agora — ensureSyncpayWebhook roda em paralelo, com seu
+    // PRÓPRIO timeout, e nunca lança (trata os próprios erros).
+    void ensureSyncpayWebhook(token, clientId, webhookUrl);
+    const body: Record<string, unknown> = {
+      amount:      amountCents / 100, // reais
+      description,
+      webhook_url: webhookUrl,
+    };
+    if (split) {
+      body.split = [{ percentage: syncpaySplitPercentage(amountCents, split.cents), user_id: split.receiver }];
+    }
+    const res = await fetchChargeCreation("SyncPay", `${SYNCPAY_BASE}/api/partner/v1/cash-in`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const data = await res.json() as { pix_code?: string; identifier?: string; message?: string };
+    if (!data.pix_code || !data.identifier) throw new Error(data.message ?? "SyncPay cashin failed");
+    return {
+      pixCode:     data.pix_code,
+      qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.pix_code)}`,
+      externalId:  data.identifier,
+      amount:      amountCents,
+      provider:    "syncpay",
+      institution: "SyncPay",
+    };
   });
-  const data = await res.json() as { pix_code?: string; identifier?: string; message?: string };
-  if (!data.pix_code || !data.identifier) throw new Error(data.message ?? "SyncPay cashin failed");
-  return {
-    pixCode:     data.pix_code,
-    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.pix_code)}`,
-    externalId:  data.identifier,
-    amount:      amountCents,
-    provider:    "syncpay",
-    institution: "SyncPay",
-  };
 }
 
 // ── BuckPay ───────────────────────────────────────────────────────────────────
@@ -227,57 +286,61 @@ export async function buckpayCashIn(
   apiToken: string,
   amountCents: number, description: string, webhookUrl: string,
   split?: EffectiveSplit | null,
+  timeoutMs = GATEWAY_TIMEOUT_MS,
 ): Promise<PixPaymentResult> {
   // O `external_id` que NÓS mandamos é a única chave de consulta que a BuckPay
   // oferece (GET /v1/transactions/external_id/{external_id}) — o `id` interno
   // que gravamos em payments.external_id não serve pra consultar. Devolvido
   // como `gatewayRef` pra conciliação poder confirmar a cobrança no gateway.
   const externalRef = randomUUID();
-  const body: Record<string, unknown> = {
-    external_id:    externalRef,
-    payment_method: "pix",
-    amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
-    postbackUrl:    webhookUrl,
-  };
-  if (split) {
-    // Split por e-mail + valor fixo em centavos (`amount_cents`, min. 1 centavo)
-    // — a Buck passou a suportar valor fixo além do percentual em bps, o que
-    // elimina a aproximação que antes convertia os 40c fixos pra um percentual
-    // (bug: não bate exato pra cada ticket). O recebedor precisa estar
-    // cadastrado na Buck.
-    body.splits = [{ email: split.receiver, amount_cents: split.cents }];
-  }
-  const res = await fetchWithTimeout("BuckPay", `${BUCKPAY_BASE_URL}/v1/transactions`, {
-    method:  "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent":   BUCKPAY_USER_AGENT,
-      Authorization:  `Bearer ${apiToken}`,
-    },
-    body: JSON.stringify(body),
+  return runWithGatewayTimeout("BuckPay", timeoutMs, async (signal) => {
+    const body: Record<string, unknown> = {
+      external_id:    externalRef,
+      payment_method: "pix",
+      amount:         Math.round(amountCents), // centavos, inteiro (mín. 600)
+      postbackUrl:    webhookUrl,
+    };
+    if (split) {
+      // Split por e-mail + valor fixo em centavos (`amount_cents`, min. 1 centavo)
+      // — a Buck passou a suportar valor fixo além do percentual em bps, o que
+      // elimina a aproximação que antes convertia os 40c fixos pra um percentual
+      // (bug: não bate exato pra cada ticket). O recebedor precisa estar
+      // cadastrado na Buck.
+      body.splits = [{ email: split.receiver, amount_cents: split.cents }];
+    }
+    const res = await fetchChargeCreation("BuckPay", `${BUCKPAY_BASE_URL}/v1/transactions`, {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":   BUCKPAY_USER_AGENT,
+        Authorization:  `Bearer ${apiToken}`,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const json = await res.json() as {
+      data?:  { id?: string; pix?: { code?: string; qrcode_base64?: string } };
+      error?: { message?: string; detail?: unknown };
+      message?: string;
+    };
+    const tx = json.data;
+    if (!res.ok || !tx?.id || !tx.pix?.code) {
+      const msg    = json.error?.message ?? json.message ?? "BuckPay cashin failed";
+      const detail = json.error?.detail ? ` detail=${JSON.stringify(json.error.detail)}` : "";
+      throw new Error(`BuckPay ${res.status}: ${msg}${detail}`);
+    }
+    return {
+      pixCode:     tx.pix.code,
+      // A API devolve o QR em base64, mas o Telegram só aceita URL/file_id no campo
+      // `photo` (não data-URI), então gera a imagem via qrserver a partir do código.
+      qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
+      externalId:  String(tx.id),
+      gatewayRef:  externalRef,
+      amount:      amountCents,
+      provider:    "buckpay",
+      institution: "BuckPay",
+    };
   });
-  const json = await res.json() as {
-    data?:  { id?: string; pix?: { code?: string; qrcode_base64?: string } };
-    error?: { message?: string; detail?: unknown };
-    message?: string;
-  };
-  const tx = json.data;
-  if (!res.ok || !tx?.id || !tx.pix?.code) {
-    const msg    = json.error?.message ?? json.message ?? "BuckPay cashin failed";
-    const detail = json.error?.detail ? ` detail=${JSON.stringify(json.error.detail)}` : "";
-    throw new Error(`BuckPay ${res.status}: ${msg}${detail}`);
-  }
-  return {
-    pixCode:     tx.pix.code,
-    // A API devolve o QR em base64, mas o Telegram só aceita URL/file_id no campo
-    // `photo` (não data-URI), então gera a imagem via qrserver a partir do código.
-    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix.code)}`,
-    externalId:  String(tx.id),
-    gatewayRef:  externalRef,
-    amount:      amountCents,
-    provider:    "buckpay",
-    institution: "BuckPay",
-  };
 }
 
 // ── NexusPag ──────────────────────────────────────────────────────────────────
@@ -288,40 +351,44 @@ export async function nexuspagCashIn(
   apiKey: string,
   amountCents: number, description: string, webhookUrl: string,
   split?: EffectiveSplit | null,
+  timeoutMs = GATEWAY_TIMEOUT_MS,
 ): Promise<PixPaymentResult> {
-  const body: Record<string, unknown> = {
-    amount:      amountCents / 100, // reais
-    description,
-    external_id: randomUUID(),
-    webhook_url: webhookUrl,
-  };
-  if (split) {
-    // Valor fixo em reais (split user-to-user entre contas da plataforma).
-    body.split = [{ user_id: split.receiver, amount: split.cents / 100 }];
-  }
-  const res = await fetchWithTimeout("NexusPag", `${NEXUSPAG_BASE}/api/pix/create`, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": apiKey },
-    body: JSON.stringify(body),
+  return runWithGatewayTimeout("NexusPag", timeoutMs, async (signal) => {
+    const body: Record<string, unknown> = {
+      amount:      amountCents / 100, // reais
+      description,
+      external_id: randomUUID(),
+      webhook_url: webhookUrl,
+    };
+    if (split) {
+      // Valor fixo em reais (split user-to-user entre contas da plataforma).
+      body.split = [{ user_id: split.receiver, amount: split.cents / 100 }];
+    }
+    const res = await fetchChargeCreation("NexusPag", `${NEXUSPAG_BASE}/api/pix/create`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const json = await res.json() as {
+      success?:     boolean;
+      transaction?: { id?: string; txid?: string; pix_copia_cola?: string; qr_code_base64?: string };
+      message?:     string;
+      error?:       string;
+    };
+    const tx = json.transaction;
+    if (!res.ok || !tx?.id || !tx.pix_copia_cola) {
+      throw new Error(errMsg(json.error, json.message, "NexusPag cashin failed"));
+    }
+    return {
+      pixCode:     tx.pix_copia_cola,
+      qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix_copia_cola)}`,
+      externalId:  String(tx.id),
+      amount:      amountCents,
+      provider:    "nexuspag",
+      institution: "NexusPag",
+    };
   });
-  const json = await res.json() as {
-    success?:     boolean;
-    transaction?: { id?: string; txid?: string; pix_copia_cola?: string; qr_code_base64?: string };
-    message?:     string;
-    error?:       string;
-  };
-  const tx = json.transaction;
-  if (!res.ok || !tx?.id || !tx.pix_copia_cola) {
-    throw new Error(errMsg(json.error, json.message, "NexusPag cashin failed"));
-  }
-  return {
-    pixCode:     tx.pix_copia_cola,
-    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(tx.pix_copia_cola)}`,
-    externalId:  String(tx.id),
-    amount:      amountCents,
-    provider:    "nexuspag",
-    institution: "NexusPag",
-  };
 }
 
 // ── WiinPay ───────────────────────────────────────────────────────────────────
@@ -333,43 +400,47 @@ export async function wiinpayCashIn(
   apiKey: string,
   amountCents: number, description: string, webhookUrl: string,
   split?: EffectiveSplit | null,
+  timeoutMs = GATEWAY_TIMEOUT_MS,
 ): Promise<PixPaymentResult> {
-  const body: Record<string, unknown> = {
-    api_key:     apiKey,
-    value:       amountCents / 100, // reais
-    // Não coletamos os dados do pagador no bot; a WiinPay só exige presença.
-    name:        "Cliente",
-    email:       "cliente@orionbot.app",
-    description,
-    webhook_url: webhookUrl,
-  };
-  if (split) {
-    // Objeto (não array), valor fixo em reais.
-    body.split = { value: split.cents / 100, user_id: split.receiver };
-  }
-  const res = await fetchWithTimeout("WiinPay", `${WIINPAY_BASE}/payment/create`, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
+  return runWithGatewayTimeout("WiinPay", timeoutMs, async (signal) => {
+    const body: Record<string, unknown> = {
+      api_key:     apiKey,
+      value:       amountCents / 100, // reais
+      // Não coletamos os dados do pagador no bot; a WiinPay só exige presença.
+      name:        "Cliente",
+      email:       "cliente@orionbot.app",
+      description,
+      webhook_url: webhookUrl,
+    };
+    if (split) {
+      // Objeto (não array), valor fixo em reais.
+      body.split = { value: split.cents / 100, user_id: split.receiver };
+    }
+    const res = await fetchChargeCreation("WiinPay", `${WIINPAY_BASE}/payment/create`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    // A resposta REAL aninha tudo em `data` e o id é `paymentId` (a doc dizia flat
+    // com `id` — confirmado errado no teste ao vivo 2026-07-25).
+    const json = await res.json() as {
+      data?:    { qr_code?: string; paymentId?: string; id?: string; message?: string };
+      message?: string; error?: string;
+    };
+    const d = json.data ?? {};
+    const pix = d.qr_code;
+    const id  = d.paymentId ?? d.id;
+    if (!res.ok || !pix || !id) throw new Error(errMsg(json.error, d.message, json.message, "WiinPay cashin failed"));
+    return {
+      pixCode:     pix,
+      qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(pix)}`,
+      externalId:  String(id),
+      amount:      amountCents,
+      provider:    "wiinpay",
+      institution: "WiinPay",
+    };
   });
-  // A resposta REAL aninha tudo em `data` e o id é `paymentId` (a doc dizia flat
-  // com `id` — confirmado errado no teste ao vivo 2026-07-25).
-  const json = await res.json() as {
-    data?:    { qr_code?: string; paymentId?: string; id?: string; message?: string };
-    message?: string; error?: string;
-  };
-  const d = json.data ?? {};
-  const pix = d.qr_code;
-  const id  = d.paymentId ?? d.id;
-  if (!res.ok || !pix || !id) throw new Error(errMsg(json.error, d.message, json.message, "WiinPay cashin failed"));
-  return {
-    pixCode:     pix,
-    qrImage:     `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(pix)}`,
-    externalId:  String(id),
-    amount:      amountCents,
-    provider:    "wiinpay",
-    institution: "WiinPay",
-  };
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -380,6 +451,11 @@ export interface CreatePixOpts {
   // createPix não decide mais split por conta própria: quem chama resolve
   // antes, senão volta a ter fontes de verdade divergentes (o bug original).
   split?: EffectiveSplit | null;
+  // Orçamento de tempo (ms) pra ESTA operação inteira (todas as chamadas HTTP
+  // que o provider precisar fazer). Default GATEWAY_TIMEOUT_MS;
+  // createPixWithFallback encolhe esse valor pros gateways seguintes da
+  // cadeia, respeitando o teto da cadeia inteira (GATEWAY_CHAIN_TIMEOUT_MS lá).
+  timeoutMs?: number;
 }
 
 export async function createPix(
@@ -392,11 +468,12 @@ export async function createPix(
   opts?: CreatePixOpts,
 ): Promise<PixPaymentResult> {
   const split = opts?.split ?? null;
+  const timeoutMs = opts?.timeoutMs ?? GATEWAY_TIMEOUT_MS;
   switch (provider) {
-    case "syncpay":  return syncpayCashIn(clientId, clientSecret, amountCents, description, webhookUrl, split);
-    case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl, split);
-    case "nexuspag": return nexuspagCashIn(clientId, amountCents, description, webhookUrl, split);
-    case "wiinpay":  return wiinpayCashIn(clientId, amountCents, description, webhookUrl, split);
+    case "syncpay":  return syncpayCashIn(clientId, clientSecret, amountCents, description, webhookUrl, split, timeoutMs);
+    case "buckpay":  return buckpayCashIn(clientId, amountCents, description, webhookUrl, split, timeoutMs);
+    case "nexuspag": return nexuspagCashIn(clientId, amountCents, description, webhookUrl, split, timeoutMs);
+    case "wiinpay":  return wiinpayCashIn(clientId, amountCents, description, webhookUrl, split, timeoutMs);
   }
 }
 

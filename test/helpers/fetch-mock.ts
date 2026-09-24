@@ -49,9 +49,10 @@ export function forceGatewayError(urlFragment: string): void {
 
 // Simula um gateway que nunca responde (TCP black hole / provedor travado):
 // a promise não resolve nem rejeita sozinha — só quando o AbortSignal que o
-// cliente passou disparar (ver gateway-clients.ts#fetchWithTimeout). Usado
-// para provar que o timeout de rede realmente desbloqueia o fetch em vez de
-// deixá-lo pendurado pra sempre.
+// cliente passou disparar (ver gateway-clients.ts#runWithGatewayTimeout).
+// Usado para provar que o timeout de rede realmente desbloqueia o fetch em
+// vez de deixar o handler que o chamou (pubsub at-least-once) esperando até o
+// próprio `fetch` desistir sozinho (~300s no undici).
 const forcedGatewayTimeouts = new Set<string>();
 export function forceGatewayTimeout(urlFragment: string): void {
   forcedGatewayTimeouts.add(urlFragment);
