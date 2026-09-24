@@ -534,18 +534,25 @@ export const upsertPixel = api(
 
     const encryptedToken = accessToken ? encrypt(accessToken) : null;
 
-    const existing = await db.select().from(trackingPixels).where(and(eq(trackingPixels.botId, id), eq(trackingPixels.provider, provider))).limit(1);
-    let row: typeof trackingPixels.$inferSelect;
-    if (existing.length) {
-      [row] = await db.update(trackingPixels).set({
-        pixelId,
-        ...(encryptedToken !== null ? { accessToken: encryptedToken } : {}),
-        ...(isActive !== undefined ? { isActive } : {}),
-        updatedAt: new Date(),
-      }).where(eq(trackingPixels.id, existing[0].id)).returning();
-    } else {
-      [row] = await db.insert(trackingPixels).values({ botId: id, provider, pixelId, accessToken: encryptedToken, isActive: isActive ?? true }).returning();
-    }
+    // Upsert atômico no índice único (bot_id, provider) — evita a corrida do
+    // select-então-insert/update antigo, onde duas chamadas PUT concorrentes
+    // liam "não existe" e as duas inseriam (duplicando o provider no bot).
+    // accessToken/isActive ausentes no PUT não apagam o valor já salvo: como o
+    // SET do ON CONFLICT não pode condicionar por parâmetro feito o UPDATE
+    // manual fazia, quando o request não manda um valor novo o SET aponta de
+    // volta para a própria coluna da linha existente (mantém o que já tinha).
+    const [row] = await db.insert(trackingPixels)
+      .values({ botId: id, provider, pixelId, accessToken: encryptedToken, isActive: isActive ?? true })
+      .onConflictDoUpdate({
+        target: [trackingPixels.botId, trackingPixels.provider],
+        set: {
+          pixelId,
+          accessToken: encryptedToken !== null ? encryptedToken : sql`${trackingPixels.accessToken}`,
+          isActive: isActive !== undefined ? (isActive ?? true) : sql`${trackingPixels.isActive}`,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
 
     return { id: row.id, provider: row.provider, pixelId: row.pixelId, isActive: row.isActive };
   },
