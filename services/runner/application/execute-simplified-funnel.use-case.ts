@@ -481,7 +481,17 @@ export class ExecuteSimplifiedFunnelUseCase {
       }
       // Valor mudou (config editada) ou passou do teto: expira p/ liberar a
       // constraint única (payments_pending_offer_ref_unique) antes do INSERT.
-      await payRepo.updateStatus(existing.id, "expired");
+      // Transição condicional (só sai de "pending"): o webhook pode confirmar
+      // o pagamento ENTRE o findPendingByOfferRef acima e esta linha — um
+      // updateStatus incondicional rebaixaria essa venda PAGA pra "expired".
+      // Mesmo padrão de handleOfferPurchase no funil de fluxo.
+      const expired = await payRepo.transitionStatus(existing.id, "expired");
+      if (!expired) {
+        const current = await payRepo.findById(existing.id);
+        // Virou paga na corrida: a entrega já vem pelo paymentPaid (webhook) —
+        // não gera outro PIX (cobraria de novo) nem agenda downsell por cima.
+        if (current?.status === "paid") return { paymentId: null };
+      }
     }
 
     // O funil não escolhe mais gateway: usa a ordem de fallback configurada no bot.

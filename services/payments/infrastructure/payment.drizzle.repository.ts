@@ -123,8 +123,8 @@ export class PaymentDrizzleRepository {
   // pra NÃO reemitir PIX quando o mesmo plano/upsell/downsell é clicado mais de
   // uma vez antes do primeiro ser pago. refKey já muda se os bumps escolhidos
   // mudarem, então nunca reaproveita PIX de uma combinação diferente. Some da
-  // busca assim que o webhook confirma (markPaid) ou cancela/expira (updateStatus)
-  // o pagamento. Mesmo papel de findPendingForOffer, mas pela chave do
+  // busca assim que o webhook confirma (markPaid) ou cancela/expira
+  // (transitionStatus) o pagamento. Mesmo papel de findPendingForOffer, mas pela chave do
   // simplificado (offer_external_ref) em vez de (node_id, paid_handle) do flow.
   async findPendingByOfferRef(leadId: string, offerExternalRef: string): Promise<Payment | null> {
     const [row] = await db.select().from(payments)
