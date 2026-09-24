@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueBroadcasts } from "./application/process-broadcasts.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
-import { scheduledMessages, broadcastRuns, broadcastDeliveries, bots, payments, leads, funnelOffers, botGroups } from "../shared/schema/index.js";
+import { scheduledMessages, broadcastRuns, broadcastDeliveries, bots, payments, leads, funnelOffers, botGroups, funnelBots } from "../shared/schema/index.js";
 import { createBot, createLead, createGateway, createFlowFunnel, createSimplifiedFunnel, getProgress } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
 import { ExecuteFlowStepUseCase } from "../runner/application/execute-flow-step.use-case.js";
@@ -473,6 +473,52 @@ describe("processDueBroadcasts — disparo inicia funil (funnelId)", () => {
     const runs = await db.select().from(broadcastRuns).where(eq(broadcastRuns.scheduledMessageId, msg.id));
     expect(runs[0].sentCount).toBe(1);
     expect(runs[0].failedCount).toBe(0);
+  });
+
+  it("disparo para vários bots: só o lead do bot que tem o funil entra nele", async () => {
+    const botA = await createBot();
+    const botB = await createBot({ userId: botA.userId });
+    const leadA = await createLead(botA.id, 9406n);
+    const leadB = await createLead(botB.id, 9407n);
+    const { funnelId } = await createFlowFunnel({
+      userId: botA.userId,
+      botId: botA.id,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    await seedMsg(botA.id, botA.userId, { message: "promo", funnelId, botIds: [botA.id, botB.id] });
+
+    await processDueBroadcasts();
+
+    // Os dois recebem o disparo; só o do bot A entra no funil.
+    expect(getSentMessages().filter((m) => m === "promo")).toHaveLength(2);
+    expect((await getProgress(leadA))?.funnelId).toBe(funnelId);
+    expect(await getProgress(leadB)).toBeUndefined();
+  });
+
+  it("bot vinculado ao funil por funnel_bots (não é o bot principal) também entra", async () => {
+    const botA = await createBot();
+    const botB = await createBot({ userId: botA.userId });
+    const leadB = await createLead(botB.id, 9408n);
+    const { funnelId } = await createFlowFunnel({
+      userId: botA.userId,
+      botId: botA.id,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    const db = await testDb();
+    await db.insert(funnelBots).values({ funnelId, botId: botB.id });
+    await seedMsg(botB.id, botB.userId, { message: "promo", funnelId });
+
+    await processDueBroadcasts();
+
+    expect((await getProgress(leadB))?.funnelId).toBe(funnelId);
   });
 
   it("grupos/canais nunca entram em funil, mesmo com funnelId no disparo", async () => {

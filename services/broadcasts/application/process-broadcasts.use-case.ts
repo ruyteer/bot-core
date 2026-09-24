@@ -2,7 +2,7 @@ import { eq, and, inArray, lte, lt, gt } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   scheduledMessages, broadcastRuns, broadcastDeliveries, bots, leads, payments, botGroups, funnelOffers,
-  funnels, funnelNodes,
+  funnels, funnelNodes, funnelBots,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -220,6 +220,11 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   // de fluxo (o simplificado não tem nós), ativo, e ter um nó `trigger`. Uma
   // vez só por disparo — não por lead — e nunca derruba o envio.
   let funnelToStart: string | null = null;
+  // Bots em que o funil está vinculado — mesma regra do runner (`belongsToBot`
+  // em execute-flow-step: `funnels.bot_id` OU `funnel_bots`). Um disparo pode
+  // ir para vários bots; o lead de um bot que não tem este funil não entra
+  // nele, senão rodaria um funil que o bot dele não usa.
+  const funnelBotIds = new Set<string>();
   if (msg.funnelId) {
     const [funnel] = await db.select().from(funnels).where(eq(funnels.id, msg.funnelId));
     if (!funnel || funnel.kind === "simplified" || !funnel.isActive) {
@@ -231,6 +236,9 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
         console.error("[broadcast] funil do disparo não tem nó trigger, leads serão notificados sem entrar em funil:", msg.id, msg.funnelId);
       } else {
         funnelToStart = funnel.id;
+        if (funnel.botId) funnelBotIds.add(funnel.botId);
+        const linked = await db.select({ botId: funnelBots.botId }).from(funnelBots).where(eq(funnelBots.funnelId, funnel.id));
+        for (const row of linked) funnelBotIds.add(row.botId);
       }
     }
   }
@@ -289,7 +297,7 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
 
         // Entrada em funil roda DEPOIS do envio, isolada do try acima: uma
         // falha aqui nunca deve virar "falha de envio" (a mensagem já saiu).
-        if (delivered && funnelToStart) {
+        if (delivered && funnelToStart && funnelBotIds.has(bot.id)) {
           try {
             await flowUseCase.startFunnelForLead({
               funnelId: funnelToStart,
