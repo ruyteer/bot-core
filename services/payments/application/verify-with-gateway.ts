@@ -6,7 +6,7 @@ import type { PaymentGateway, Provider } from "../domain/gateway.entity.js";
 import type { Payment } from "../domain/payment.entity.js";
 import type { NormalizedWebhookEvent } from "./gateway-clients.js";
 import {
-  fetchChargeStatus, GatewayStatusUnavailableError, type GatewayChargeStatus,
+  fetchChargeStatus, GatewayStatusUnavailableError, type GatewayChargeStatus, type UnavailableCode,
 } from "./gateway-status.js";
 
 // ── Confirmação de uma cobrança no gateway ──────────────────────────────────
@@ -19,13 +19,24 @@ import {
 
 const gwRepo = new GatewayDrizzleRepository();
 
+// Motivo de a verificação não ter chegado a uma resposta do gateway — vira o
+// código `verification_unavailable:<motivo>` no log de webhooks.
+export type UnavailableReason =
+  | UnavailableCode      // rede, timeout, HTTP de erro, resposta sem status, auth
+  | "credentials"        // credencial do gateway ilegível/ausente
+  | "gateway_missing";   // gateway do pagamento não existe mais
+
 export type ChargeCheck =
   | { kind: "verified"; charge: GatewayChargeStatus; event: NormalizedWebhookEvent }
+  // 404 para todas as chaves tentadas.
   | { kind: "not_found"; lookedUp: string[] }
+  // BuckPay: o gateway respondeu uma cobrança, mas de OUTRO id interno — o
+  // external_id do payload aponta pra cobrança alheia. Sinal de forja.
+  | { kind: "mismatch"; lookedUp: string[] }
   // BuckPay sem nenhuma chave de consulta (PIX criado antes da 0020 e nenhum
   // webhook trouxe o external_id): não dá pra perguntar ao gateway.
   | { kind: "no_lookup_key" }
-  | { kind: "unavailable"; error: string };
+  | { kind: "unavailable"; reason: UnavailableReason; error: string };
 
 export interface CheckOpts {
   /**
@@ -69,14 +80,14 @@ export async function checkChargeAtGateway(payment: Payment, opts: CheckOpts = {
   if (!externalId) return { kind: "not_found", lookedUp: [] };
 
   const gw = await loadGateway(payment.gatewayId, opts.gatewayCache);
-  if (!gw) return { kind: "unavailable", error: `gateway ${payment.gatewayId} não encontrado` };
+  if (!gw) return { kind: "unavailable", reason: "gateway_missing", error: `gateway ${payment.gatewayId} não encontrado` };
   const provider = gw.provider;
 
   let creds: { clientId: string; clientSecret: string };
   try {
     creds = gwRepo.decryptCredentials(gw);
   } catch (err) {
-    return { kind: "unavailable", error: `credencial do gateway ilegível: ${err instanceof Error ? err.message : String(err)}` };
+    return { kind: "unavailable", reason: "credentials", error: `credencial do gateway ilegível: ${err instanceof Error ? err.message : String(err)}` };
   }
 
   // BuckPay: consulta pelo external_id enviado na criação (guardado em
@@ -92,12 +103,13 @@ export async function checkChargeAtGateway(payment: Payment, opts: CheckOpts = {
   if (lookupIds.length === 0) return { kind: "no_lookup_key" };
 
   const tried: string[] = [];
+  let mismatched = false;
   try {
     for (const lookupId of lookupIds) {
       tried.push(lookupId);
       const charge = await fetchChargeStatus(provider, creds, lookupId);
       if (!charge) continue;
-      if (provider === "buckpay" && charge.gatewayTxId !== externalId) continue;
+      if (provider === "buckpay" && charge.gatewayTxId !== externalId) { mismatched = true; continue; }
       if (provider === "buckpay" && lookupId !== storedRef) {
         await saveGatewayRef(provider, externalId, lookupId).catch((err) =>
           console.error("[payments] falha ao guardar gateway_ref da BuckPay:", err));
@@ -120,8 +132,8 @@ export async function checkChargeAtGateway(payment: Payment, opts: CheckOpts = {
       };
     }
   } catch (err) {
-    if (err instanceof GatewayStatusUnavailableError) return { kind: "unavailable", error: err.message };
+    if (err instanceof GatewayStatusUnavailableError) return { kind: "unavailable", reason: err.code, error: err.message };
     throw err;
   }
-  return { kind: "not_found", lookedUp: tried };
+  return mismatched ? { kind: "mismatch", lookedUp: tried } : { kind: "not_found", lookedUp: tried };
 }

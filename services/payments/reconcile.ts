@@ -105,8 +105,8 @@ export async function reconcilePendingPayments(now: Date = new Date()): Promise<
         console.warn(`[payments] conciliação: BuckPay ${row.external_id} sem chave de consulta (PIX anterior à 0020) — só o webhook confirma esta cobrança`);
         continue;
       }
-      if (check.kind === "not_found") {
-        console.warn(`[payments] conciliação: cobrança ${row.provider} ${row.external_id} não encontrada no gateway (consultado: [${check.lookedUp.join(", ")}])`);
+      if (check.kind === "not_found" || check.kind === "mismatch") {
+        console.warn(`[payments] conciliação: cobrança ${row.provider} ${row.external_id} ${check.kind === "mismatch" ? "devolvida com outro id interno" : "não encontrada"} no gateway (consultado: [${check.lookedUp.join(", ")}])`);
         continue;
       }
       // Só aplica o que a máquina de estados aceita a partir do status atual —

@@ -62,7 +62,12 @@ beforeEach(() => {
   }) as typeof globalThis.fetch;
 });
 
+// Modo da verificação por gateway (verify-mode.ts): o stub do secret lê
+// TEST_SECRET_<NOME>. Padrão (sem nada) = todos em modo sombra.
+function setStrict(list: string): void { process.env.TEST_SECRET_WEBHOOK_VERIFY_STRICT = list; }
+
 afterEach(() => {
+  delete process.env.TEST_SECRET_WEBHOOK_VERIFY_STRICT;
   globalThis.fetch = baseFetch;
   vi.restoreAllMocks();
 });
@@ -118,7 +123,7 @@ function paidPublishes(paymentId: string): number {
 
 // ── 1. Autenticação: o payload não confirma nada sozinho ────────────────────
 describe("webhook de pagamento — confirmação ativa no gateway", () => {
-  it("webhook forjado com status paid, mas gateway diz pendente → venda NÃO é aprovada", async () => {
+  it("webhook forjado com status paid, mas gateway diz pendente → venda NÃO é aprovada (modo sombra)", async () => {
     const p = await seedPayment("wiinpay", "wp-forged");
     gatewayStatus("wiinpay", "wp-forged", { data: { paymentId: "wp-forged", status: "PENDING", value: 19.9 } });
 
@@ -130,7 +135,7 @@ describe("webhook de pagamento — confirmação ativa no gateway", () => {
     const db = await testDb();
     const [log] = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
     expect(log.processed).toBe(false);
-    expect(log.errorMessage).toMatch(/gateway diz "PENDING"/);
+    expect(log.errorMessage).toMatch(/^suspeito: .*gateway diz "PENDING"/);
   });
 
   it("webhook confirmado pelo gateway → aprova com o valor que o GATEWAY informou, não o do payload", async () => {
@@ -176,7 +181,8 @@ describe("webhook de pagamento — confirmação ativa no gateway", () => {
     expect((await payRepo.findById(p.id))!.status).toBe("paid");
   });
 
-  it("gateway fora do ar na consulta → responde 503 (gateway reenvia) e não aprova", async () => {
+  it("modo estrito: gateway fora do ar na consulta → responde 503 (gateway reenvia) e não aprova", async () => {
+    setStrict("syncpay,nexuspag");
     const p = await seedPayment("nexuspag", "nx-down");
     gatewayStatus("nexuspag", "nx-down", { message: "boom" }, 502);
 
@@ -184,18 +190,61 @@ describe("webhook de pagamento — confirmação ativa no gateway", () => {
 
     expect(resp.calls).toEqual(["head:503", "end:retry"]);
     expect((await payRepo.findById(p.id))!.status).toBe("pending");
+    const db = await testDb();
+    const [log] = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
+    expect(log.errorMessage).toMatch(/^verification_unavailable:http_error .*modo estrito/);
   });
 
-  it("cobrança inexistente no gateway (404) → ignorado com log, sem aprovar", async () => {
+  it("modo sombra: gateway fora do ar → segue pelo payload (confirma) e registra verification_unavailable", async () => {
+    setStrict("syncpay"); // outro gateway estrito não afeta a NexusPag
+    const p = await seedPayment("nexuspag", "nx-shadow");
+    gatewayStatus("nexuspag", "nx-shadow", { message: "boom" }, 502);
+
+    const resp = await postWebhook("nexuspag", { transaction_id: "nx-shadow", status: "paid", event: "payment.confirmed", amount: 19.9 });
+
+    expect(resp.calls).toEqual(["head:200", "end:ok"]);
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    expect(paidPublishes(p.id)).toBe(1);
+    const db = await testDb();
+    const logs = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
+    expect(logs.some((l) => /^verification_unavailable:http_error .*modo sombra/.test(l.errorMessage ?? ""))).toBe(true);
+  });
+
+  it("modo sombra: resposta sem status (formato inesperado) → segue pelo payload com o motivo bad_response", async () => {
+    const p = await seedPayment("wiinpay", "wp-shape");
+    gatewayStatus("wiinpay", "wp-shape", { ok: true });
+
+    await postWebhook("wiinpay", { data: { paymentId: "wp-shape", status: "PAID", value: 19.9 } });
+
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    const db = await testDb();
+    const logs = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
+    expect(logs.some((l) => (l.errorMessage ?? "").startsWith("verification_unavailable:bad_response"))).toBe(true);
+  });
+
+  it("modo estrito: cobrança inexistente no gateway (404) → 503, sem aprovar", async () => {
+    setStrict("all");
     const p = await seedPayment("wiinpay", "wp-ghost");
 
     const resp = await postWebhook("wiinpay", { data: { paymentId: "wp-ghost", status: "PAID" } });
 
-    expect(resp.calls).toEqual(["head:200", "end:ok"]);
+    expect(resp.calls).toEqual(["head:503", "end:retry"]);
     expect((await payRepo.findById(p.id))!.status).toBe("pending");
     const db = await testDb();
     const [log] = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
-    expect(log.errorMessage).toMatch(/não encontrada no gateway/);
+    expect(log.errorMessage).toMatch(/^verification_unavailable:not_found/);
+  });
+
+  it("modo sombra: BuckPay legado sem chave de consulta → segue pelo payload e registra no_lookup_key", async () => {
+    const p = await seedPayment("buckpay", "bk-legacy-wh");
+
+    await postWebhook("buckpay", { event: "transaction.processed", data: { id: "bk-legacy-wh", status: "paid", total_amount: 1990 } });
+
+    expect((await payRepo.findById(p.id))!.status).toBe("paid");
+    expect(gatewayCalls).toHaveLength(0);
+    const db = await testDb();
+    const logs = await db.select().from(paymentWebhookLogs).where(eq(paymentWebhookLogs.matchedPaymentId, p.id));
+    expect(logs.some((l) => (l.errorMessage ?? "").startsWith("verification_unavailable:no_lookup_key"))).toBe(true);
   });
 
   it("buckpay: consulta pelo external_id do payload e só aceita se o id interno bater com o nosso", async () => {
@@ -212,7 +261,7 @@ describe("webhook de pagamento — confirmação ativa no gateway", () => {
     expect(ref.gatewayRef).toBe("our-ref-1");
   });
 
-  it("buckpay: external_id do payload aponta pra OUTRA cobrança paga → rejeita", async () => {
+  it("buckpay: external_id do payload aponta pra OUTRA cobrança paga → rejeita (mesmo em modo sombra)", async () => {
     const p = await seedPayment("buckpay", "bk-victim");
     // O atacante cita uma cobrança paga qualquer da conta: o id interno não bate.
     gatewayStatus("buckpay", "someone-else", { data: { id: "bk-other", status: "paid", total_amount: 1990 } });

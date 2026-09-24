@@ -21,6 +21,7 @@ import { resolveEffectiveSplit, type EffectiveSplit } from "./application/split-
 import { canTransition, checkPaidAmount } from "./domain/payment-status.js";
 import { checkChargeAtGateway } from "./application/verify-with-gateway.js";
 import { allowWebhookFromIp, allowGatewayCheckForPayment } from "./application/webhook-rate-limiter.js";
+import { verifyModeFor } from "./application/verify-mode.js";
 
 // Valor em centavos -> "R$ 12,34"
 function formatBRL(cents: number): string {
@@ -330,9 +331,11 @@ async function handleAlreadyPaid(
 // processamento falhasse, o gateway já tinha recebido "ok" e o evento se
 // perdia. Agora a resposta só sai depois do processamento:
 // - 200: processado (ou nada a fazer — sem id, pagamento desconhecido,
-//   cobrança inexistente no gateway, status/valor não conferem);
+//   status/valor não conferem);
 // - 429: freio de abuso (webhook-rate-limiter.ts) — reenvie depois;
-// - 503: não deu pra consultar o gateway agora — reenvie;
+// - 503: não deu pra consultar o gateway agora e o gateway está em modo
+//   estrito — reenvie (em modo sombra, o padrão, segue pelo payload; ver
+//   application/verify-mode.ts);
 // - 500: o processamento falhou — reenvie.
 // A conciliação (reconcile.ts) cobre o que ainda assim ficar para trás.
 
@@ -416,35 +419,61 @@ export async function processVerifiedWebhook(
     eventLabel:     event.event,
   });
 
-  if (check.kind === "unavailable") {
+  // BuckPay: o external_id do payload aponta pra cobrança de OUTRO id interno.
+  // O gateway respondeu — e a resposta desmente o payload: suspeito, em
+  // qualquer modo.
+  if (check.kind === "mismatch") {
     await logEntryDecision(event, rawPayload, sourceIp, {
       externalId:       paymentKey,
       matchedPaymentId: payment.id,
-      errorMessage:     `não foi possível confirmar a cobrança no gateway (${check.error}) — respondido 503 pro gateway reenviar`,
-    });
-    return "retry";
-  }
-
-  if (check.kind === "not_found" || check.kind === "no_lookup_key") {
-    const lookedUp = check.kind === "not_found" ? check.lookedUp.join(", ") : "";
-    await logEntryDecision(event, rawPayload, sourceIp, {
-      externalId:       paymentKey,
-      matchedPaymentId: payment.id,
-      errorMessage:     `cobrança não encontrada no gateway (consultado: [${lookedUp}]) — webhook ignorado`,
+      errorMessage:     `suspeito: a cobrança consultada no gateway ([${check.lookedUp.join(", ")}]) é de outro id interno, não "${paymentKey}" — webhook ignorado`,
     });
     return "ok";
   }
 
-  // Gateway diz que ainda está pendente, mas o webhook dizia outra coisa
-  // (ex.: "paid"): forjado ou adiantado. Registra a divergência; a conciliação
-  // pega a mudança real quando ela acontecer.
-  if (check.charge.status === "pending" && event.status !== "pending") {
+  // Verificação INDISPONÍVEL: o gateway não deu uma resposta sobre esta
+  // cobrança. Modo estrito → 503 (reenvie). Modo sombra (padrão, ver
+  // verify-mode.ts) → segue pelo payload, como antes da verificação, e deixa
+  // `verification_unavailable:<motivo>` no log pra conferência pós-deploy.
+  if (check.kind !== "verified") {
+    const reason = check.kind === "unavailable" ? check.reason : check.kind;
+    const detail = check.kind === "unavailable" ? check.error
+      : check.kind === "not_found" ? `cobrança não encontrada no gateway (consultado: [${check.lookedUp.join(", ")}])`
+      : "BuckPay sem chave de consulta (PIX anterior à 0020 e payload sem external_id)";
+    const code = `verification_unavailable:${reason}`;
+    const mode = verifyModeFor(event.provider);
+    console.warn(`[payments] webhook ${event.provider} ${paymentKey}: ${code} (${detail}) — modo ${mode}`);
+
+    if (mode === "strict") {
+      await logEntryDecision(event, rawPayload, sourceIp, {
+        externalId:       paymentKey,
+        matchedPaymentId: payment.id,
+        errorMessage:     `${code} — ${detail}; modo estrito: respondido 503 pro gateway reenviar`,
+      });
+      return "retry";
+    }
+
     await logEntryDecision(event, rawPayload, sourceIp, {
       externalId:       paymentKey,
       matchedPaymentId: payment.id,
-      errorMessage:     `webhook diz "${event.status}", mas o gateway diz "${check.charge.rawStatus}" (pendente) — ignorado`,
+      errorMessage:     `${code} — ${detail}; modo sombra: processado pelo payload (sem confirmação no gateway)`,
     });
+    await processWebhookEvent(event, rawPayload, sourceIp);
     return "ok";
+  }
+
+  // Gateway RESPONDEU e desmente o payload (ex.: payload "paid", gateway
+  // pendente/cancelado): forjado ou adiantado — em qualquer modo, vale o
+  // gateway. Pendente não aplica nada (a conciliação pega a mudança real
+  // quando ela acontecer); cancelado/expirado segue pelo caso de uso abaixo.
+  const claimedPaid = event.status === "paid" && check.charge.status !== "paid";
+  if (claimedPaid || (check.charge.status === "pending" && event.status !== "pending")) {
+    await logEntryDecision(event, rawPayload, sourceIp, {
+      externalId:       paymentKey,
+      matchedPaymentId: payment.id,
+      errorMessage:     `${claimedPaid ? "suspeito: " : ""}webhook diz "${event.status}", mas o gateway diz "${check.charge.rawStatus}" — vale o gateway`,
+    });
+    if (check.charge.status === "pending") return "ok";
   }
 
   await processWebhookEvent(check.event, rawPayload, sourceIp);

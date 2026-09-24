@@ -43,11 +43,19 @@ export interface GatewayChargeStatus {
  * o status do webhook — responde erro pro gateway reenviar, e a conciliação
  * tenta de novo depois.
  */
+export type UnavailableCode =
+  | "network" | "timeout" | "http_error" | "bad_response" | "auth_failed";
+
 export class GatewayStatusUnavailableError extends Error {
-  constructor(message: string) {
+  constructor(public readonly code: UnavailableCode, message: string) {
     super(message);
     this.name = "GatewayStatusUnavailableError";
   }
+}
+
+function isTimeout(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === "TimeoutError" || name === "AbortError";
 }
 
 const SYNCPAY_BASE  = "https://api.syncpayments.com.br";
@@ -94,15 +102,16 @@ async function getJson(url: string, headers: Record<string, string>, onUnauthori
   try {
     res = await fetch(url, { method: "GET", headers, signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) });
   } catch (err) {
-    throw new GatewayStatusUnavailableError(`falha de rede ao consultar o gateway: ${err instanceof Error ? err.message : String(err)}`);
+    throw new GatewayStatusUnavailableError(isTimeout(err) ? "timeout" : "network",
+      `falha de rede ao consultar o gateway: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (res.status === 404) return null;
   if (res.status === 401) onUnauthorized?.();
-  if (!res.ok) throw new GatewayStatusUnavailableError(`gateway respondeu HTTP ${res.status} na consulta`);
+  if (!res.ok) throw new GatewayStatusUnavailableError("http_error", `gateway respondeu HTTP ${res.status} na consulta`);
   try {
     return await res.json();
   } catch {
-    throw new GatewayStatusUnavailableError("gateway devolveu resposta não-JSON na consulta");
+    throw new GatewayStatusUnavailableError("bad_response", "gateway devolveu resposta não-JSON na consulta");
   }
 }
 
@@ -127,15 +136,16 @@ async function syncpayToken(clientId: string, clientSecret: string): Promise<str
     });
     data = await res.json() as { access_token?: string };
   } catch (err) {
-    throw new GatewayStatusUnavailableError(`SyncPay auth falhou: ${err instanceof Error ? err.message : String(err)}`);
+    throw new GatewayStatusUnavailableError(isTimeout(err) ? "timeout" : "auth_failed",
+      `SyncPay auth falhou: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (!data.access_token) throw new GatewayStatusUnavailableError("SyncPay auth falhou: sem access_token");
+  if (!data.access_token) throw new GatewayStatusUnavailableError("auth_failed", "SyncPay auth falhou: sem access_token");
   syncpayTokens.set(clientId, { token: data.access_token, expiresAt: Date.now() + SYNCPAY_TOKEN_TTL_MS });
   return data.access_token;
 }
 
 function result(status: string | undefined, paid: Set<string>, amount: number | null, gatewayTxId: unknown, raw: unknown, amountIsGross = true): GatewayChargeStatus {
-  if (!status) throw new GatewayStatusUnavailableError("gateway não informou o status da cobrança");
+  if (!status) throw new GatewayStatusUnavailableError("bad_response", "gateway não informou o status da cobrança");
   return {
     status:      mapStatus(status, paid),
     amount,

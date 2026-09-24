@@ -45,3 +45,8 @@ export const mediaS3SecretKey = secret("MEDIA_S3_SECRET_KEY");
 // ninguém é tratado como proxy confiável (comportamento antigo, mais
 // conservador); não quebra o boot se não estiver setado.
 export const trustedProxySecret = secret("TRUSTED_PROXY_SECRET");
+
+// Gateways cujo webhook exige a verificação ativa no gateway SEM fallback pro
+// payload (payments/application/verify-mode.ts). Lista separada por vírgula
+// (syncpay,buckpay,nexuspag,wiinpay) ou "all". Vazio = todos em modo sombra.
+export const webhookVerifyStrict = secret("WEBHOOK_VERIFY_STRICT");
