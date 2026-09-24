@@ -74,6 +74,11 @@ export async function reconcilePendingPayments(now: Date = new Date()): Promise<
     -- estados aceita expired → paid justamente por isso.
     WHERE p.status IN ('pending', 'expired')
       AND p.external_id IS NOT NULL
+      -- BuckPay só é consultável pelo external_id que NÓS enviamos (gateway_ref).
+      -- PIX criado antes da 0020 não tem essa chave e nunca vai ter: selecioná-lo
+      -- só gerava uma linha de log por cobrança a cada rodada. Esses ficam com o
+      -- webhook, como antes.
+      AND NOT (g.provider = 'buckpay' AND r.gateway_ref IS NULL)
       AND p.created_at >= ${oldestIso}::timestamptz
       AND p.created_at <= ${youngestIso}::timestamptz
       AND (

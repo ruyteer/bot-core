@@ -402,12 +402,12 @@ describe("conciliação de pagamentos pendentes", () => {
     expect(gatewayCalls.filter((u) => u.endsWith("/api/pix/nx-wait"))).toHaveLength(2);
   });
 
-  it("buckpay sem chave de consulta (PIX anterior à 0020) → contado à parte, sem consulta", async () => {
+  it("buckpay sem chave de consulta (PIX anterior à 0020) nem entra na rodada — sem consulta e sem log a cada minuto", async () => {
     await seedPayment("buckpay", "bk-legacy", { ageMs: 10 * MIN });
 
     const r = await reconcilePendingPayments();
 
-    expect(r).toMatchObject({ checked: 1, noLookupKey: 1, applied: 0 });
+    expect(r).toMatchObject({ checked: 0, noLookupKey: 0, applied: 0 });
     expect(gatewayCalls).toHaveLength(0);
   });
 
