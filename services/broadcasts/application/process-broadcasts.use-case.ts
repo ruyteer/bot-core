@@ -2,10 +2,14 @@ import { eq, and, inArray, lte, lt, gt } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
   scheduledMessages, broadcastRuns, broadcastDeliveries, bots, leads, payments, botGroups, funnelOffers,
+  funnels, funnelNodes,
 } from "../../shared/schema/index.js";
 import { TelegramClient } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
+import { ExecuteFlowStepUseCase, getVars } from "../../runner/application/execute-flow-step.use-case.js";
+
+const flowUseCase = new ExecuteFlowStepUseCase();
 
 // Intervalo mínimo entre heartbeats (updatedAt) durante um envio em andamento —
 // evita martelar o UPDATE a cada lead num broadcast grande, mas garante que o
@@ -210,6 +214,27 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
   const botRows = await db.select().from(bots).where(inArray(bots.id, botIdList));
   let totalTargets = 0, sentCount = 0, failedCount = 0;
 
+  // ── Funil disparado ao final do envio (só leads, nunca grupos/canais) ───────
+  // `msg.funnelId` é validado na criação/envio (assertFunnelOwnership), mas só
+  // aqui checamos se o funil ainda serve para iniciar automação: precisa ser
+  // de fluxo (o simplificado não tem nós), ativo, e ter um nó `trigger`. Uma
+  // vez só por disparo — não por lead — e nunca derruba o envio.
+  let funnelToStart: string | null = null;
+  if (msg.funnelId) {
+    const [funnel] = await db.select().from(funnels).where(eq(funnels.id, msg.funnelId));
+    if (!funnel || funnel.kind === "simplified" || !funnel.isActive) {
+      console.error("[broadcast] funnelId do disparo aponta para funil inválido (inexistente/simplificado/inativo), leads serão notificados sem entrar em funil:", msg.id, msg.funnelId);
+    } else {
+      const [triggerNode] = await db.select().from(funnelNodes)
+        .where(and(eq(funnelNodes.funnelId, funnel.id), eq(funnelNodes.type, "trigger")));
+      if (!triggerNode) {
+        console.error("[broadcast] funil do disparo não tem nó trigger, leads serão notificados sem entrar em funil:", msg.id, msg.funnelId);
+      } else {
+        funnelToStart = funnel.id;
+      }
+    }
+  }
+
   // Ocorrência deste disparo (estável durante retries de um resgate — só muda
   // quando finalizeSchedule agenda a PRÓXIMA ocorrência de uma recorrência).
   // Carrega quem já recebeu nesta ocorrência pra um resgate não reenviar.
@@ -250,15 +275,33 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
         const text = replaceVars(msg.message || "", lead);
         if (media.length === 0 && !text && !keyboard) continue; // nada a enviar
         totalTargets++;
+        let delivered = false;
         try {
           if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
           else await tg.sendMessage({ chatId, text: text || "👇", replyMarkup: keyboard, protectContent: bot.protectContent });
           sentCount++;
+          delivered = true;
           deliveredLeadIds.add(lead.id);
           await db.insert(broadcastDeliveries).values({ scheduledMessageId: msg.id, occurrenceAt, leadId: lead.id })
             .onConflictDoNothing()
             .catch((e) => console.error("[broadcast] registro de entrega falhou:", lead.id, e));
         } catch (e) { failedCount++; console.error("[broadcast] lead falhou:", lead.id, e); }
+
+        // Entrada em funil roda DEPOIS do envio, isolada do try acima: uma
+        // falha aqui nunca deve virar "falha de envio" (a mensagem já saiu).
+        if (delivered && funnelToStart) {
+          try {
+            await flowUseCase.startFunnelForLead({
+              funnelId: funnelToStart,
+              leadId:   lead.id,
+              botId:    bot.id,
+              chatId,
+              tg,
+              protect:  bot.protectContent,
+              vars:     await getVars(lead.id, bot.id),
+            });
+          } catch (e) { console.error("[broadcast] falha ao iniciar funil para lead:", lead.id, e); }
+        }
         await maybeHeartbeat();
       }
     }

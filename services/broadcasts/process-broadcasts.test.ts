@@ -1,10 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { eq } from "drizzle-orm";
 import { processDueBroadcasts } from "./application/process-broadcasts.use-case.js";
 import { testDb } from "../../test/helpers/db.js";
 import { scheduledMessages, broadcastRuns, broadcastDeliveries, bots, payments, leads, funnelOffers, botGroups } from "../shared/schema/index.js";
-import { createBot, createLead, createGateway } from "../../test/helpers/seed.js";
+import { createBot, createLead, createGateway, createFlowFunnel, createSimplifiedFunnel, getProgress } from "../../test/helpers/seed.js";
 import { getSentMessages, getTelegramCalls, forceTelegramError } from "../../test/helpers/fetch-mock.js";
+import { ExecuteFlowStepUseCase } from "../runner/application/execute-flow-step.use-case.js";
 
 async function seedMsg(botId: string, userId: string, over: Partial<typeof scheduledMessages.$inferInsert> = {}) {
   const db = await testDb();
@@ -343,5 +344,161 @@ describe("processDueBroadcasts — bot inativo (não envia por bot desativado)",
     const n = await processDueBroadcasts();
     expect(n).toBe(1);
     expect(getTelegramCalls("sendMessage").length).toBe(0); // bot inativo, ninguém recebe
+  });
+});
+
+describe("processDueBroadcasts — disparo inicia funil (funnelId)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("lead entra no funil de fluxo depois de receber o disparo", async () => {
+    const bot = await createBot();
+    const leadId = await createLead(bot.id, 9401n);
+    const { funnelId } = await createFlowFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    await seedMsg(bot.id, bot.userId, { message: "promo", funnelId });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+
+    // A mensagem do disparo E a primeira mensagem do funil devem ter sido enviadas.
+    expect(getSentMessages()).toContain("promo");
+    expect(getSentMessages()).toContain("Bem-vindo ao funil!");
+
+    const prog = await getProgress(leadId);
+    expect(prog).toBeDefined();
+    expect(prog.funnelId).toBe(funnelId);
+    // Nó "msg" não tem saída — o funil roda até o fim e completa (mesmo
+    // comportamento do /start): currentNodeId some, status vira "completed".
+    expect(prog.status).toBe("completed");
+  });
+
+  it("funil SIMPLIFICADO referenciado no disparo é ignorado (não tem nós pra entrar)", async () => {
+    const bot = await createBot();
+    const leadId = await createLead(bot.id, 9402n);
+    const funnelId = await createSimplifiedFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      config: {},
+    });
+    await seedMsg(bot.id, bot.userId, { message: "promo", funnelId });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getSentMessages()).toContain("promo"); // disparo sai normalmente
+
+    const prog = await getProgress(leadId);
+    expect(prog).toBeUndefined(); // lead não entrou em funil nenhum
+  });
+
+  it("funil INATIVO referenciado no disparo é ignorado", async () => {
+    const bot = await createBot();
+    const leadId = await createLead(bot.id, 9403n);
+    const { funnelId } = await createFlowFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      isActive: false,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    await seedMsg(bot.id, bot.userId, { message: "promo", funnelId });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getSentMessages()).toContain("promo");
+    expect(getSentMessages()).not.toContain("Bem-vindo ao funil!");
+
+    const prog = await getProgress(leadId);
+    expect(prog).toBeUndefined();
+  });
+
+  it("funil de fluxo SEM nó trigger referenciado no disparo é ignorado", async () => {
+    const bot = await createBot();
+    const leadId = await createLead(bot.id, 9404n);
+    const { funnelId } = await createFlowFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      nodes: [
+        // Sem nó "trigger" de propósito.
+        { key: "msg", type: "message", content: { message: "Nunca deveria ser alcançado" } },
+      ],
+      connections: [],
+    });
+    await seedMsg(bot.id, bot.userId, { message: "promo", funnelId });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getSentMessages()).toContain("promo");
+    expect(getSentMessages()).not.toContain("Nunca deveria ser alcançado");
+
+    const prog = await getProgress(leadId);
+    expect(prog).toBeUndefined();
+  });
+
+  it("falha ao iniciar o funil não impede o envio do disparo (erro isolado, não conta como falha de entrega)", async () => {
+    vi.spyOn(ExecuteFlowStepUseCase.prototype, "startFunnelForLead").mockRejectedValueOnce(new Error("boom"));
+
+    const bot = await createBot();
+    await createLead(bot.id, 9405n);
+    const { funnelId } = await createFlowFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    const msg = await seedMsg(bot.id, bot.userId, { message: "promo", funnelId });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getSentMessages()).toContain("promo"); // envio aconteceu apesar do erro no funil
+
+    const db = await testDb();
+    const [after] = await db.select().from(scheduledMessages).where(eq(scheduledMessages.id, msg.id));
+    expect(after.status).toBe("sent"); // não vira 'failed'/'partial' por causa do erro no funil
+
+    const runs = await db.select().from(broadcastRuns).where(eq(broadcastRuns.scheduledMessageId, msg.id));
+    expect(runs[0].sentCount).toBe(1);
+    expect(runs[0].failedCount).toBe(0);
+  });
+
+  it("grupos/canais nunca entram em funil, mesmo com funnelId no disparo", async () => {
+    const bot = await createBot();
+    const { funnelId } = await createFlowFunnel({
+      userId: bot.userId,
+      botId: bot.id,
+      nodes: [
+        { key: "trigger", type: "trigger" },
+        { key: "msg", type: "message", content: { message: "Bem-vindo ao funil!" } },
+      ],
+      connections: [{ from: "trigger", to: "msg" }],
+    });
+    const db = await testDb();
+    const [group] = await db.insert(botGroups).values({
+      botId: bot.id, telegramChatId: -1001234567890n, name: "Grupo Teste", type: "supergroup",
+    }).returning();
+
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo", funnelId, targetType: "groups", targetGroupIds: [group.id],
+    });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getSentMessages()).toContain("promo");
+    // Nenhum lead existe nesse teste — mas o essencial é não quebrar e não
+    // tentar startFunnelForLead para o grupo (não há leadId de grupo).
   });
 });
