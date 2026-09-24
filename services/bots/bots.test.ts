@@ -217,6 +217,32 @@ describe("UpdateBotUseCase — troca de token", () => {
   });
 });
 
+describe("UpdateBotUseCase — posse do gateway padrão", () => {
+  it("recusa vincular defaultGatewayId de OUTRO usuário ao bot", async () => {
+    const bot = await createBot();
+    const outroUserId = await createProfile();
+    const gatewayAlheio = await createGateway({ userId: outroUserId });
+
+    // Ataque: dono do bot manda no PATCH o id de um gateway que não é dele
+    // (adivinhado, ou visto em algum payload de outra tela/usuário).
+    await expect(
+      new UpdateBotUseCase(repo).execute(bot.id, bot.userId, { defaultGatewayId: gatewayAlheio }),
+    ).rejects.toThrow();
+
+    const db = await testDb();
+    const [row] = await db.select().from(bots).where(eq(bots.id, bot.id));
+    expect(row.defaultGatewayId).toBeNull();
+  });
+
+  it("aceita vincular um gateway do PRÓPRIO usuário", async () => {
+    const bot = await createBot();
+    const gatewayProprio = await createGateway({ userId: bot.userId });
+
+    const updated = await new UpdateBotUseCase(repo).execute(bot.id, bot.userId, { defaultGatewayId: gatewayProprio });
+    expect(updated.defaultGatewayId).toBe(gatewayProprio);
+  });
+});
+
 describe("BotDrizzleRepository.findInternalById", () => {
   it("descriptografa o token do Telegram", async () => {
     const bot = await createBot({ token: "999:SECRET" });

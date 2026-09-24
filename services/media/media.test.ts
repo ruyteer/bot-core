@@ -1,5 +1,119 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { Readable, Writable } from "node:stream";
 import { isAllowedMime, matchesFileSignature, sanitizeFolder, extFromFilename } from "./application/validation.js";
+
+// ─── GET /media/*key — nosniff, Content-Type e Content-Disposition ──────────
+//
+// Mocka o storage (s3-client) pra exercitar o handler getMedia sem rede real.
+// api.raw devolve o handler puro em teste (ver test/stubs/encore-api.ts), então
+// dá pra chamar getMedia(req, resp) direto com um par IncomingMessage/
+// ServerResponse minimalista.
+vi.mock("./application/s3-client.js", () => ({
+  putObject: vi.fn(),
+  getObject: vi.fn(),
+}));
+
+class FakeResponse extends Writable {
+  statusCode = 200;
+  headers: Record<string, string> = {};
+  chunks: Buffer[] = [];
+  writeHead(status: number, headers?: Record<string, string>) {
+    this.statusCode = status;
+    if (headers) Object.assign(this.headers, headers);
+    return this;
+  }
+  _write(chunk: Buffer, _enc: string, cb: (err?: Error | null) => void) {
+    this.chunks.push(chunk);
+    cb();
+  }
+  get body(): string {
+    return Buffer.concat(this.chunks).toString("utf8");
+  }
+}
+
+function fakeRequest(pathAndQuery: string): { url: string } {
+  return { url: pathAndQuery };
+}
+
+describe("GET /media/*key — headers de segurança", () => {
+  it("resposta sempre inclui X-Content-Type-Options: nosniff", async () => {
+    const { getMedia } = await import("./media.api.js");
+    const s3 = await import("./application/s3-client.js");
+    vi.mocked(s3.getObject).mockResolvedValue({
+      body: Readable.from([Buffer.from("fake-png-bytes")]),
+      contentType: "image/png",
+      contentLength: 14,
+    });
+
+    const resp = new FakeResponse();
+    await new Promise<void>((resolve) => {
+      resp.on("finish", resolve);
+      (getMedia as any)(fakeRequest("/media/u1/misc/foo.png"), resp);
+    });
+
+    expect(resp.headers["X-Content-Type-Options"]).toBe("nosniff");
+  });
+
+  it("documento (pdf) é servido com Content-Disposition: attachment", async () => {
+    const { getMedia } = await import("./media.api.js");
+    const s3 = await import("./application/s3-client.js");
+    vi.mocked(s3.getObject).mockResolvedValue({
+      body: Readable.from([Buffer.from("%PDF-1.7 fake")]),
+      contentType: "application/pdf",
+      contentLength: 13,
+    });
+
+    const resp = new FakeResponse();
+    await new Promise<void>((resolve) => {
+      resp.on("finish", resolve);
+      (getMedia as any)(fakeRequest("/media/u1/misc/doc.pdf"), resp);
+    });
+
+    expect(resp.headers["X-Content-Type-Options"]).toBe("nosniff");
+    expect(resp.headers["Content-Disposition"]).toMatch(/^attachment;/);
+    expect(resp.headers["Content-Type"]).toBe("application/pdf");
+  });
+
+  it("imagem é servida com Content-Disposition: inline (preview no editor)", async () => {
+    const { getMedia } = await import("./media.api.js");
+    const s3 = await import("./application/s3-client.js");
+    vi.mocked(s3.getObject).mockResolvedValue({
+      body: Readable.from([Buffer.from("fake-png-bytes")]),
+      contentType: "image/png",
+      contentLength: 14,
+    });
+
+    const resp = new FakeResponse();
+    await new Promise<void>((resolve) => {
+      resp.on("finish", resolve);
+      (getMedia as any)(fakeRequest("/media/u1/misc/foto.png"), resp);
+    });
+
+    expect(resp.headers["Content-Disposition"]).toMatch(/^inline;/);
+  });
+
+  it("Content-Type divergente da allowlist do storage vira octet-stream (não confia cego no metadata)", async () => {
+    const { getMedia } = await import("./media.api.js");
+    const s3 = await import("./application/s3-client.js");
+    // Cenário defensivo: metadata do objeto no storage viesse com um tipo fora
+    // da allowlist (não devia acontecer via upload normal, mas o handler não
+    // pode confiar cegamente nisso pra decidir o que manda de volta ao navegador).
+    vi.mocked(s3.getObject).mockResolvedValue({
+      body: Readable.from([Buffer.from("<script>alert(1)</script>")]),
+      contentType: "text/html",
+      contentLength: 26,
+    });
+
+    const resp = new FakeResponse();
+    await new Promise<void>((resolve) => {
+      resp.on("finish", resolve);
+      (getMedia as any)(fakeRequest("/media/u1/misc/x"), resp);
+    });
+
+    expect(resp.headers["Content-Type"]).toBe("application/octet-stream");
+    expect(resp.headers["X-Content-Type-Options"]).toBe("nosniff");
+  });
+});
 
 describe("isAllowedMime", () => {
   it("aceita image/video/audio por prefixo", () => {

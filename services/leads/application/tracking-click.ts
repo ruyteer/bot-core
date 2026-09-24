@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import { bots, leads, trackingClicks } from "../../shared/schema/index.js";
 import { allowClick } from "./click-rate-limiter.js";
@@ -100,15 +100,30 @@ const ORGANIC_PREFIXES: Array<[string, "utmSource" | "utmMedium" | "utmCampaign"
  * - `src_x__m_y`  → link orgânico com UTMs embutidas no próprio payload.
  * Nunca lança: rastreamento jamais pode derrubar o funil.
  */
-export async function applyStartTracking(leadId: string, startPayload: string): Promise<void> {
+export async function applyStartTracking(leadId: string, startPayload: string, botId: string): Promise<void> {
   try {
     const payload = startPayload.trim();
     if (!payload) return;
 
     if (payload.startsWith("tk_")) {
       const token = payload.slice(3);
-      const [click] = await db.select().from(trackingClicks)
-        .where(eq(trackingClicks.token, token)).limit(1);
+
+      // Resgate atômico e de uso único, preso ao bot que emitiu o clique: o
+      // UPDATE só afeta a linha se token+bot baterem E consumedAt ainda for
+      // nulo, tudo numa única instrução — duas corridas concorrentes (mesmo
+      // token, /start em paralelo) travam na mesma linha e só uma vence,
+      // porque o WHERE é reavaliado depois do commit da primeira. Antes, o
+      // mesmo tk_ podia ser resgatado em qualquer outro bot (a busca era só
+      // por token, sem checar o dono) e quantas vezes quisessem (a UTM era
+      // reaplicada a cada /start, mesmo já consumido).
+      const [click] = await db.update(trackingClicks)
+        .set({ leadId, consumedAt: new Date() })
+        .where(and(
+          eq(trackingClicks.token, token),
+          eq(trackingClicks.botId, botId),
+          isNull(trackingClicks.consumedAt),
+        ))
+        .returning();
       if (!click) return;
 
       await db.update(leads).set({
@@ -127,14 +142,6 @@ export async function applyStartTracking(leadId: string, startPayload: string): 
         ...(click.userAgent   ? { clientUserAgent: click.userAgent } : {}),
         updatedAt: new Date(),
       }).where(eq(leads.id, leadId));
-
-      // Liga clique → lead (funil de conversão do link) sem sobrescrever o
-      // primeiro consumo caso o mesmo link seja clicado de novo.
-      if (!click.consumedAt) {
-        await db.update(trackingClicks)
-          .set({ leadId, consumedAt: new Date() })
-          .where(eq(trackingClicks.id, click.id));
-      }
       return;
     }
 

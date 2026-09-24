@@ -191,8 +191,8 @@ describe("/start src_... — payload orgânico", () => {
   });
 });
 
-describe("applyStartTracking direto", () => {
-  it("segundo clique no mesmo token não sobrescreve o vínculo original", async () => {
+describe("applyStartTracking direto — resgate atômico e de uso único", () => {
+  it("segundo /start com o mesmo token não sobrescreve o vínculo original nem aplica UTM de novo", async () => {
     const bot = await botWithFunnel();
     const db = await testDb();
     const { url } = (await registerTrackingClick({ botId: bot.id, utmSource: "facebook" }))!;
@@ -203,14 +203,42 @@ describe("applyStartTracking direto", () => {
     const firstLeadId = firstClick.leadId;
     const firstConsumedAt = firstClick.consumedAt;
 
+    // Ataque: reusar o mesmo tk_ (compartilhado, capturado no histórico do
+    // chat etc.) num segundo /start — token já resgatado não pode gerar uma
+    // segunda atribuição.
     await runner.execute({ botId: bot.id, update: textUpdate(6002, `/start ${token}`) });
     const [after] = await db.select().from(trackingClicks);
     expect(after.leadId).toBe(firstLeadId);
     expect(after.consumedAt?.getTime()).toBe(firstConsumedAt?.getTime());
 
-    // Mas o segundo lead ainda recebe as UTMs do clique.
+    // O segundo lead NÃO recebe as UTMs do clique alheio — token de uso único.
     const rows = await db.select().from(leads);
     const second = rows.find((l) => l.telegramChatId === BigInt(6002))!;
-    expect(second.utmSource).toBe("facebook");
+    expect(second.utmSource).toBeNull();
+  });
+
+  it("token emitido para o bot A não pode ser resgatado no /start do bot B", async () => {
+    const botA = await botWithFunnel();
+    const botB = await botWithFunnel();
+    const db = await testDb();
+    const { url } = (await registerTrackingClick({ botId: botA.id, utmSource: "facebook", utmCampaign: "camp_a" }))!;
+    const token = new URL(url).searchParams.get("start")!;
+
+    // Ataque: pegar o tk_ emitido para o bot A e mandar pro /start do bot B.
+    await runner.execute({ botId: botB.id, update: textUpdate(6101, `/start ${token}`) });
+
+    const [click] = await db.select().from(trackingClicks).where(eq(trackingClicks.botId, botA.id));
+    expect(click.consumedAt).toBeNull();
+    expect(click.leadId).toBeNull();
+
+    const leadB = (await db.select().from(leads).where(eq(leads.botId, botB.id)))[0];
+    expect(leadB.utmSource).toBeNull();
+    expect(leadB.utmCampaign).toBeNull();
+
+    // O token continua íntegro e resgatável no bot certo (A).
+    await runner.execute({ botId: botA.id, update: textUpdate(6102, `/start ${token}`) });
+    const leadA = (await db.select().from(leads).where(eq(leads.botId, botA.id)))[0];
+    expect(leadA.utmSource).toBe("facebook");
+    expect(leadA.utmCampaign).toBe("camp_a");
   });
 });
