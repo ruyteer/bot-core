@@ -1,15 +1,16 @@
-import { eq, and, lte } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { db } from "../../shared/database.js";
 import {
-  bots, leads, funnels, payments, simplifiedScheduledTasks,
+  bots, leads, funnels, payments, simplifiedScheduledTasks, leadProgress,
 } from "../../shared/schema/index.js";
-import { TelegramClient, urlButtonMarkup } from "./telegram.client.js";
+import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { interpolate, leadFieldsMap } from "./interpolate.js";
 import { telegramButtonStyle } from "./telegram-button-style.js";
 import { fmtBRL, sendPixMessages } from "./pix-messages.js";
 import { buildOrderBumpCard } from "./order-bump.js";
 import { decrypt } from "../../shared/crypto.js";
 import { encoreExternalUrl } from "../../config/secrets.js";
+import { isUniqueViolation } from "../../shared/db-errors.js";
 import { GatewayDrizzleRepository } from "../../payments/infrastructure/gateway.drizzle.repository.js";
 import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastructure/payment.drizzle.repository.js";
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
@@ -19,6 +20,39 @@ import { registerOrRenewVipMembership, previewVipInviteExpireEpoch } from "./vip
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
+
+// PIX pendente reaproveitável por até esse tempo (Achado 2/3 da auditoria) —
+// mesmo default do timeout "não pago" do funil de FLUXO (unpaidTimeoutMinutes
+// em execute-flow-step.use-case.ts), pra manter o mesmo comportamento entre os
+// dois tipos de funil. Depois disso, um PIX morto no gateway (expirou lá sem o
+// webhook de expiração chegar) não é mais reenviado pra sempre.
+const PIX_REUSE_MAX_AGE_MS = 5 * 60_000;
+
+// Escapa conteúdo dinâmico (nome do lead, textos livres do painel) antes de
+// mandar com parse_mode HTML — sem isso, um `<`/`&` cru (no first_name do
+// Telegram do lead, ou digitado pelo dono no painel) quebra o parser da
+// Telegram e a mensagem nem chega (Achado 5 da auditoria; mesmo tratamento já
+// aplicado no funil de fluxo, ver escapeHtml em execute-flow-step.use-case.ts).
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Quantas tarefas vencidas um tick processa — precisa de teto pro tick
+// TERMINAR (mesmo raciocínio do DELAY_BATCH em runner.ts): sem limite, uma
+// fila grande faria um tick durar demais, empilhando os próximos.
+const TASK_BATCH = 200;
+
+// Subconjunto de simplified_scheduled_tasks devolvido pelo claim atômico —
+// só os campos que runDueTask usa (RETURNING explícito na query, sem select *).
+interface DueSimplifiedTask {
+  id:        string;
+  botId:     string;
+  leadId:    string;
+  funnelId:  string;
+  kind:      string;
+  refId:     string;
+  paymentId: string | null;
+}
 
 // ── Helpers (porte fiel do backend antigo Lovable) ──────────────────────────────
 
@@ -156,6 +190,24 @@ export class ExecuteSimplifiedFunnelUseCase {
     const payCfg  = (cfg.payment as Record<string, unknown>) || {};
     const protect = bot.protectContent;
 
+    // Garante uma linha em lead_progress pra este lead: é ali que o pause
+    // manual (POST /leads/:id/pause) grava o estado, mas o simplificado é
+    // stateless (não navega por nós) e nunca criava essa linha — leads que só
+    // falaram com o simplificado ficavam sem onde a pausa "pousar", e
+    // pausar/despausar virava no-op (Achado 6 da auditoria). currentNodeId
+    // fica null (não há nó); o guard de pausa em execute-flow-step.use-case.ts
+    // (linha que checa `prog?.status === "paused_manual"` antes de rotear pra
+    // cá) passa a funcionar pra esses leads também a partir da 1ª interação.
+    const [existingProgress] = await db.select({ id: leadProgress.id, status: leadProgress.status })
+      .from(leadProgress).where(eq(leadProgress.leadId, lead.id));
+    if (!existingProgress) {
+      await db.insert(leadProgress).values({ leadId: lead.id, funnelId: funnel.id, status: "active" });
+    } else if (existingProgress.status === "paused_manual") {
+      // Pausado manualmente (atendimento humano): não processa nada — nem
+      // mensagem, nem callback, nem gera PIX.
+      return true;
+    }
+
     const send = (textMsg: string, replyMarkup?: unknown) =>
       tg.sendMessage({ chatId, text: textMsg, replyMarkup, protectContent: protect });
 
@@ -176,7 +228,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       await this.generatePix({
         bot, lead, chatId, tg, payCfg, amount, productName: String(u.name || "Oferta"),
         ctx: { kind: "upsell", funnelId: funnel.id, items: [toDeliveryItem(u)] },
-        refKey: `${funnel.id}:upsell:${id}`,
+        refKey: `${funnel.id}:upsell:${id}`, retryCallbackData: callbackData,
       });
       return true;
     }
@@ -193,7 +245,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       await this.generatePix({
         bot, lead, chatId, tg, payCfg, amount, productName: String(d.name || "Oferta"),
         ctx: { kind: "downsell", funnelId: funnel.id, items: [toDeliveryItem(d)] },
-        refKey: `${funnel.id}:downsell:${id}`,
+        refKey: `${funnel.id}:downsell:${id}`, retryCallbackData: callbackData,
       });
       return true;
     }
@@ -245,7 +297,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
     if (callbackData === `sc_decline_${funnel.id}`) {
       const cta = (cfg.cta as Record<string, unknown>) || {};
-      const msg = itp((String(cta.decline_message || "Tudo bem! Use /start quando quiser ver as ofertas.")).trim());
+      const msg = escapeHtml(itp((String(cta.decline_message || "Tudo bem! Use /start quando quiser ver as ofertas.")).trim()));
       if (msg) await send(msg);
       return true;
     }
@@ -261,7 +313,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     const welcome = (cfg.welcome as Record<string, unknown>) || {};
     const cta     = (cfg.cta as Record<string, unknown>) || {};
     const ctaEnabled = !!cta.enabled && !!String(cta.text || "").trim();
-    const welcomeText = itp(String(welcome.text || (ctaEnabled ? "" : "Bem-vindo! Escolha um plano abaixo:")).trim());
+    const welcomeText = escapeHtml(itp(String(welcome.text || (ctaEnabled ? "" : "Bem-vindo! Escolha um plano abaixo:")).trim()));
 
     const welcomeKeyboard: Array<Array<Record<string, unknown>>> = [];
     if (!ctaEnabled) {
@@ -295,7 +347,7 @@ export class ExecuteSimplifiedFunnelUseCase {
       }
       const ctaKeyboard = [ctaRow];
       await sendMediaBlock({
-        tg, chatId, media: readSimpleMediaList(cta), caption: itp(String(cta.text || "").trim()),
+        tg, chatId, media: readSimpleMediaList(cta), caption: escapeHtml(itp(String(cta.text || "").trim())),
         replyMarkup: { inline_keyboard: ctaKeyboard }, protect,
       });
     }
@@ -314,7 +366,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
     if (!keyboard.length) { await tg.sendMessage({ chatId, text: "⚠️ Nenhum plano configurado.", protectContent: protect }); return; }
     const legacyDescr = plans.map((p) => (typeof p?.description === "string" ? p.description.trim() : "")).filter(Boolean);
-    const text = interpolate(intro || legacyDescr.join("\n\n") || "Planos disponíveis:", leadVars);
+    const text = escapeHtml(interpolate(intro || legacyDescr.join("\n\n") || "Planos disponíveis:", leadVars));
     await tg.sendMessage({ chatId, text, replyMarkup: { inline_keyboard: keyboard }, protectContent: protect });
   }
 
@@ -328,7 +380,7 @@ export class ExecuteSimplifiedFunnelUseCase {
         buttonLabel: nonEmptyStr(ob.button_label),
         style: ob.style,
       })),
-      introText: String(cfg.order_bumps_intro_text || ""),
+      introText: escapeHtml(String(cfg.order_bumps_intro_text || "")),
       skipText: nonEmptyStr(cfg.order_bumps_decline_label),
       skipStyle: cfg.order_bumps_decline_style,
       addOneTemplate: nonEmptyStr(cfg.order_bumps_add_one_label),
@@ -380,7 +432,7 @@ export class ExecuteSimplifiedFunnelUseCase {
     const { paymentId } = await this.generatePix({
       bot, lead, chatId, tg, payCfg, amount: totalAmount, productName: String(plan.name || "Plano"),
       ctx: { kind: "plan", funnelId: funnel.id, planId, items },
-      refKey,
+      refKey, retryCallbackData: ctx.callbackData,
     });
 
     // Agenda downsells (uma vez) p/ esse PIX.
@@ -401,11 +453,36 @@ export class ExecuteSimplifiedFunnelUseCase {
     productName: string;
     ctx: SimplifiedPaymentCtx;
     refKey: string;
+    // Callback que reproduz ESTE MESMO clique (plano/upsell/downsell/bump) — se
+    // a geração falhar, vira um botão "tentar de novo" na mensagem de erro em
+    // vez de deixar o lead sem nenhuma saída (Achado 4 da auditoria).
+    retryCallbackData?: string | null;
   }): Promise<{ paymentId: string | null }> {
-    const { bot, lead, chatId, tg, payCfg, amount, productName, ctx, refKey } = opts;
+    const { bot, lead, chatId, tg, payCfg, amount, productName, ctx, refKey, retryCallbackData } = opts;
     // amount chega em REAIS (preços do funil simplificado); gateway e tabela
     // payments trabalham em centavos. Display (fmtBRL) continua em reais.
     const amountCents = Math.round(amount * 100);
+    const retryMarkup = retryCallbackData
+      ? { inline_keyboard: [[{ text: "🔄 Tentar novamente", callback_data: retryCallbackData }]] }
+      : undefined;
+
+    // Dedupe (Achado 2/3): reaproveita um PIX pendente pra este MESMO refKey —
+    // refKey já embute oferta+bumps (ver generatePixForPlan/upsell/downsell
+    // acima), então uma seleção de bump diferente NUNCA reusa o PIX de outra
+    // combinação; a checagem de amountCents cobre o caso raro do dono editar o
+    // preço entre um clique e outro. Teto de idade: PIX morto no gateway (sem
+    // o webhook de expiração ter chegado) não é reenviado pra sempre.
+    const existing = await payRepo.findPendingByOfferRef(lead.id, refKey);
+    if (existing?.pixCode) {
+      const ageMs = Date.now() - existing.createdAt.getTime();
+      if (existing.amount === amountCents && ageMs < PIX_REUSE_MAX_AGE_MS) {
+        await this.resendPix(chatId, bot, tg, existing.pixCode);
+        return { paymentId: existing.id };
+      }
+      // Valor mudou (config editada) ou passou do teto: expira p/ liberar a
+      // constraint única (payments_pending_offer_ref_unique) antes do INSERT.
+      await payRepo.updateStatus(existing.id, "expired");
+    }
 
     // O funil não escolhe mais gateway: usa a ordem de fallback configurada no bot.
     const chain = await gwRepo.findChainForBot({ userId: bot.userId, botId: bot.id });
@@ -420,32 +497,57 @@ export class ExecuteSimplifiedFunnelUseCase {
       });
     } catch (err) {
       console.error("[simplified] createPix falhou em toda a cadeia:", err);
-      await tg.sendMessage({ chatId, text: "⚠️ Erro ao gerar PIX. Tente novamente.", protectContent: bot.protectContent });
+      await tg.sendMessage({
+        chatId, text: "⚠️ Não consegui gerar o PIX agora. Toque no botão abaixo pra tentar de novo.",
+        replyMarkup: retryMarkup, protectContent: bot.protectContent,
+      });
       return { paymentId: null };
     }
     if (!result) {
-      await tg.sendMessage({ chatId, text: "⚠️ Gateway de pagamento não configurado.", protectContent: bot.protectContent });
+      await tg.sendMessage({
+        chatId, text: "⚠️ Pagamento indisponível no momento. Toque no botão abaixo pra tentar de novo em instantes.",
+        replyMarkup: retryMarkup, protectContent: bot.protectContent,
+      });
       return { paymentId: null };
     }
     const { gateway: gw, pix } = result;
 
-    const created = await payRepo.create({
-      userId:           bot.userId,
-      botId:            bot.id,
-      leadId:           lead.id,
-      gatewayId:        gw.id,
-      offerName:        productName,
-      offerExternalRef: refKey,
-      amount:           amountCents,
-      status:           "pending",
-      saleType:         saleTypeFromCtx(ctx.kind),
-      externalId:       pix.externalId,
-      pixCode:          pix.pixCode,
-      description:      productName,
-      funnelId:         ctx.funnelId,
-      simplifiedCtx:    ctx,
-      splitSnapshot:    result.splitSnapshot,
-    });
+    let created: Payment;
+    try {
+      created = await payRepo.create({
+        userId:           bot.userId,
+        botId:            bot.id,
+        leadId:           lead.id,
+        gatewayId:        gw.id,
+        offerName:        productName,
+        offerExternalRef: refKey,
+        amount:           amountCents,
+        status:           "pending",
+        saleType:         saleTypeFromCtx(ctx.kind),
+        externalId:       pix.externalId,
+        pixCode:          pix.pixCode,
+        description:      productName,
+        funnelId:         ctx.funnelId,
+        simplifiedCtx:    ctx,
+        splitSnapshot:    result.splitSnapshot,
+      });
+    } catch (err) {
+      // Corrida: entre o findPendingByOfferRef lá em cima e este INSERT, outra
+      // execução concorrente (duplo-toque do lead, ou reentrega at-least-once
+      // do update do Telegram) já criou o pendente pra este MESMO refKey — a
+      // constraint única parcial (payments_pending_offer_ref_unique, migration
+      // 0023) barrou a duplicata. O PIX que ESTA execução gerou no gateway fica
+      // órfão; reenviamos o da concorrente que ganhou a corrida (mesmo padrão
+      // de handleOfferPurchase no funil de fluxo).
+      if (isUniqueViolation(err, "payments_pending_offer_ref_unique")) {
+        const winner = await payRepo.findPendingByOfferRef(lead.id, refKey);
+        if (winner?.pixCode) {
+          await this.resendPix(chatId, bot, tg, winner.pixCode);
+          return { paymentId: winner.id };
+        }
+      }
+      throw err;
+    }
 
     // Push para o dono do bot. Não bloqueia a entrega do PIX ao lead —
     // sendPushToUser trata os próprios erros, o catch aqui é só cinto extra.
@@ -467,6 +569,18 @@ export class ExecuteSimplifiedFunnelUseCase {
       leadName: lead.firstName ?? "", fallback: "simplified",
     });
     return { paymentId: created.id };
+  }
+
+  // Reenvia o código copia-e-cola de um PIX já pendente (dedupe) — sem repetir
+  // QR/legenda, só o essencial pra pagar. Mesmo padrão de resendPix no funil
+  // de fluxo (execute-flow-step.use-case.ts).
+  private async resendPix(chatId: string, bot: typeof bots.$inferSelect, tg: TelegramClient, pixCode: string): Promise<void> {
+    await tg.sendMessage({
+      chatId,
+      text: `<code>${escapeHtml(pixCode)}</code>`,
+      protectContent: bot.protectContent,
+      replyMarkup: pixCopyButtonMarkup(pixCode),
+    });
   }
 
   // ── Pago: entrega os itens + agenda upsells (chamado pelo subscriber paymentPaid) ──
@@ -500,11 +614,11 @@ export class ExecuteSimplifiedFunnelUseCase {
     leadVars: Map<string, string> = new Map(),
     botId?: string, lead?: { telegramChatId: bigint; telegramUsername: string | null; firstName: string | null; lastName: string | null }, paymentId?: string,
   ): Promise<void> {
-    const name = interpolate(item.name, leadVars);
+    const name = escapeHtml(interpolate(item.name, leadVars));
     if (item.delivery_type === "content" && item.delivery_url) {
-      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n🔗 Acesse seu conteúdo:\n${interpolate(item.delivery_url, leadVars)}`, protectContent: protect });
+      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n🔗 Acesse seu conteúdo:\n${escapeHtml(interpolate(item.delivery_url, leadVars))}`, protectContent: protect });
     } else if (item.delivery_type === "text" && item.delivery_text) {
-      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n${interpolate(item.delivery_text, leadVars)}`, protectContent: protect });
+      await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n${escapeHtml(interpolate(item.delivery_text, leadVars))}`, protectContent: protect });
     } else if (item.delivery_type === "vip_group" && item.vip_group_id) {
       // botId/lead só faltam quando chamado de fora de deliverPaid (não há
       // outro caller hoje) — sem eles não dá pra consultar o vencimento
@@ -571,13 +685,39 @@ export class ExecuteSimplifiedFunnelUseCase {
 
   // ── Processa tarefas agendadas vencidas (chamado pelo tick de 60s do runner) ──
   async processDueTasks(): Promise<number> {
-    const due = await db.select().from(simplifiedScheduledTasks)
-      .where(and(eq(simplifiedScheduledTasks.status, "pending"), lte(simplifiedScheduledTasks.executeAt, new Date())));
+    // Claim atômico: marca "processing" e devolve as linhas vencidas numa
+    // única query. FOR UPDATE SKIP LOCKED → com várias réplicas rodando o
+    // tick, cada uma pega um lote DISJUNTO — sem isso, a mesma tarefa vencida
+    // (upsell, downsell, lembrete) podia ser pega por duas réplicas e
+    // executada em dobro (Achado 1 da auditoria). execute_at = now() no claim
+    // marca QUANDO a tarefa foi pega: é o relógio que recoverStuckSimplifiedTasks
+    // (runner.ts) usa pra resgatar órfãs — a tabela não tem updated_at, e o
+    // execute_at ORIGINAL (o agendamento) já é passado por definição, então
+    // usá-lo direto daria falso positivo em tarefa recém-claimed. Mesmo padrão
+    // de runDuePendingDelays em runner.ts.
+    const claimed = await db.execute(sql`
+      UPDATE simplified_scheduled_tasks SET status = 'processing', execute_at = now()
+      WHERE id IN (
+        SELECT id FROM simplified_scheduled_tasks
+        WHERE status = 'pending' AND execute_at <= now()
+        ORDER BY execute_at ASC
+        LIMIT ${TASK_BATCH}
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING id, bot_id AS "botId", lead_id AS "leadId", funnel_id AS "funnelId",
+                kind, ref_id AS "refId", payment_id AS "paymentId"
+    `);
+    const due = (claimed.rows ?? []) as unknown as DueSimplifiedTask[];
 
     let processed = 0;
     for (const task of due) {
       try {
-        await db.update(simplifiedScheduledTasks).set({ status: "processing" }).where(eq(simplifiedScheduledTasks.id, task.id));
+        // Lead pausado manualmente (atendimento humano): não manda upsell nem
+        // downsell enquanto durar a pausa (Achado 6 da auditoria).
+        if (await this.isLeadPaused(task.leadId)) {
+          await db.update(simplifiedScheduledTasks).set({ status: "skipped" }).where(eq(simplifiedScheduledTasks.id, task.id));
+          continue;
+        }
         await this.runDueTask(task);
         await db.update(simplifiedScheduledTasks).set({ status: "done" }).where(eq(simplifiedScheduledTasks.id, task.id));
         processed++;
@@ -589,7 +729,15 @@ export class ExecuteSimplifiedFunnelUseCase {
     return processed;
   }
 
-  private async runDueTask(task: typeof simplifiedScheduledTasks.$inferSelect): Promise<void> {
+  // Mesma checagem do guard de pausa manual em execute-flow-step.use-case.ts
+  // (`prog?.status === "paused_manual"`), só que sem depender de já ter um
+  // `prog` carregado — usada pelo tick de tarefas, que só tem o leadId.
+  private async isLeadPaused(leadId: string): Promise<boolean> {
+    const rows = await db.select({ status: leadProgress.status }).from(leadProgress).where(eq(leadProgress.leadId, leadId));
+    return rows.some((r) => r.status === "paused_manual");
+  }
+
+  private async runDueTask(task: DueSimplifiedTask): Promise<void> {
     const [bot]    = await db.select().from(bots).where(eq(bots.id, task.botId));
     const [lead]   = await db.select().from(leads).where(eq(leads.id, task.leadId));
     const [funnel] = await db.select().from(funnels).where(eq(funnels.id, task.funnelId));
@@ -605,8 +753,8 @@ export class ExecuteSimplifiedFunnelUseCase {
       if (!u) return;
       const priceLabel = fmtBRL(Number(u.price || 0));
       const text = (typeof u.description === "string" && u.description.trim())
-        ? u.description.trim()
-        : `🎁 <b>Oferta especial só pra você!</b>\n\n<b>${u.name}</b>\n\nAdicione agora por apenas <b>${priceLabel}</b>.`;
+        ? escapeHtml(u.description.trim())
+        : `🎁 <b>Oferta especial só pra você!</b>\n\n<b>${escapeHtml(String(u.name || ""))}</b>\n\nAdicione agora por apenas <b>${priceLabel}</b>.`;
       const uStyle = telegramButtonStyle(u.style);
       await tg.sendMessage({
         chatId, text, protectContent: bot.protectContent,
@@ -626,8 +774,8 @@ export class ExecuteSimplifiedFunnelUseCase {
       if (!d) return;
       const priceLabel = fmtBRL(Number(d.price || 0));
       const text = (typeof d.description === "string" && d.description.trim())
-        ? d.description.trim()
-        : `💡 <b>Última chance!</b>\n\nQue tal levar <b>${d.name}</b> por apenas <b>${priceLabel}</b>?`;
+        ? escapeHtml(d.description.trim())
+        : `💡 <b>Última chance!</b>\n\nQue tal levar <b>${escapeHtml(String(d.name || ""))}</b> por apenas <b>${priceLabel}</b>?`;
       const dStyle = telegramButtonStyle(d.style);
       await tg.sendMessage({
         chatId, text, protectContent: bot.protectContent,

@@ -416,6 +416,17 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS "vip_members_expires_at_idx"
      ON "vip_members" USING btree ("expires_at")
      WHERE "expires_at" IS NOT NULL AND "expired_at" IS NULL`,
+
+  // 0023_payments_pending_offer_ref_unique.sql — fecha a janela de corrida do
+  // dedupe de PIX do funil SIMPLIFICADO (auditoria de 24/09): generatePix fazia
+  // check-then-act sem lock/transação entre o SELECT de "já existe pendente" e
+  // o INSERT (com uma chamada de rede ao gateway no meio) — dois cliques
+  // concorrentes no mesmo plano/upsell/downsell geravam dois PIX. Só um
+  // "pending" por (lead_id, offer_external_ref) por vez — mesmo padrão de
+  // payments_pending_offer_unique (0014), mas pela chave do simplificado.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "payments_pending_offer_ref_unique"
+     ON "payments" USING btree ("lead_id", "offer_external_ref")
+     WHERE "status" = 'pending' AND "offer_external_ref" IS NOT NULL`,
 ];
 
 export interface SchemaFailure {

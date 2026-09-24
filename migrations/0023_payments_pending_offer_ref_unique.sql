@@ -1,0 +1,13 @@
+-- Fecha a janela de corrida do dedupe de PIX do funil SIMPLIFICADO (achado da
+-- auditoria de 24/09): generatePix (execute-simplified-funnel.use-case.ts)
+-- fazia check-then-act sem lock nem transação (findPendingByOfferRef → SELECT,
+-- createPixWithFallback → chamada de rede ao gateway, payRepo.create → INSERT).
+-- Dois cliques concorrentes no mesmo plano/upsell/downsell (duplo-toque do
+-- lead, ou reentrega at-least-once do update do Telegram/pubsub do Encore)
+-- liam "sem pendente" antes de qualquer um inserir e geravam DOIS PIX pra
+-- mesma compra. Mesmo padrão de payments_pending_offer_unique (migration
+-- 0014), só que pela chave do simplificado (lead_id, offer_external_ref) em
+-- vez de (lead_id, node_id, paid_handle) do funil de fluxo. offer_external_ref
+-- só é preenchido pelo simplificado — flow nunca grava esse campo, então não
+-- há colisão entre os dois tipos de funil.
+CREATE UNIQUE INDEX "payments_pending_offer_ref_unique" ON "payments" USING btree ("lead_id","offer_external_ref") WHERE "payments"."status" = 'pending' AND "payments"."offer_external_ref" IS NOT NULL;
