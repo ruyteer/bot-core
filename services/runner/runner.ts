@@ -22,7 +22,15 @@ const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
 
 // ── Telegram update subscriber ────────────────────────────────────────────────
 
+// ackDeadline maior que o default (30s) de propósito: um único passo do funil
+// pode fazer mais de uma chamada ao Telegram (ex.: mídia com fallback de
+// cache), cada uma com até 20s de timeout + o retry conservador do
+// TelegramClient (429 pequeno, 5xx). Com o default de 30s, um passo só um
+// pouco mais lento já estourava o prazo, o Encore reentregava o MESMO update
+// e o passo do funil rodava em paralelo consigo mesmo (dois envios pro mesmo
+// lead). 120s cobre folgadamente o pior caso hoje sem reentrega falsa.
 const _sub = new Subscription(telegramUpdateReceived, "runner-process-update", {
+  ackDeadline: "120s",
   handler: async (event) => {
     try {
       await executeFlowStep.execute({ botId: event.botId, update: event.update });
@@ -253,11 +261,14 @@ export const processPendingDelays = api(
 // Os Cron Jobs do Encore só rodam no Encore Cloud; em self-hosted (Railway) não
 // disparam. Então processamos a fila com setInterval no próprio processo.
 //
-// DOIS ticks separados:
+// TRÊS ticks separados:
 // - RÁPIDO (3s): só os delays do funil de fluxo — são o "timing" que o usuário
 //   percebe (delay de 3s tem que sair em ~3s, não em até 1min). Query leve.
-// - LENTO (60s): tarefas do simplificado, broadcasts e remarketing — não são
-//   sensíveis a latência de segundos.
+// - LENTO (60s): tarefas do simplificado e remarketing — não são sensíveis a
+//   latência de segundos, mas também não deveriam levar mais que alguns
+//   segundos por chamada.
+// - BROADCASTS (60s): fora do tick lento de propósito — ver comentário em
+//   BROADCAST_TICK_MAX_MS.
 //
 // Cada tick tem guarda por TEMPO (não booleana permanente): se um travar (ex.:
 // rede), o próximo assume que morreu após o máximo e segue — evita congelar a
@@ -268,45 +279,99 @@ const FAST_TICK_MAX_MS = 60_000;
 const SLOW_TICK_MS     = 60_000;
 const SLOW_TICK_MAX_MS = 3 * 60_000;
 
-let fastRunningSince = 0;
-async function tickFast(): Promise<void> {
-  const now = Date.now();
-  if (fastRunningSince && now - fastRunningSince < FAST_TICK_MAX_MS) return;
-  fastRunningSince = now;
-  try {
-    const n = await runDuePendingDelays();
-    if (n > 0) console.log(`[runner] delays: ${n} processado(s)`);
-  } catch (err) {
-    console.error("[runner] tick rápido (delays) falhou:", err);
-  } finally {
-    fastRunningSince = 0;
-  }
+// Um disparo de milhares de leads com o espaçamento de 40ms (ver
+// process-broadcasts.use-case.ts) sozinho já passa fácil de 3min (10 mil
+// leads ≈ 7min só de espaçamento, mais a latência de cada chamada). Se
+// `processDueBroadcasts` rodasse dentro do tick LENTO (SLOW_TICK_MAX_MS =
+// 3min), um disparo grande faria esse teto estourar por conta própria —
+// mesmo sem nenhum problema real — liberando um segundo tick lento pra rodar
+// em paralelo (inclusive reprocessando simplificado/remarketing ao mesmo
+// tempo que o primeiro ainda está no meio do disparo). Por isso broadcasts
+// tem seu PRÓPRIO tick, com teto bem mais generoso: `processDueBroadcasts` já
+// se protege sozinho contra reentrada de verdade (claim atômico em
+// `scheduledMessages`, heartbeat durante o envio, resgate de "sending"
+// travado >10min) — este teto aqui é só uma rede de segurança final contra um
+// travamento genuíno (ex.: processo pendurado numa query), não um limite que
+// se espera bater em operação normal.
+const BROADCAST_TICK_MS     = 60_000;
+const BROADCAST_TICK_MAX_MS = 30 * 60_000;
+
+// Guarda de reentrada por tempo: impede que dois ticks do MESMO laço rodem em
+// paralelo, mas se recupera sozinha se um tick travar de vez (>maxMs) sem
+// nunca terminar — por isso guarda um timestamp, não uma booleana permanente.
+//
+// Bug corrigido aqui (guard do tick lento quebrado, que também existia
+// identicamente no tick rápido): o `finally` antigo zerava a marca de
+// execução incondicionalmente. Se um tick ultrapassasse maxMs e fosse
+// considerado morto (liberando um tick seguinte), mas na verdade só estivesse
+// lento, quando ele finalmente terminasse seu `finally` zerava a marca de
+// execução do tick SEGUINTE — que ainda estava rodando de verdade. Um
+// terceiro tick via a marca zerada e começava em cima do segundo, e a partir
+// daí os ticks empilhavam em cascata (exatamente o cenário que a guarda
+// deveria evitar). Guardando o timestamp que CADA execução gravou
+// (`startedAt`) e só zerando se ele ainda for o dono da marca, cada tick só
+// libera a sua PRÓPRIA execução — nunca a de quem já assumiu no lugar dele.
+// Extraída como função pura (sem depender do corpo real do tick) pra poder
+// testar essa lógica isoladamente — ver tick-guard.test.ts.
+export function createTickGuard(maxMs: number): (fn: () => Promise<void>, now?: number) => Promise<void> {
+  let runningSince = 0;
+  return async function run(fn: () => Promise<void>, now: number = Date.now()): Promise<void> {
+    if (runningSince && now - runningSince < maxMs) return;
+    runningSince = now;
+    const startedAt = runningSince;
+    try {
+      await fn();
+    } finally {
+      if (runningSince === startedAt) runningSince = 0;
+    }
+  };
 }
 
-let slowRunningSince = 0;
+const runFastTick = createTickGuard(FAST_TICK_MAX_MS);
+async function tickFast(): Promise<void> {
+  await runFastTick(async () => {
+    try {
+      const n = await runDuePendingDelays();
+      if (n > 0) console.log(`[runner] delays: ${n} processado(s)`);
+    } catch (err) {
+      console.error("[runner] tick rápido (delays) falhou:", err);
+    }
+  });
+}
+
+const runSlowTick = createTickGuard(SLOW_TICK_MAX_MS);
 async function tickSlow(): Promise<void> {
-  const now = Date.now();
-  if (slowRunningSince && now - slowRunningSince < SLOW_TICK_MAX_MS) return;
-  slowRunningSince = now;
-  try {
-    const m = await simplifiedFunnel.processDueTasks();
-    const b = await processDueBroadcasts();
-    const enrolled = await enrollRemarketingTriggers();
-    const rmk = await processDueRemarketing();
-    await recoverStuckProcessingDelays();
-    const px = await processPendingConversionEvents();
-    const vipExpired = await expireDueVipMemberships();
-    if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);
-    if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
-    if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
-    if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);
-    if (rmk > 0) console.log(`[runner] scheduler: ${rmk} mensagem(ns) de remarketing enviada(s)`);
-    if (vipExpired > 0) console.log(`[runner] scheduler: ${vipExpired} assinatura(s) VIP vencida(s) removida(s)`);
-  } catch (err) {
-    console.error("[runner] tick lento falhou:", err);
-  } finally {
-    slowRunningSince = 0;
-  }
+  await runSlowTick(async () => {
+    try {
+      const m = await simplifiedFunnel.processDueTasks();
+      const enrolled = await enrollRemarketingTriggers();
+      const rmk = await processDueRemarketing();
+      await recoverStuckProcessingDelays();
+      const px = await processPendingConversionEvents();
+      const vipExpired = await expireDueVipMemberships();
+      if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);
+      if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
+      if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);
+      if (rmk > 0) console.log(`[runner] scheduler: ${rmk} mensagem(ns) de remarketing enviada(s)`);
+      if (vipExpired > 0) console.log(`[runner] scheduler: ${vipExpired} assinatura(s) VIP vencida(s) removida(s)`);
+    } catch (err) {
+      console.error("[runner] tick lento falhou:", err);
+    }
+  });
+}
+
+// Tick dedicado a broadcasts — ver BROADCAST_TICK_MAX_MS pro porquê de não
+// estar dentro do tickSlow.
+const runBroadcastTick = createTickGuard(BROADCAST_TICK_MAX_MS);
+async function tickBroadcasts(): Promise<void> {
+  await runBroadcastTick(async () => {
+    try {
+      const b = await processDueBroadcasts();
+      if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
+    } catch (err) {
+      console.error("[runner] tick de broadcasts falhou:", err);
+    }
+  });
 }
 
 // Aplica DDLs idempotentes pendentes antes do 1º tick (self-hosted não tem migrator).
@@ -315,4 +380,5 @@ void ensureSchemaAtBoot()
   .then(() => pruneStaleRequeuedDelays());
 
 setInterval(() => { void tickFast(); }, FAST_TICK_MS);
+setInterval(() => { void tickBroadcasts(); }, BROADCAST_TICK_MS);
 setInterval(() => { void tickSlow(); }, SLOW_TICK_MS);

@@ -19,11 +19,39 @@ let originalFetch: typeof globalThis.fetch | undefined;
 // Permite um teste forçar erro num método específico do Telegram (ex.: simular
 // createChatInviteLink falhando) ou num gateway. errorCode opcional vira o
 // `error_code` da resposta (ex.: 401 = token revogado).
+//
+// `opts.retryAfterSec` controla o `parameters.retry_after` de um 429 forçado
+// (default 7, igual ao comportamento antigo) — usado pelos testes de
+// retry/backoff do TelegramClient pra simular retry_after pequeno (retenta
+// inline) ou grande (propaga) sem depender do valor fixo.
+// `opts.times` limita quantas chamadas seguidas recebem o erro forçado; depois
+// disso o mock volta a responder sucesso — simula uma falha transitória que
+// se resolve sozinha, sem precisar chamar forceTelegramError de novo no meio
+// do teste.
 const forcedErrors = new Map<string, number | undefined>();
 const forcedErrorDescriptions = new Map<string, string>();
-export function forceTelegramError(method: string, errorCode?: number, description?: string): void {
+const forcedErrorRetryAfter = new Map<string, number>();
+const forcedErrorRemaining = new Map<string, number>();
+export function forceTelegramError(
+  method: string,
+  errorCode?: number,
+  description?: string,
+  opts?: { retryAfterSec?: number; times?: number },
+): void {
   forcedErrors.set(method, errorCode);
   if (description !== undefined) forcedErrorDescriptions.set(method, description);
+  forcedErrorRetryAfter.set(method, opts?.retryAfterSec ?? 7);
+  forcedErrorRemaining.set(method, opts?.times ?? Infinity);
+}
+
+// Simula um erro de REDE/TIMEOUT (fetch lança, em vez de responder com um JSON
+// `ok: false`) — cenário AMBÍGUO (não dá pra saber se o Telegram processou a
+// requisição antes da conexão cair), diferente de `forceTelegramError` (o
+// Telegram respondeu, só que com erro). Usado pelos testes que verificam que
+// métodos não-idempotentes NÃO retentam nesse caso.
+const forcedNetworkErrors = new Map<string, number>(); // method -> quantas chamadas ainda devem falhar
+export function forceTelegramNetworkError(method: string, times = Infinity): void {
+  forcedNetworkErrors.set(method, times);
 }
 
 // Espelha o parse_mode HTML do Telegram: `&` solto (não-entidade) faz a API
@@ -144,6 +172,11 @@ export function installFetchMock(): void {
     if (tgMatch) {
       const method = tgMatch[1];
       telegramCalls.push({ method, body: body ?? {} });
+      const remainingNetworkFailures = forcedNetworkErrors.get(method) ?? 0;
+      if (remainingNetworkFailures > 0) {
+        forcedNetworkErrors.set(method, remainingNetworkFailures - 1);
+        throw new Error(`simulated network failure for ${method}`);
+      }
       if (
         rejectUnescapedHtml
         && method === "sendMessage"
@@ -157,14 +190,17 @@ export function installFetchMock(): void {
           description: "Bad Request: can't parse entities: Unsupported start tag at byte offset 0",
         });
       }
-      if (forcedErrors.has(method)) {
+      const remaining = forcedErrorRemaining.get(method) ?? Infinity;
+      if (forcedErrors.has(method) && remaining > 0) {
+        forcedErrorRemaining.set(method, remaining - 1);
         const code = forcedErrors.get(method);
+        const retryAfter = forcedErrorRetryAfter.get(method) ?? 7;
         return jsonResponse({
           ok: false,
           ...(code ? { error_code: code } : {}),
-          description: forcedErrorDescriptions.get(method) ?? (code === 429 ? "Too Many Requests: retry after 7" : "forced error"),
+          description: forcedErrorDescriptions.get(method) ?? (code === 429 ? `Too Many Requests: retry after ${retryAfter}` : "forced error"),
           // Shape real do 429 do Telegram: retry_after em parameters.
-          ...(code === 429 ? { parameters: { retry_after: 7 } } : {}),
+          ...(code === 429 ? { parameters: { retry_after: retryAfter } } : {}),
         });
       }
       return jsonResponse({ ok: true, result: telegramResult(method, body ?? {}) });
@@ -222,6 +258,9 @@ export function resetFetchMock(): void {
   otherCalls = [];
   forcedErrors.clear();
   forcedErrorDescriptions.clear();
+  forcedErrorRetryAfter.clear();
+  forcedErrorRemaining.clear();
+  forcedNetworkErrors.clear();
   forcedGatewayErrors.clear();
   forcedGatewayTimeouts.clear();
   rejectUnescapedHtml = false;
