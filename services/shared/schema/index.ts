@@ -483,7 +483,14 @@ export const trackingPixels = pgTable("tracking_pixels", {
   isActive:    boolean("is_active").notNull().default(true),
   createdAt:   timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:   timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Auditoria do backend (24/09): upsertPixel fazia select-então-insert/update
+  // sem lock — duas chamadas PUT /bots/:id/pixels/:provider concorrentes
+  // liam "não existe" e as duas inseriam, cadastrando o mesmo provider duas
+  // vezes no mesmo bot. Ver migration 0019 (dedup defensivo antes do índice)
+  // e bots.api.ts (upsertPixel agora faz onConflictDoUpdate neste índice).
+  uniqueIndex("tracking_pixels_bot_id_provider_unique").on(t.botId, t.provider),
+]);
 
 // Cliques dos links rastreáveis de tráfego pago (/r?b=...). A plataforma de
 // ads substitui as macros, o endpoint grava tudo aqui sob um token tk_ e

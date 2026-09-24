@@ -293,6 +293,49 @@ const STATEMENTS: string[] = [
   // Produção conferida antes (só leitura): 18 perfis, zero duplicata de
   // lower(email), nenhum email nulo.
   `CREATE UNIQUE INDEX IF NOT EXISTS "profiles_email_lower_unique" ON "profiles" (lower("email"))`,
+
+  // 0019_indices_runner_e_pixels.sql — auditoria do backend (24/09), índices
+  // que faltam nas tabelas quentes do runner (tick de 3s/60s e update do
+  // Telegram). CONCURRENTLY: cada statement deste bootstrap roda isolado, sem
+  // BEGIN/COMMIT em volta (ver ensureSchema abaixo), então CONCURRENTLY é
+  // seguro aqui. Detalhe de cada índice (arquivo:linha da consulta que atende)
+  // no comentário da migration.
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "scheduled_delays_status_execute_at_idx"
+     ON "scheduled_delays" ("status", "execute_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "simplified_scheduled_tasks_status_execute_at_idx"
+     ON "simplified_scheduled_tasks" ("status", "execute_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "scheduled_messages_status_scheduled_at_idx"
+     ON "scheduled_messages" ("status", "scheduled_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "remarketing_lead_state_status_next_send_at_idx"
+     ON "remarketing_lead_state" ("status", "next_send_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "conversion_events_status_created_at_idx"
+     ON "conversion_events" ("status", "created_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "payments_external_id_idx"
+     ON "payments" ("external_id")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "payments_bot_id_status_created_at_idx"
+     ON "payments" ("bot_id", "status", "created_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "leads_bot_id_updated_at_idx"
+     ON "leads" ("bot_id", "updated_at")`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS "lead_messages_lead_id_created_at_idx"
+     ON "lead_messages" ("lead_id", "created_at")`,
+
+  // tracking_pixels: unicidade por (bot_id, provider) — antes disto dava pra
+  // cadastrar o mesmo provider duas vezes no mesmo bot (upsertPixel fazia
+  // select-então-insert/update sem lock). DESTRUTIVO se já houver duplicata em
+  // produção: ver comentário completo na migration 0019 — mantém só a linha
+  // mais recentemente atualizada de cada (bot_id, provider) e apaga as
+  // demais (nenhuma FK aponta para tracking_pixels.id).
+  `DELETE FROM "tracking_pixels" t
+     USING (
+       SELECT id, row_number() OVER (
+         PARTITION BY bot_id, provider
+         ORDER BY updated_at DESC, created_at DESC, id DESC
+       ) AS rn
+       FROM "tracking_pixels"
+     ) ranked
+     WHERE t.id = ranked.id AND ranked.rn > 1`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "tracking_pixels_bot_id_provider_unique"
+     ON "tracking_pixels" ("bot_id", "provider")`,
 ];
 
 export interface SchemaFailure {
