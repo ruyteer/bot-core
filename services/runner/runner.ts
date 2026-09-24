@@ -237,6 +237,42 @@ async function recoverStuckSimplifiedTasks(): Promise<void> {
   }
 }
 
+// ── Poda de processed_telegram_updates (dedupe de update, Achado 1 da auditoria) ─
+// Uma linha por update de CADA bot, pra sempre — sem poda, a tabela cresce sem
+// limite. O Telegram não reentrega um update passado esse prazo (o próprio
+// webhook expira bem antes), então é seguro apagar o que passou de ~48h. Em
+// lotes (não um DELETE só): a primeira poda depois de meses acumulando não
+// pode travar a tabela numa transação gigante.
+const PROCESSED_UPDATES_CLEANUP_BATCH = 5_000;
+
+export async function cleanupProcessedTelegramUpdates(): Promise<number> {
+  let total = 0;
+  try {
+    for (;;) {
+      // `RETURNING` + `.rows.length` em vez de `rowCount`: o driver de
+      // produção (pg) preenche `rowCount` certinho, mas o PGlite dos testes
+      // devolve `affectedRows` — `rowCount` some (undefined) e o loop achava
+      // que não tinha nada pra apagar. `.rows` funciona igual nos dois.
+      const res = await db.execute<{ bot_id: string }>(sql`
+        DELETE FROM processed_telegram_updates
+        WHERE ctid IN (
+          SELECT ctid FROM processed_telegram_updates
+          WHERE created_at < now() - interval '48 hours'
+          LIMIT ${PROCESSED_UPDATES_CLEANUP_BATCH}
+        )
+        RETURNING bot_id
+      `);
+      const n = res.rows?.length ?? 0;
+      total += n;
+      if (n < PROCESSED_UPDATES_CLEANUP_BATCH) break;
+    }
+    if (total > 0) console.log(`[runner] processed_telegram_updates: ${total} registro(s) antigo(s) podado(s)`);
+  } catch (err) {
+    console.error("[runner] poda de processed_telegram_updates falhou:", err);
+  }
+  return total;
+}
+
 // ── Resgate one-shot dos delays mortos pelo incidente de 429 (2026-08-07) ────
 // Delays marcados "failed" nas últimas 24h eram, na maioria, 429 do Telegram —
 // os leads não receberam NADA, então reprocessar é o correto. Escalonados a 2s
@@ -366,6 +402,7 @@ async function tickSlow(): Promise<void> {
       const rmk = await processDueRemarketing();
       await recoverStuckProcessingDelays();
       await recoverStuckSimplifiedTasks();
+      await cleanupProcessedTelegramUpdates();
       const px = await processPendingConversionEvents();
       const vipExpired = await expireDueVipMemberships();
       if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);

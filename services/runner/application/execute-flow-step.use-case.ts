@@ -3,7 +3,7 @@ import { db } from "../../shared/database.js";
 import {
   leads, leadProgress, leadVariables, leadMessages,
   funnels, funnelBots, funnelNodes, nodeConnections, scheduledDelays, bots, botGroups,
-  funnelOffers, leadEvents,
+  funnelOffers, leadEvents, processedTelegramUpdates,
 } from "../../shared/schema/index.js";
 import { TelegramClient, urlButtonMarkup, pixCopyButtonMarkup } from "./telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
@@ -755,7 +755,28 @@ async function describeInboundButtonClick(
 }
 
 async function advanceProgress(progressId: string, nodeId: string | null, status: string): Promise<void> {
-  await db.update(leadProgress).set({ currentNodeId: nodeId, status, updatedAt: new Date() })
+  // Qualquer avanço/parada LEGÍTIMA limpa um `stallReason` deixado por um
+  // beco sem saída anterior — senão o rótulo de diagnóstico ficaria grudado
+  // no progresso mesmo depois de o lead voltar a andar (retomada por delay,
+  // novo clique válido, etc.).
+  await db.update(leadProgress).set({ currentNodeId: nodeId, status, stallReason: null, updatedAt: new Date() })
+    .where(eq(leadProgress.id, progressId));
+}
+
+// Beco sem saída do funil: o lead tomou um caminho (clicou num botão/oferta
+// real, ou uma oferta ficou sem NENHUMA saída configurada) que não leva a
+// nenhum nó — sem isto o lead simplesmente parava, sem registro nenhum, e
+// ninguém no painel via o motivo. Não muda `status` nem `currentNodeId` (o
+// lead continua exatamente onde estava, pronto pra um clique válido depois)
+// — só registra, em log estruturado e no próprio progresso, POR QUÊ ele
+// parou. Funis bem montados (toda saída usada tem aresta) nunca disparam isto.
+async function markStall(progressId: string, reason: string, extra: Record<string, unknown> = {}): Promise<void> {
+  console.warn("[runner] beco sem saída no funil:", { progressId, reason, ...extra });
+  // Só o motivo — não mexe em `updatedAt` (não é um avanço nem uma retomada
+  // do lead, e mudar `updatedAt` aqui distorceria qualquer leitura que use
+  // essa coluna como "última atividade" de verdade, ex.: o próprio desempate
+  // da migração 0025).
+  await db.update(leadProgress).set({ stallReason: reason })
     .where(eq(leadProgress.id, progressId));
 }
 
@@ -764,6 +785,30 @@ async function advanceProgress(progressId: string, nodeId: string | null, status
 export class ExecuteFlowStepUseCase {
   async execute(ctx: ExecutionContext): Promise<void> {
     const { botId, update } = ctx;
+
+    // ── Dedupe de update do Telegram ─────────────────────────────────────────
+    // `telegramUpdateReceived` é at-least-once (ver services/shared/events/
+    // index.ts) e o próprio Telegram reentrega o mesmo update em retry de
+    // webhook — sem isto, o MESMO update roda o passo do funil de novo (dois
+    // avanços de progresso, duas cobranças). `update_id` é sequencial só
+    // DENTRO do bot, daí a chave composta (bot_id, update_id) — o INSERT com
+    // `onConflictDoNothing` é o próprio lock: só quem inserir de fato segue.
+    // Falha no CLAIM em si (não conflito — isso o onConflictDoNothing já
+    // resolve sem erro) tolera e processa mesmo assim: por exemplo, a tabela
+    // ainda não existir num boot no meio do rollout da migração. Um update
+    // processado em dobro nessa janela rara é melhor do que dropar updates
+    // reais por causa de uma tabela auxiliar de dedupe.
+    if (typeof update.update_id === "number") {
+      try {
+        const claimed = await db.insert(processedTelegramUpdates)
+          .values({ botId, updateId: update.update_id })
+          .onConflictDoNothing()
+          .returning({ botId: processedTelegramUpdates.botId });
+        if (claimed.length === 0) return; // já processado (retry/reentrega)
+      } catch (err) {
+        console.error("[runner] claim de dedupe do update falhou — processando mesmo assim:", err);
+      }
+    }
 
     // ── Bot adicionado/removido de grupo/canal (my_chat_member) ─────────────
     if (update.my_chat_member) {
@@ -1094,6 +1139,21 @@ export class ExecuteFlowStepUseCase {
           ));
           await advanceProgress(prog.id, nextId, "active");
           await this.runNode(prog.funnelId, nextId, prog.id, lead.id, botId, chatIdStr, tg, bot.protectContent, vars, null);
+        } else if (known) {
+          // Beco sem saída de verdade: um botão DESTE nó, identificado com
+          // CERTEZA (formato atual com escopo de nó, ou posição válida já
+          // resolvida contra o nó de origem) — sem isto o lead parava aqui
+          // sem NENHUM registro em lugar nenhum.
+          //
+          // Não usa `ownsClick` (mais largo, inclui o casamento por handle
+          // LITERAL contra `callbackData` cru): esse fallback existe pra
+          // decidir se um handle órfão pode seguir pela saída genérica, mas
+          // pode bater por COINCIDÊNCIA com o handle de um botão do nó atual
+          // mesmo quando o clique é de um teclado ANTIGO de outro nó — nesse
+          // caso marcar seria falso positivo.
+          await markStall(prog.id, "botao_sem_conexao", {
+            nodeId: originNode.id, callbackData,
+          });
         }
         return;
       }
@@ -1283,31 +1343,36 @@ export class ExecuteFlowStepUseCase {
 
     const [prog] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
 
+    // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
+    // (o "sem clique" do nó onde o lead estava, o timeout de "sem ação" de
+    // uma oferta, um nó `delay`) ficaria órfão e depois arrancaria o lead do
+    // funil recomeçado. Cancela antes de reposicionar no trigger.
     if (prog) {
-      // Recomeço reaproveita o MESMO progressId, então qualquer delay pendente
-      // (o "sem clique" do nó onde o lead estava, o timeout de "sem ação" de
-      // uma oferta, um nó `delay`) ficaria órfão e depois arrancaria o lead
-      // do funil recomeçado. Cancela antes de reposicionar no trigger.
       await db.delete(scheduledDelays).where(and(
         eq(scheduledDelays.progressId, prog.id),
         eq(scheduledDelays.status, "pending"),
       ));
-      await db.update(leadProgress)
-        .set({ funnelId, currentNodeId: triggerNode.id, status: "active", updatedAt: new Date() })
-        .where(eq(leadProgress.id, prog.id));
-    } else {
-      await db.insert(leadProgress).values({
-        leadId,
-        funnelId,
-        currentNodeId: triggerNode.id,
-        status:        "active",
-      });
     }
+    // Upsert atômico por `lead_id` (índice único, migração 0025) — o SELECT de
+    // `prog` acima e este write não são atômicos entre si, então duas chamadas
+    // concorrentes pro MESMO lead (um `/start` disparado bem na hora de um
+    // broadcast com funil, ou retry do pubsub) não podem terminar criando dois
+    // progressos nem estourando a constraint: a segunda vira UPDATE em vez de
+    // falhar. Único ponto de escrita de `lead_progress` no funil de fluxo —
+    // qualquer outro insert deve passar por aqui.
+    const [newProg] = await db.insert(leadProgress).values({
+      leadId,
+      funnelId,
+      currentNodeId: triggerNode.id,
+      status:        "active",
+    }).onConflictDoUpdate({
+      target: leadProgress.leadId,
+      set: { funnelId, currentNodeId: triggerNode.id, status: "active", stallReason: null, updatedAt: new Date() },
+    }).returning();
 
     // Execute from the node AFTER the trigger
     const afterTriggerId = await nextNode(funnelId, triggerNode.id);
     if (afterTriggerId) {
-      const [newProg] = await db.select().from(leadProgress).where(eq(leadProgress.leadId, leadId));
       await this.runNode(funnelId, afterTriggerId, newProg.id, leadId, botId, chatId, tg, protect, vars, null);
     }
     return true;
@@ -1845,6 +1910,11 @@ export class ExecuteFlowStepUseCase {
       if (!target) continue;
       targets.add(target);
     }
+    // Sem __pending/__no_action pra seguir (kind="unpaid", PIX já gerado): NÃO
+    // é beco sem saída — a oferta continua tendo saída __paid (ou a genérica,
+    // via handlePaidOffer) enquanto o lead puder pagar. Sem timeout de
+    // lembrete configurado é design válido (igual buttons/wait_response sem
+    // timeout: espera indefinidamente), não falta de registro.
     for (const target of targets) {
       await db.insert(scheduledDelays).values({
         botId, leadId, funnelId, progressId, nextNodeId: target, executeAt, status: "pending",
@@ -1962,13 +2032,6 @@ export class ExecuteFlowStepUseCase {
       }
     }
 
-    // O lead interagiu com a oferta → cancela o timeout de "sem ação" pendente
-    // deste progresso (só há os do nó de oferta atual).
-    await db.delete(scheduledDelays).where(and(
-      eq(scheduledDelays.progressId, prog.id),
-      eq(scheduledDelays.status, "pending"),
-    ));
-
     // offer.price está em REAIS no nó do funil; gateway e tabela payments usam centavos.
     // Order bump soma no MESMO PIX (não gera cobrança à parte) — paridade com o simplificado.
     const offerPriceReais = typeof offer.price === "number" ? offer.price : 0;
@@ -1996,6 +2059,10 @@ export class ExecuteFlowStepUseCase {
     } catch (err) {
       console.error("[runner] createPix falhou em toda a cadeia:", err);
       await tg.sendMessage({ chatId, text: "Não consegui gerar o PIX agora. Tente novamente em instantes.", protectContent: bot.protectContent });
+      // Nada foi cancelado ainda neste ponto (a limpeza do timeout "sem ação"
+      // só acontece MAIS ABAIXO, depois do PIX gerado e persistido) — sem PIX
+      // nenhum, o timeout agendado na apresentação da oferta continua de pé,
+      // então o lead não fica sem nenhum jeito de sair.
       return;
     }
     if (!result) {
@@ -2058,6 +2125,32 @@ export class ExecuteFlowStepUseCase {
       body:      `${formatBotHandle(bot.telegramUsername)} · ${productName} — R$ ${(amount / 100).toFixed(2)}`,
       data:      { url: "/sales", lead_id: lead.id },
     }).catch((err) => console.error("[runner] push de PIX gerado falhou:", err));
+
+    // O lead interagiu com ESTA oferta e o PIX já está persistido → cancela o
+    // timeout "sem ação" DELA (o que a apresentação agendou), pelos DOIS
+    // alvos possíveis — __no_action E __pending, não só um via `??` — antes
+    // de agendar o novo "não pago" abaixo. Um re-clique depois do PIX expirar
+    // (o `existing`/`transitionStatus` lá em cima) passa por aqui de novo:
+    // pegar só um dos dois alvos deixava o outro (o __pending já agendado no
+    // clique anterior) vivo, e o insert do "unpaid" abaixo duplicava a linha.
+    //
+    // Escopado por ALVO, não por progressId inteiro: um nó de oferta pode ter
+    // MAIS de uma oferta, cada uma com seu próprio "sem ação" apontando pra
+    // nós diferentes. Mantém de propósito os "sem ação" das ofertas IRMÃS
+    // vivos — decisão de produto ainda em aberto se comprar uma oferta deve
+    // cancelar o cronômetro das outras do mesmo nó; por ora só a oferta que o
+    // lead de fato tocou perde o timeout dela.
+    const staleTargets = (await Promise.all([
+      nextNode(prog.funnelId, node.id, `${handleId}__no_action`),
+      nextNode(prog.funnelId, node.id, `${handleId}__pending`),
+    ])).filter((t): t is string => !!t);
+    if (staleTargets.length > 0) {
+      await db.delete(scheduledDelays).where(and(
+        eq(scheduledDelays.progressId, prog.id),
+        eq(scheduledDelays.status, "pending"),
+        inArray(scheduledDelays.nextNodeId, staleTargets),
+      ));
+    }
 
     // Gerou PIX e não pagou → dispara o ramo __pending após o unpaid_timeout.
     // Cancelado quando o pagamento confirma (handlePaidOffer).
@@ -2225,17 +2318,12 @@ export class ExecuteFlowStepUseCase {
     const chatId = lead.telegramChatId.toString();
     const vars   = await getVars(lead.id, bot.id);
 
-    // Pagou → cancela o timeout __pending pendente deste progresso.
-    await db.delete(scheduledDelays).where(and(
-      eq(scheduledDelays.progressId, payment.progressId),
-      eq(scheduledDelays.status, "pending"),
-    ));
-
     // Localiza a oferta paga p/ entregar o produto (handle sem o sufixo __paid).
     // collectNodeOffers cobre tanto o nó offer quanto ofertas embutidas em message.
     const handleId = payment.paidHandle.replace(/__paid$/, "");
     const offer    = collectNodeOffers(node.content as Record<string, unknown>)
       .find((x) => x.handleId === handleId)?.offer;
+
     if (offer) {
       await this.deliverOffer(offer, chatId, tg, bot.protectContent, vars, bot.id, lead, payment.id)
         .catch((e) => console.error("[runner] entrega da oferta falhou:", e));
@@ -2260,6 +2348,19 @@ export class ExecuteFlowStepUseCase {
       )).limit(1);
       nextId = defaultConn?.targetNodeId ?? null;
     }
+
+    // O lead SAI deste nó agora (avança pra nextId ou o progresso encerra) —
+    // cancela TODOS os delays pendentes do progresso, não só o desta oferta.
+    // Diferente de handleOfferPurchase (onde o lead CONTINUA no mesmo nó, daí
+    // o escopo por alvo): aqui, se o timeout de um downsell já em curso (de um
+    // "sem ação"/"não pago" anterior) ou o "sem ação" de uma oferta irmã deste
+    // MESMO nó sobrevivesse, ele dispararia depois pra alguém que já saiu —
+    // inclusive empurrando um downsell pra quem acabou de pagar.
+    await db.delete(scheduledDelays).where(and(
+      eq(scheduledDelays.progressId, payment.progressId),
+      eq(scheduledDelays.status, "pending"),
+    ));
+
     if (nextId) {
       await advanceProgress(prog.id, nextId, "active");
       await this.runNode(payment.funnelId, nextId, prog.id, lead.id, bot.id, chatId, tg, bot.protectContent, vars, null);

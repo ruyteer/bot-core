@@ -58,6 +58,11 @@ export async function sendPixMessages(opts: {
   fallback: "simplified" | "flow";
 }): Promise<void> {
   const { tg, chatId, pixCode, qrPhoto, amountReais, productName, payCfg, protect } = opts;
+  // `nome`/`produto` NÃO são escapados aqui: `replacePixVariables` já escapa
+  // cada valor antes de substituir no template (`nome` vem do first_name do
+  // Telegram, controlado pelo LEAD; `produto` é texto livre da oferta —
+  // parse_mode HTML por padrão, um `<`/`&` cru quebraria a mensagem). Escapar
+  // dos dois lados dobraria a entidade ("A & B" → "A &amp;amp; B").
   const pixVars = {
     nome: opts.leadName ?? "",
     valor: fmtBRL(amountReais),
