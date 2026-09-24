@@ -381,4 +381,18 @@ export class TelegramClient {
     }) as { invite_link: string };
     return result.invite_link;
   }
+
+  // Remove um membro do grupo por vencimento de acesso VIP (ver
+  // expireDueVipMemberships em vip-membership.ts). `revoke_messages` não é
+  // usado — expirar acesso não deve apagar as mensagens que o membro mandou.
+  async banChatMember(chatId: string, userId: string): Promise<void> {
+    await this.call("banChatMember", { chat_id: chatId, user_id: Number(userId) });
+  }
+
+  // Desbane logo em seguida do ban acima: sem isso o ban do Telegram é
+  // permanente e o membro não conseguiria voltar a entrar numa renovação
+  // futura, mesmo com um novo convite.
+  async unbanChatMember(chatId: string, userId: string): Promise<void> {
+    await this.call("unbanChatMember", { chat_id: chatId, user_id: Number(userId), only_if_banned: true });
+  }
 }

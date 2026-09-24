@@ -79,9 +79,37 @@ export const vipMembers = pgTable("vip_members", {
   lastName:       text("last_name"),
   isBlocked:      boolean("is_blocked").notNull().default(false),
   joinedAt:       timestamp("joined_at", { withTimezone: true }).defaultNow().notNull(),
+  // Ciclo de vida da assinatura VIP (migration 0022). `accessDays`/`expiresAt`
+  // nulos = vitalício (oferta sem prazo). `expiredAt` é gravado pelo job de
+  // expiração do runner quando o membro é banido+desbanido do grupo por
+  // vencimento — é o que o gatilho `vip_expired` do remarketing deve consultar
+  // (hoje não suportado por falta desta coluna; ver process-remarketing.use-case.ts).
+  // `expireClaimedAt` é o claim atômico do job (mesmo truque de `execute_at` em
+  // scheduled_delays): evita duas réplicas do runner banirem o mesmo membro 2x.
+  accessDays:      integer("access_days"),
+  expiresAt:       timestamp("expires_at", { withTimezone: true }),
+  expiredAt:       timestamp("expired_at", { withTimezone: true }),
+  expireClaimedAt: timestamp("expire_claimed_at", { withTimezone: true }),
+  // Compra que concedeu/renovou o acesso atual (nem sempre há uma oferta do
+  // catálogo: oferta embutida em node de funil flow não tem linha em
+  // `funnel_offers`, então `offerId` fica nulo nesse caso).
+  paymentId:      uuid("payment_id").references(() => payments.id, { onDelete: "set null" }),
+  offerId:        uuid("offer_id").references(() => funnelOffers.id, { onDelete: "set null" }),
   createdAt:      timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt:      timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (t) => [
+  // Renovação estende/reativa a mesma linha em vez de duplicar (ver
+  // registerOrRenewVipMembership em services/runner/application/vip-membership.ts).
+  // Parcial (WHERE group_id IS NOT NULL) porque group_id é opcional — sem grupo
+  // resolvido não há como deduplicar nem expirar automaticamente mesmo.
+  uniqueIndex("vip_members_bot_group_chat_unique")
+    .on(t.botId, t.groupId, t.telegramChatId)
+    .where(sql`${t.groupId} IS NOT NULL`),
+  // Usado pelo job de expiração do runner (claim atômico por lote).
+  index("vip_members_expires_at_idx")
+    .on(t.expiresAt)
+    .where(sql`${t.expiresAt} IS NOT NULL AND ${t.expiredAt} IS NULL`),
+]);
 
 // ─── LEADS ────────────────────────────────────────────────────────────────────
 

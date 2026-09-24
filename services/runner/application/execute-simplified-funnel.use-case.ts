@@ -15,6 +15,7 @@ import { PaymentDrizzleRepository, type SaleType } from "../../payments/infrastr
 import { createPixWithFallback } from "../../payments/application/create-pix-with-fallback.js";
 import type { SimplifiedPaymentCtx, SimplifiedDeliveryItem, Payment } from "../../payments/domain/payment.entity.js";
 import { sendPushToUser, PUSH_EVENT_TYPES } from "../../notifications/application/send-push.use-case.js";
+import { registerOrRenewVipMembership, previewVipInviteExpireEpoch } from "./vip-membership.js";
 
 const gwRepo  = new GatewayDrizzleRepository();
 const payRepo = new PaymentDrizzleRepository();
@@ -484,7 +485,8 @@ export class ExecuteSimplifiedFunnelUseCase {
 
     const leadVars = leadFieldsMap(lead);
     for (const item of ctx.items ?? []) {
-      await this.deliverItem(tg, chatId, item, lead.id, protect, leadVars).catch((e) => console.error("[simplified] deliverItem:", e));
+      await this.deliverItem(tg, chatId, item, lead.id, protect, leadVars, bot.id, lead, payment.id)
+        .catch((e) => console.error("[simplified] deliverItem:", e));
     }
 
     if (ctx.kind === "plan" && ctx.planId) {
@@ -493,14 +495,23 @@ export class ExecuteSimplifiedFunnelUseCase {
     }
   }
 
-  private async deliverItem(tg: TelegramClient, chatId: string, item: SimplifiedDeliveryItem, leadId: string, protect: boolean, leadVars: Map<string, string> = new Map()): Promise<void> {
+  private async deliverItem(
+    tg: TelegramClient, chatId: string, item: SimplifiedDeliveryItem, leadId: string, protect: boolean,
+    leadVars: Map<string, string> = new Map(),
+    botId?: string, lead?: { telegramChatId: bigint; telegramUsername: string | null; firstName: string | null; lastName: string | null }, paymentId?: string,
+  ): Promise<void> {
     const name = interpolate(item.name, leadVars);
     if (item.delivery_type === "content" && item.delivery_url) {
       await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n🔗 Acesse seu conteúdo:\n${interpolate(item.delivery_url, leadVars)}`, protectContent: protect });
     } else if (item.delivery_type === "text" && item.delivery_text) {
       await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n${interpolate(item.delivery_text, leadVars)}`, protectContent: protect });
     } else if (item.delivery_type === "vip_group" && item.vip_group_id) {
-      const expireDate = (item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined;
+      // botId/lead só faltam quando chamado de fora de deliverPaid (não há
+      // outro caller hoje) — sem eles não dá pra consultar o vencimento
+      // empilhado, cai no cálculo simples (só os dias desta entrega).
+      const expireDate = botId && lead
+        ? await previewVipInviteExpireEpoch(botId, item.vip_group_id, lead.telegramChatId, item.access_days)
+        : ((item.access_days || 0) > 0 ? Math.floor(Date.now() / 1000) + (item.access_days as number) * 86400 : undefined);
       try {
         const link = await tg.createChatInviteLink(item.vip_group_id, { memberLimit: 1, expireDate });
         await tg.sendMessage({
@@ -509,6 +520,15 @@ export class ExecuteSimplifiedFunnelUseCase {
           replyMarkup: urlButtonMarkup("🚀 Entrar no grupo VIP", link),
           protectContent: protect,
         });
+        // botId/lead/paymentId só faltam quando chamado de fora de deliverPaid
+        // (não há outro caller hoje) — checagem defensiva, não bloqueia entrega.
+        if (botId && lead) {
+          await registerOrRenewVipMembership({
+            botId, groupTelegramChatId: item.vip_group_id, memberTelegramChatId: lead.telegramChatId,
+            username: lead.telegramUsername, firstName: lead.firstName, lastName: lead.lastName,
+            accessDays: item.access_days ?? null, paymentId: paymentId ?? null, offerId: null,
+          }).catch((e) => console.error("[simplified] registerOrRenewVipMembership:", e));
+        }
       } catch (err) {
         console.error("[simplified] createChatInviteLink:", err);
         await tg.sendMessage({ chatId, text: `📦 <b>${name}</b>\n\n⚠️ Não foi possível gerar o link de convite automaticamente. Entre em contato com o suporte.`, protectContent: protect });

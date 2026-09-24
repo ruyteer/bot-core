@@ -15,6 +15,7 @@ import { ensureSchemaAtBoot } from "../shared/ensure-schema.js";
 import { processPendingConversionEvents } from "../bots/application/pixel-events.js";
 import { routePaidPayment } from "./application/paid-routing.js";
 import { deliverPaidOnce } from "./application/deliver-paid-once.js";
+import { expireDueVipMemberships } from "./application/vip-membership.js";
 
 const executeFlowStep   = new ExecuteFlowStepUseCase();
 const simplifiedFunnel  = new ExecuteSimplifiedFunnelUseCase();
@@ -294,11 +295,13 @@ async function tickSlow(): Promise<void> {
     const rmk = await processDueRemarketing();
     await recoverStuckProcessingDelays();
     const px = await processPendingConversionEvents();
+    const vipExpired = await expireDueVipMemberships();
     if (px > 0) console.log(`[runner] scheduler: ${px} evento(s) de pixel processado(s)`);
     if (m > 0) console.log(`[runner] scheduler: ${m} tarefa(s) simplificada(s) processada(s)`);
     if (b > 0) console.log(`[runner] scheduler: ${b} broadcast(s) processado(s)`);
     if (enrolled > 0) console.log(`[runner] scheduler: ${enrolled} lead(s) inscrito(s) em remarketing`);
     if (rmk > 0) console.log(`[runner] scheduler: ${rmk} mensagem(ns) de remarketing enviada(s)`);
+    if (vipExpired > 0) console.log(`[runner] scheduler: ${vipExpired} assinatura(s) VIP vencida(s) removida(s)`);
   } catch (err) {
     console.error("[runner] tick lento falhou:", err);
   } finally {
