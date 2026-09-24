@@ -548,3 +548,158 @@ describe("processDueBroadcasts — disparo inicia funil (funnelId)", () => {
     // tentar startFunnelForLead para o grupo (não há leadId de grupo).
   });
 });
+
+// Item de auditoria: filterType desconhecido (a API não valida por enum —
+// broadcasts.api.ts guarda como string livre) acabava caindo no `return all`
+// default de getAudienceLeads e mandando pra TODO MUNDO. Deve falhar fechado.
+describe("processDueBroadcasts — filterType desconhecido falha fechado", () => {
+  it("filterType não reconhecido não envia pra ninguém (nunca vira 'todos')", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9401n);
+    await createLead(bot.id, 9402n);
+    await seedMsg(bot.id, bot.userId, { message: "promo", filterType: "vip_secreto_inexistente" });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    expect(getTelegramCalls("sendMessage").length).toBe(0);
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].totalTargets).toBe(0);
+  });
+
+  it("filterType 'product' sem filterProductId não envia pra ninguém", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9403n);
+    await seedMsg(bot.id, bot.userId, { message: "promo", filterType: "product" }); // sem advancedFilters.filter_product_id
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMessage").length).toBe(0);
+  });
+});
+
+// Item de auditoria: disparo em massa sem rate limit/backoff/retry — 429 do
+// Telegram derrubava a mensagem na hora (contava como falha, nunca reenviada)
+// e um 401 (token inválido) era tentado lead por lead, repetindo o mesmo erro
+// centenas de vezes (log real de produção: "sendPhoto failed [401]:
+// Unauthorized" num disparo inteiro).
+describe("processDueBroadcasts — rate limit, backoff e 401 (fix disparo em massa)", () => {
+  it("401 (token inválido) interrompe o envio deste bot — não tenta lead por lead", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9501n);
+    await createLead(bot.id, 9502n);
+    await createLead(bot.id, 9503n);
+    forceTelegramError("sendMessage", 401, "Unauthorized");
+    await seedMsg(bot.id, bot.userId, { message: "promo" });
+
+    const n = await processDueBroadcasts();
+    expect(n).toBe(1);
+    // Só UMA tentativa — os outros 2 leads nunca chegam a ser tentados.
+    expect(getTelegramCalls("sendMessage").length).toBe(1);
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].totalTargets).toBe(1); // só o lead que revelou o 401 conta como alvo
+    expect(runs[0].failedCount).toBe(1);
+    expect(runs[0].status).toBe("failed");
+  });
+
+  it("401 num bot não impede o disparo de continuar pros outros bots da lista", async () => {
+    const botA = await createBot();
+    const botB = await createBot({ userId: botA.userId });
+    await createLead(botA.id, 9511n);
+    await createLead(botB.id, 9512n);
+    const msg = await seedMsg(botA.id, botA.userId, { botIds: [botA.id, botB.id] });
+    const db = await testDb();
+    // Só o token do bot A está "inválido" — simulado forçando 401 só na
+    // primeira chamada de sendMessage (bot A é processado primeiro).
+    forceTelegramError("sendMessage", 401, "Unauthorized", { times: 1 });
+
+    await processDueBroadcasts();
+    // Bot A falha (401), bot B (processado em seguida) entrega normalmente.
+    expect(getTelegramCalls("sendMessage").length).toBe(2);
+    const runs = await db.select().from(broadcastRuns).where(eq(broadcastRuns.scheduledMessageId, msg.id));
+    expect(runs[0].sentCount).toBe(1);
+    expect(runs[0].failedCount).toBe(1);
+  });
+
+  it("429 com retry_after grande é honrado (espera e reenvia) em vez de perder a mensagem", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9521n);
+    // retry_after 3s (> limite de retry inline do client, 2s) — só a 1ª
+    // chamada falha (times: 1); a 2ª, feita pelo backoff do broadcast, entrega.
+    forceTelegramError("sendMessage", 429, undefined, { retryAfterSec: 3, times: 1 });
+    await seedMsg(bot.id, bot.userId, { message: "promo" });
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMessage").length).toBe(2); // 1ª falhou, 2ª (retry) entregou
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].sentCount).toBe(1);
+    expect(runs[0].failedCount).toBe(0);
+  }, 10_000);
+
+  it("429 num envio de mídia (múltiplas chamadas) NÃO reexecuta — evita duplicar o que já foi entregue", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9540n);
+    // 2 fotos (dispara sendMediaGroup) + botão inline (dispara um 2º sendMessage
+    // de teclado depois do álbum) — exatamente a sequência de 2 chamadas onde
+    // reexecutar o fechamento inteiro duplicaria o álbum já entregue.
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: {
+        media: [
+          { url: "https://cdn/a.jpg", media_type: "image" },
+          { url: "https://cdn/b.jpg", media_type: "image" },
+        ],
+        inline_buttons: [{ text: "Saiba mais", url: "https://x.com" }],
+      } as Record<string, unknown>,
+    });
+    // O álbum (sendMediaGroup) entrega normalmente; só o sendMessage de
+    // teclado que vem depois falha com 429 grande (persistente).
+    forceTelegramError("sendMessage", 429, undefined, { retryAfterSec: 3 });
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendMediaGroup").length).toBe(1); // álbum enviado só UMA vez, nunca duplicado
+    expect(getTelegramCalls("sendMessage").length).toBe(1); // falhou, sem nova tentativa (envio composto)
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].failedCount).toBe(1);
+    expect(runs[0].sentCount).toBe(0);
+  });
+
+  it("429 com UMA única mídia (mesmo com teclado) É reexecutado — é sempre 1 chamada, seguro retentar", async () => {
+    const bot = await createBot();
+    await createLead(bot.id, 9541n);
+    // 1 foto + botão: sendSingleMedia embute o teclado na MESMA chamada — não
+    // é um envio composto, então o backoff pode reexecutar sem risco de
+    // duplicar nada.
+    await seedMsg(bot.id, bot.userId, {
+      message: "promo",
+      advancedFilters: {
+        media: [{ url: "https://cdn/a.jpg", media_type: "image" }],
+        inline_buttons: [{ text: "Saiba mais", url: "https://x.com" }],
+      } as Record<string, unknown>,
+    });
+    forceTelegramError("sendPhoto", 429, undefined, { retryAfterSec: 3, times: 1 });
+
+    await processDueBroadcasts();
+    expect(getTelegramCalls("sendPhoto").length).toBe(2); // 1ª falhou, 2ª (retry) entregou
+    const db = await testDb();
+    const runs = await db.select().from(broadcastRuns);
+    expect(runs[0].sentCount).toBe(1);
+    expect(runs[0].failedCount).toBe(0);
+  }, 10_000);
+
+  it("envio a vários leads respeita espaçamento entre chamadas (não manda tudo de uma vez)", async () => {
+    const bot = await createBot();
+    for (let i = 0; i < 5; i++) await createLead(bot.id, BigInt(9530 + i));
+    await seedMsg(bot.id, bot.userId, { message: "promo" });
+
+    const start = Date.now();
+    await processDueBroadcasts();
+    const elapsed = Date.now() - start;
+    expect(getTelegramCalls("sendMessage").length).toBe(5);
+    // 5 envios com espaçamento > 0 entre eles não podem ser instantâneos —
+    // sem o fix, o loop original não tinha nenhum `await sleep` entre envios.
+    expect(elapsed).toBeGreaterThanOrEqual(4 * 30); // margem sobre SEND_SPACING_MS (40ms) x 4 intervalos
+  });
+});

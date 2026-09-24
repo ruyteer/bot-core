@@ -4,7 +4,7 @@ import {
   scheduledMessages, broadcastRuns, broadcastDeliveries, bots, leads, payments, botGroups, funnelOffers,
   funnels, funnelNodes, funnelBots,
 } from "../../shared/schema/index.js";
-import { TelegramClient } from "../../runner/application/telegram.client.js";
+import { TelegramClient, TelegramApiError } from "../../runner/application/telegram.client.js";
 import { decrypt } from "../../shared/crypto.js";
 import { telegramButtonStyle } from "../../runner/application/telegram-button-style.js";
 import { ExecuteFlowStepUseCase, getVars } from "../../runner/application/execute-flow-step.use-case.js";
@@ -18,6 +18,49 @@ const flowUseCase = new ExecuteFlowStepUseCase();
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ── Rate limit / backoff / retry (item de auditoria: disparo em massa sem
+// nenhum dos três) ───────────────────────────────────────────────────────────
+// Espaçamento entre envios de um mesmo bot: sem isso, um disparo de milhares
+// de leads mandava tudo de uma vez, estourando o rate limit do Telegram
+// (~30 msg/s por bot) — resultado eram 429 em cascata e mensagens perdidas
+// (contadas como falha, nunca reenviadas). Mesmo valor/raciocínio já usado em
+// runner.ts pro processador de delays.
+const SEND_SPACING_MS = 40;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Envia com backoff por bot. O TelegramClient já retenta internamente 429 com
+// retry_after pequeno (ver telegram.client.ts) — se o erro chegou até aqui, o
+// retry_after é grande o bastante pra valer a pena honrar aqui em vez de só
+// perder a mensagem. `botCooldown` guarda a penalidade pros PRÓXIMOS envios
+// deste mesmo bot (leads e grupos seguintes esperam o cooldown antes de
+// tentar), pra não repetir o mesmo 429 imediatamente no próximo item.
+//
+// `retryable` PRECISA ser false sempre que `send` fizer MAIS DE UMA chamada
+// ao Telegram (álbum de mídia + teclado, ou várias mídias em sequência — ver
+// sendMedia): se a 2ª chamada de uma sequência assim falhar com 429, reexecutar
+// `send()` do zero reenviaria também a 1ª chamada, que já tinha tido sucesso —
+// o lead receberia a mídia duplicada. Nesse caso só o cooldown é aplicado (pros
+// PRÓXIMOS itens); o item atual conta como falha, sem nova tentativa. Só uma
+// mensagem de texto simples (`retryable: true`) é seguramente reexecutável,
+// por ser uma única chamada.
+async function sendWithBackoff(send: () => Promise<void>, botCooldown: { until: number }, retryable: boolean): Promise<void> {
+  const wait = botCooldown.until - Date.now();
+  if (wait > 0) await sleep(wait);
+  try {
+    await send();
+  } catch (err) {
+    if (!(err instanceof TelegramApiError) || !err.isRateLimit) throw err;
+    const waitMs = (err.retryAfter ?? 3) * 1000 + 250;
+    botCooldown.until = Date.now() + waitMs;
+    if (!retryable) throw err; // envio composto (mídia) — não reexecuta, evita duplicar o que já foi entregue
+    await sleep(waitMs);
+    await send(); // uma única nova tentativa — se falhar de novo, propaga (conta como falha)
+  }
+}
 
 // ── Variáveis do broadcast (chave simples, igual ao painel) ─────────────────────
 function replaceVars(text: string, lead: { firstName?: string | null; lastName?: string | null; telegramUsername?: string | null }): string {
@@ -80,12 +123,24 @@ async function getAudienceLeads(botId: string, filterType: string, filterProduct
   const buyerIds = new Set(paid.map((p) => p.leadId).filter(Boolean) as string[]);
   if (filterType === "buyers") return all.filter((l) => buyerIds.has(l.id));
   if (filterType === "non_buyers") return all.filter((l) => !buyerIds.has(l.id));
-  if (filterType === "product" && filterProductId) {
+  if (filterType === "product") {
+    // "product" sem filterProductId é filtro incompleto, não "sem filtro" —
+    // cai no mesmo cuidado do filterType desconhecido logo abaixo: falha
+    // fechada em vez de virar "todos" por acidente.
+    if (!filterProductId) {
+      console.error("[broadcast] filterType 'product' sem filterProductId — não envia (falha fechada):", botId);
+      return [];
+    }
     const prodPaid = await db.select({ leadId: payments.leadId }).from(payments).where(and(eq(payments.botId, botId), eq(payments.status, "paid"), eq(payments.offerId, filterProductId)));
     const ids = new Set(prodPaid.map((p) => p.leadId).filter(Boolean) as string[]);
     return all.filter((l) => ids.has(l.id));
   }
-  return all;
+  // filterType desconhecido (valor não é validado por enum na API — ver
+  // broadcasts.api.ts): nunca deve virar "todos" por acidente. Falha fechada —
+  // não envia pra ninguém e registra o motivo, em vez de vazar o disparo pro
+  // público inteiro.
+  console.error("[broadcast] filterType desconhecido, não envia (falha fechada):", botId, filterType);
+  return [];
 }
 
 interface MediaItem { url: string; media_type: string; has_spoiler?: boolean }
@@ -272,10 +327,19 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
     const allRows = [...((inlineKb?.inline_keyboard as Array<Array<Record<string, unknown>>>) ?? []), ...offerRows];
     const keyboard = allRows.length ? { inline_keyboard: allRows } : undefined;
 
+    // Estado deste bot dentro do disparo: cooldown acumulado após 429 (ver
+    // sendWithBackoff) e trava definitiva em 401. Token inválido é erro do
+    // BOT inteiro, não do lead atual — insistir lead por lead com o mesmo
+    // token quebrado só repete o mesmo 401 nos logs sem entregar nada (era o
+    // caso observado em produção: "sendPhoto failed [401]: Unauthorized").
+    const botCooldown = { until: 0 };
+    let tokenInvalid = false;
+
     // Leads
     if (targetType === "leads" || targetType === "both") {
       const audience = await getAudienceLeads(bot.id, msg.filterType || "all", filterProductId);
       for (const lead of audience) {
+        if (tokenInvalid) break;
         // Já entregue numa tentativa anterior desta mesma ocorrência (resgate
         // de "sending" travado) — não conta como alvo nem reenvia.
         if (deliveredLeadIds.has(lead.id)) continue;
@@ -285,15 +349,25 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
         totalTargets++;
         let delivered = false;
         try {
-          if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
-          else await tg.sendMessage({ chatId, text: text || "👇", replyMarkup: keyboard, protectContent: bot.protectContent });
+          await sendWithBackoff(async () => {
+            if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
+            else await tg.sendMessage({ chatId, text: text || "👇", replyMarkup: keyboard, protectContent: bot.protectContent });
+          }, botCooldown, media.length <= 1); // 0 ou 1 mídia = sempre 1 chamada (com ou sem teclado) — seguro reexecutar; 2+ pode virar álbum+teclado (2 chamadas)
           sentCount++;
           delivered = true;
           deliveredLeadIds.add(lead.id);
           await db.insert(broadcastDeliveries).values({ scheduledMessageId: msg.id, occurrenceAt, leadId: lead.id })
             .onConflictDoNothing()
             .catch((e) => console.error("[broadcast] registro de entrega falhou:", lead.id, e));
-        } catch (e) { failedCount++; console.error("[broadcast] lead falhou:", lead.id, e); }
+        } catch (e) {
+          failedCount++;
+          if (e instanceof TelegramApiError && e.errorCode === 401) {
+            tokenInvalid = true;
+            console.error(`[broadcast] bot ${bot.id}: token inválido (401) — envio deste bot interrompido`, e);
+          } else {
+            console.error("[broadcast] lead falhou:", lead.id, e);
+          }
+        }
 
         // Entrada em funil roda DEPOIS do envio, isolada do try acima: uma
         // falha aqui nunca deve virar "falha de envio" (a mensagem já saiu).
@@ -310,12 +384,13 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
             });
           } catch (e) { console.error("[broadcast] falha ao iniciar funil para lead:", lead.id, e); }
         }
+        await sleep(SEND_SPACING_MS);
         await maybeHeartbeat();
       }
     }
 
     // Grupos/canais
-    if (targetType === "groups" || targetType === "both") {
+    if (!tokenInvalid && (targetType === "groups" || targetType === "both")) {
       // Distingue "nenhum filtro" (rawTargetGroupIds vazio → todos os grupos do bot) de
       // "filtro tinha só ids inválidos" (não pode virar "todos os grupos" por acidente).
       const groups = rawTargetGroupIds.length === 0
@@ -324,15 +399,27 @@ async function sendBroadcast(msg: typeof scheduledMessages.$inferSelect): Promis
           ? await db.select().from(botGroups).where(and(eq(botGroups.botId, bot.id), inArray(botGroups.id, targetGroupIds)))
           : [];
       for (const g of groups) {
+        if (tokenInvalid) break;
         const chatId = g.telegramChatId.toString();
         const text = msg.message || "";
         if (media.length === 0 && !text) continue;
         totalTargets++;
         try {
-          if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
-          else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
+          await sendWithBackoff(async () => {
+            if (media.length > 0) await sendMedia(tg, chatId, media, text || undefined, keyboard, bot.protectContent);
+            else await tg.sendMessage({ chatId, text, replyMarkup: keyboard, protectContent: bot.protectContent });
+          }, botCooldown, media.length <= 1); // 0 ou 1 mídia = sempre 1 chamada (com ou sem teclado) — seguro reexecutar; 2+ pode virar álbum+teclado (2 chamadas)
           sentCount++;
-        } catch (e) { failedCount++; console.error("[broadcast] grupo falhou:", g.id, e); }
+        } catch (e) {
+          failedCount++;
+          if (e instanceof TelegramApiError && e.errorCode === 401) {
+            tokenInvalid = true;
+            console.error(`[broadcast] bot ${bot.id}: token inválido (401) — envio deste bot interrompido`, e);
+          } else {
+            console.error("[broadcast] grupo falhou:", g.id, e);
+          }
+        }
+        await sleep(SEND_SPACING_MS);
         await maybeHeartbeat();
       }
     }

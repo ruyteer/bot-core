@@ -85,6 +85,78 @@ function isCacheableUrl(url: string): boolean {
   return /^https?:\/\//.test(url) && !url.includes("api.qrserver.com");
 }
 
+// ── Retry/backoff (item de auditoria: cliente sem retry) ────────────────────
+// Este client é usado por TODO o backend (funis, remarketing, disparos) —
+// inclusive no tick RÁPIDO de delays (3s). Por isso o retry aqui é
+// deliberadamente conservador:
+//
+// - 429 com retry_after PEQUENO (<=RATE_LIMIT_INLINE_RETRY_MAX_SEC): provável
+//   throttle momentâneo — vale esperar exatamente o retry_after e tentar mais
+//   uma vez (uma única vez). 429 com retry_after maior (penalidade real de
+//   flood) NÃO é retentado aqui: propaga pro chamador, que decide melhor —
+//   runner.ts já tem cooldown por bot pro resto do lote de delays (o teste
+//   "429 põe o bot em cooldown" depende de UMA chamada só antes do cooldown
+//   assumir), e o disparo em massa tem seu próprio ritmo/backoff. Como o
+//   Telegram RESPONDEU (a requisição não ficou ambígua), retenta pra
+//   qualquer método, mesmo os que não são idempotentes.
+// - 5xx explícito do Telegram: mesma lógica — é uma resposta de verdade (não
+//   um timeout), então também retenta pra qualquer método.
+// - Erro de rede/timeout (fetch falhou, abort, DNS...): AMBÍGUO — não dá pra
+//   saber se o Telegram chegou a processar a requisição antes da conexão
+//   cair. Retentar aqui pode DUPLICAR o efeito (mensagem enviada 2x, link de
+//   convite de uso único criado 2x). Por isso só retenta quando o método é
+//   explicitamente marcado como seguro pra repetir (`idempotent: true`) —
+//   uma releitura, uma ação puramente local no chat (apagar, editar teclado)
+//   ou algo que não duplica nada visível ao repetir. Todo método de ENVIO ou
+//   CRIAÇÃO (sendMessage, sendPhoto, createChatInviteLink, etc.) é
+//   NÃO-idempotente por padrão — precisa ser explicitamente marcado do
+//   contrário, o que é a escolha conservadora certa pra qualquer método novo.
+// - 401/403/400: definitivos (token inválido, bot bloqueado, chat inexistente)
+//   — nunca retentados, propagam na primeira tentativa.
+const RATE_LIMIT_INLINE_RETRY_MAX_SEC = 2;
+const TRANSIENT_MAX_ATTEMPTS = 3; // 1ª tentativa + 2 retries
+const TRANSIENT_BACKOFF_MS = 200; // 200ms, depois 400ms
+
+function isDefinitiveTelegramError(errorCode: number | undefined): boolean {
+  return errorCode === 401 || errorCode === 403 || errorCode === 400;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTelegramRetry<T>(fn: () => Promise<T>, idempotent: boolean): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof TelegramApiError) {
+        if (isDefinitiveTelegramError(err.errorCode)) throw err;
+        if (err.isRateLimit) {
+          const retryAfter = err.retryAfter;
+          const canRetryInline = attempt === 1 && retryAfter != null && retryAfter <= RATE_LIMIT_INLINE_RETRY_MAX_SEC;
+          if (!canRetryInline) throw err;
+          await sleep(retryAfter * 1000);
+          continue;
+        }
+        // 5xx: resposta explícita do Telegram, não uma ambiguidade de rede —
+        // seguro retentar mesmo pra métodos não-idempotentes.
+        const isServerError = err.errorCode != null && err.errorCode >= 500;
+        if (!isServerError || attempt >= TRANSIENT_MAX_ATTEMPTS) throw err;
+        await sleep(TRANSIENT_BACKOFF_MS * attempt);
+        continue;
+      }
+      // Erro de rede/timeout (fetch falhou, abort, DNS...) — não sabemos se o
+      // Telegram processou antes da conexão cair. Só retenta se o método foi
+      // marcado como seguro pra repetir.
+      if (!idempotent || attempt >= TRANSIENT_MAX_ATTEMPTS) throw err;
+      await sleep(TRANSIENT_BACKOFF_MS * attempt);
+    }
+  }
+}
+
 export class TelegramClient {
   // `botId` habilita o cache de file_id (mídia enviada por URL uma vez fica
   // instantânea nas próximas — o Telegram não precisa baixar o arquivo de novo).
@@ -154,7 +226,14 @@ export class TelegramClient {
     await this.storeFileId(kind, url, result);
   }
 
-  private async call(method: string, body: Record<string, unknown>): Promise<unknown> {
+  // `idempotent: true` habilita retry também em erro de rede/timeout (ver
+  // withTelegramRetry) — só passe isso pra métodos onde repetir a chamada não
+  // duplica efeito nenhum visível ao usuário/chat.
+  private async call(method: string, body: Record<string, unknown>, opts?: { idempotent?: boolean }): Promise<unknown> {
+    return withTelegramRetry(() => this.rawCall(method, body), opts?.idempotent ?? false);
+  }
+
+  private async rawCall(method: string, body: Record<string, unknown>): Promise<unknown> {
     // Timeout obrigatório: sem isso, um fetch que trava (TCP black hole, Telegram
     // lento) deixaria o await pendurado pra sempre — e, no scheduler, isso congela
     // toda a fila (delays/broadcasts/remarketing). 20s é folgado p/ a API do TG.
@@ -183,7 +262,11 @@ export class TelegramClient {
 
   // Mesmo tratamento de erro/timeout de `call`, mas com corpo multipart (upload
   // de arquivo) em vez de JSON — a Bot API espera multipart para binário.
-  private async callMultipart(method: string, form: FormData): Promise<unknown> {
+  private async callMultipart(method: string, form: FormData, opts?: { idempotent?: boolean }): Promise<unknown> {
+    return withTelegramRetry(() => this.rawCallMultipart(method, form), opts?.idempotent ?? false);
+  }
+
+  private async rawCallMultipart(method: string, form: FormData): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20_000);
     try {
@@ -271,22 +354,26 @@ export class TelegramClient {
   // (ex.: bot sem acesso). Usado p/ nomear grupos/canais salvos.
   async getChat(chatId: string): Promise<{ id: number; type: string; title?: string } | null> {
     try {
-      return await this.call("getChat", { chat_id: chatId }) as { id: number; type: string; title?: string };
+      // Leitura pura — repetir não duplica nada. Idempotente.
+      return await this.call("getChat", { chat_id: chatId }, { idempotent: true }) as { id: number; type: string; title?: string };
     } catch {
       return null;
     }
   }
 
   // Indicador de "digitando…"/"gravando áudio…" etc. Best-effort (não lança).
+  // Repetir só reexibe o indicador — sem efeito duplicado. Idempotente.
   async sendChatAction(chatId: string, action: string): Promise<void> {
-    await this.call("sendChatAction", { chat_id: chatId, action }).catch(() => {});
+    await this.call("sendChatAction", { chat_id: chatId, action }, { idempotent: true }).catch(() => {});
   }
 
+  // Responde o toast/loading do botão clicado — repetir não reenvia nada ao
+  // chat, só reconfirma o callback. Idempotente.
   async answerCallbackQuery(opts: AnswerCallbackOptions): Promise<void> {
     await this.call("answerCallbackQuery", {
       callback_query_id: opts.callbackQueryId,
       text:              opts.text,
-    });
+    }, { idempotent: true });
   }
 
   // Álbum: 2+ fotos/vídeos numa só mensagem. caption (HTML) só no 1º item.
@@ -357,14 +444,18 @@ export class TelegramClient {
     await this.callMedia(m.endpoint, m.field as MediaKind, m.field, opts.url, body);
   }
 
+  // Substitui o teclado por completo (não incrementa nada) — repetir a mesma
+  // chamada resulta no mesmo estado final. Idempotente.
   async editMessageReplyMarkup(chatId: string, messageId: number, replyMarkup: unknown): Promise<void> {
     await this.call("editMessageReplyMarkup", {
       chat_id: chatId, message_id: messageId, reply_markup: replyMarkup,
-    }).catch(() => {});
+    }, { idempotent: true }).catch(() => {});
   }
 
+  // Apagar uma mensagem já apagada só falha (best-effort, já engolido abaixo)
+  // — sem efeito duplicado. Idempotente.
   async deleteMessage(chatId: string, messageId: number): Promise<void> {
-    await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }).catch(() => {});
+    await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, { idempotent: true }).catch(() => {});
   }
 
   // Gera um link de convite p/ entrega de oferta "grupo VIP". `memberLimit: 1`
